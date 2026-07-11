@@ -47,7 +47,7 @@
         {
           "binding": "DB",
           "database_name": "ollama-status-staging",
-          "database_id": "b8e3a94e-7cc2-404b-b76a-e6bef5181b77"
+          "database_id": "98b85e7c-d2af-4910-8d9e-d6bdbf2ecee4"
         }
       ],
       "vars": {
@@ -78,7 +78,7 @@
         {
           "binding": "DB",
           "database_name": "ollama-status",
-          "database_id": "REPLACE_WITH_PRODUCTION_D1_ID"
+          "database_id": "16bb1ba2-eb9e-4e36-9399-8eb9ce89c127"
         }
       ],
       "vars": {
@@ -91,6 +91,12 @@
         "CONFIRMATION_CALLBACK_URL": "https://ollama-status.srnoob.dev/api/internal/confirmation",
         "GITHUB_REPOSITORY": "srnoob2570/ollama-status"
       }
+    }
+  },
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
     }
   }
 }
