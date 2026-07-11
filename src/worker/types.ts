@@ -32,9 +32,10 @@ export interface Env {
     OLLAMA_MAX_TOKENS?: string;
     FREE_CHECK_INTERVAL_MINUTES?: string;
     PAID_CHECK_INTERVAL_MINUTES?: string;
-    // Throttle controls so free API keys (1 concurrent model) don't burst into 429s.
-    // Paid keys can raise PROBE_CONCURRENCY (~3-10) to finish runs faster.
-    PROBE_CONCURRENCY?: string;
+    // Independent throttle controls: Free keys remain conservative, while Paid keys can
+    // use the provider's higher parallelism allowance.
+    FREE_PROBE_CONCURRENCY?: string;
+    PAID_PROBE_CONCURRENCY?: string;
     PROBE_DELAY_MIN_MS?: string;
     PROBE_DELAY_MAX_MS?: string;
     OLLAMA_API_KEY_FREE: string;

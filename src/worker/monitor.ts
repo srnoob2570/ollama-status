@@ -20,8 +20,9 @@ const providerSeeds = [
 // past their cadence and drift to "checked N minutes ago". Kept above catalog size with
 // room to grow.
 const MAX_MODELS_PER_RUN = 40;
-const PROBE_CONCURRENCY_DEFAULT = 1;
 const PROBE_CONCURRENCY_MAX = 16;
+const FREE_PROBE_CONCURRENCY_DEFAULT = 1;
+const PAID_PROBE_CONCURRENCY_DEFAULT = 6;
 const PROBE_DELAY_MIN_MS_DEFAULT = 0;
 const PROBE_DELAY_MAX_MS_DEFAULT = 5_000;
 const LOCK_LEASE_MS = 6 * 60_000;
@@ -47,15 +48,21 @@ let providersSeeded = false;
 let lastRolledHour: string | null = null;
 let lastCleanupDay: string | null = null;
 
-// Probes run in parallel batches so one slow or timing-out model can't stagger the rest of
-// the run across minutes. Concurrency is configurable via PROBE_CONCURRENCY: free API keys
-// allow only 1 in-flight model, so the default stays at 1 to avoid per-model 429s; paid keys
-// can raise it (~3-10) to finish runs faster. The inter-probe delay (PROBE_DELAY_MIN_MS ..
-// PROBE_DELAY_MAX_MS) spreads requests over time instead of bursting them all at once.
-export function probeConcurrency(env: Env): number {
-    const parsed = Number.parseInt(env.PROBE_CONCURRENCY ?? '', 10);
-    if (!Number.isFinite(parsed) || parsed < 1) return PROBE_CONCURRENCY_DEFAULT;
+// Free and Paid probes use independent worker pools. Paid work only becomes eligible after the
+// corresponding Free probe reports SUBSCRIPTION_REQUIRED, so a higher Paid limit can overlap
+// later Free classifications without increasing pressure on the Free API key.
+function configuredProbeConcurrency(value: string | undefined, fallback: number): number {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1) return fallback;
     return Math.min(parsed, PROBE_CONCURRENCY_MAX);
+}
+
+export function freeProbeConcurrency(env: Env): number {
+    return configuredProbeConcurrency(env.FREE_PROBE_CONCURRENCY, FREE_PROBE_CONCURRENCY_DEFAULT);
+}
+
+export function paidProbeConcurrency(env: Env): number {
+    return configuredProbeConcurrency(env.PAID_PROBE_CONCURRENCY, PAID_PROBE_CONCURRENCY_DEFAULT);
 }
 
 // Random delay in [min, max] applied before each probe so staggered requests don't burst.
@@ -544,98 +551,156 @@ function failedProbe(result: ProbeResult): number {
     return isFailure(result.classification) ? 1 : 0;
 }
 
-async function probeByEntitlement(
+type ScheduledExecution = {
+    id: string;
+    model: Model;
+};
+
+type PaidProbeTask = ScheduledExecution & {
+    freeResult: ProbeResult;
+};
+
+async function completeExecution(
     env: Env,
     freeProvider: Provider,
     paidProvider: Provider | undefined,
-    model: Model,
+    execution: ScheduledExecution,
     runId: string,
+    scheduledAtMs: number,
+    freeResult: ProbeResult,
+    paidResult?: ProbeResult,
+): Promise<void> {
+    const effectiveProvider = paidResult && paidProvider ? paidProvider : freeProvider;
+    const effectiveResult = paidResult ?? freeResult;
+    const paid = paidResult ? 1 : 0;
+    const paidSkipped =
+        !paidResult && entitlementFromFreeProbe(freeResult.classification) === 'PAID' ? 1 : 0;
+    const failed = failedProbe(freeResult) + (paidResult ? failedProbe(paidResult) : 0);
+    const completedAt = now();
+    const terminal = await env.DB.batch([
+        env.DB.prepare(
+            `UPDATE models SET next_check_at=?,updated_at=? WHERE id=?
+             AND EXISTS (SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING')`,
+        ).bind(
+            nextCheckAt(
+                effectiveResult.publicStatus,
+                effectiveResult.publicStatus === 'OUTAGE',
+                effectiveResult.retryAfterSeconds,
+                nextCheckTier(effectiveProvider, execution.model, effectiveResult),
+                env,
+                scheduledAtMs,
+                Date.parse(completedAt),
+            ),
+            completedAt,
+            execution.model.id,
+            execution.id,
+        ),
+        env.DB.prepare(
+            `UPDATE monitor_runs SET completed_model_count=completed_model_count+1,
+             free_probe_count=free_probe_count+1, paid_probe_count=paid_probe_count+?,
+             paid_skipped_count=paid_skipped_count+?, failed_probe_count=failed_probe_count+?, current_model=?
+             WHERE id=? AND EXISTS (
+                 SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING'
+             )`,
+        ).bind(paid, paidSkipped, failed, execution.model.remote_name, runId, execution.id),
+        env.DB.prepare(
+            "UPDATE model_check_executions SET state='COMPLETED',completed_at=?,detail=NULL WHERE id=? AND state='RUNNING'",
+        ).bind(completedAt, execution.id),
+    ]);
+    if (terminal[2].meta.changes !== 1) throw new Error('execution_transition_conflict');
+}
+
+async function failExecution(
+    env: Env,
     executionId: string,
+    signal: AbortSignal | undefined,
+    error: unknown,
+): Promise<void> {
+    const state = signal?.aborted ? 'ABANDONED' : 'FAILED';
+    const detail = error instanceof Error ? error.message.slice(0, 200) : 'probe_failed';
+    await env.DB.prepare(
+        "UPDATE model_check_executions SET state=?,completed_at=?,detail=? WHERE id=? AND state='RUNNING'",
+    )
+        .bind(state, now(), detail, executionId)
+        .run();
+}
+
+async function probeFree(
+    env: Env,
+    freeProvider: Provider,
+    paidProvider: Provider | undefined,
+    execution: ScheduledExecution,
+    runId: string,
     scheduledAtMs: number,
     signal?: AbortSignal,
-): Promise<void> {
-    // Claim the execution before any provider I/O. Every terminal write below is conditional on
-    // this RUNNING state so orphan recovery cannot be overwritten by a late probe.
+): Promise<PaidProbeTask | undefined> {
+    // Claim before Free I/O. It stays RUNNING while queued for Paid work, so recovery can
+    // abandon an interrupted execution without allowing a late worker to overwrite it.
     const running = await env.DB.prepare(
         "UPDATE model_check_executions SET state='RUNNING',started_at=?,detail=NULL WHERE id=? AND state='SCHEDULED'",
     )
-        .bind(now(), executionId)
+        .bind(now(), execution.id)
         .run();
     if (running.meta.changes !== 1) throw new Error('execution_not_scheduled');
     try {
         const freeResult = await probeModel(
             env,
             freeProvider,
-            model,
-            executionId,
+            execution.model,
+            execution.id,
             scheduledAtMs,
             signal,
         );
-        const entitlement = entitlementFromFreeProbe(freeResult.classification);
         const paidAvailable = Boolean(paidProvider && hasKey(env, paidProvider));
-        let paid = 0,
-            paidSkipped = 0,
-            failed = failedProbe(freeResult),
-            effectiveProvider = freeProvider,
-            effectiveResult = freeResult;
-
         if (shouldProbePaid(freeResult.classification, paidAvailable) && paidProvider) {
-            const paidResult = await probeModel(
-                env,
-                paidProvider,
-                model,
-                executionId,
-                scheduledAtMs,
-                signal,
-            );
-            paid = 1;
-            failed += failedProbe(paidResult);
-            effectiveProvider = paidProvider;
-            effectiveResult = paidResult;
-        } else if (entitlement === 'PAID') {
-            paidSkipped = 1;
+            return { ...execution, freeResult };
         }
-
-        const completedAt = now();
-        const terminal = await env.DB.batch([
-            env.DB.prepare(
-                `UPDATE models SET next_check_at=?,updated_at=? WHERE id=?
-                 AND EXISTS (SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING')`,
-            ).bind(
-                nextCheckAt(
-                    effectiveResult.publicStatus,
-                    effectiveResult.publicStatus === 'OUTAGE',
-                    effectiveResult.retryAfterSeconds,
-                    nextCheckTier(effectiveProvider, model, effectiveResult),
-                    env,
-                    scheduledAtMs,
-                    Date.parse(completedAt),
-                ),
-                completedAt,
-                model.id,
-                executionId,
-            ),
-            env.DB.prepare(
-                `UPDATE monitor_runs SET completed_model_count=completed_model_count+1,
-                 free_probe_count=free_probe_count+1, paid_probe_count=paid_probe_count+?,
-                 paid_skipped_count=paid_skipped_count+?, failed_probe_count=failed_probe_count+?, current_model=?
-                 WHERE id=? AND EXISTS (
-                     SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING'
-                 )`,
-            ).bind(paid, paidSkipped, failed, model.remote_name, runId, executionId),
-            env.DB.prepare(
-                "UPDATE model_check_executions SET state='COMPLETED',completed_at=?,detail=NULL WHERE id=? AND state='RUNNING'",
-            ).bind(completedAt, executionId),
-        ]);
-        if (terminal[2].meta.changes !== 1) throw new Error('execution_transition_conflict');
+        await completeExecution(
+            env,
+            freeProvider,
+            paidProvider,
+            execution,
+            runId,
+            scheduledAtMs,
+            freeResult,
+        );
+        return undefined;
     } catch (error) {
-        const state = signal?.aborted ? 'ABANDONED' : 'FAILED';
-        const detail = error instanceof Error ? error.message.slice(0, 200) : 'probe_failed';
-        await env.DB.prepare(
-            "UPDATE model_check_executions SET state=?,completed_at=?,detail=? WHERE id=? AND state='RUNNING'",
-        )
-            .bind(state, now(), detail, executionId)
-            .run();
+        await failExecution(env, execution.id, signal, error);
+        throw error;
+    }
+}
+
+async function probePaid(
+    env: Env,
+    freeProvider: Provider,
+    paidProvider: Provider,
+    task: PaidProbeTask,
+    runId: string,
+    scheduledAtMs: number,
+    signal?: AbortSignal,
+): Promise<void> {
+    try {
+        const paidResult = await probeModel(
+            env,
+            paidProvider,
+            task.model,
+            task.id,
+            scheduledAtMs,
+            signal,
+        );
+        await completeExecution(
+            env,
+            freeProvider,
+            paidProvider,
+            task,
+            runId,
+            scheduledAtMs,
+            task.freeResult,
+            paidResult,
+        );
+    } catch (error) {
+        await failExecution(env, task.id, signal, error);
         throw error;
     }
 }
@@ -715,51 +780,132 @@ export async function runMonitor(
         )
             .bind(catalogModelCount, due.results.length, runId)
             .run();
-        const concurrency = probeConcurrency(env);
-        // Time-box the run so it finishes within one cron interval: stop starting new batches
-        // once the deadline is reached, leaving the lock free for the next tick. Models not
-        // probed stay due and are picked up first next tick (the due query orders by
-        // next_check_at). Without this, a slow/long run holds the lock past the next tick and
-        // that tick is silently skipped, doubling the effective cadence to ~10 min.
+        const freeConcurrency = freeProbeConcurrency(env);
+        const paidConcurrency = paidProbeConcurrency(env);
+        const freeQueue: ScheduledExecution[] = executions;
+        const paidQueue: PaidProbeTask[] = [];
+        // Time-box the run so it finishes within one cron interval. Free and Paid workers are
+        // independent: a Free result can feed the Paid queue while the Free pool immediately
+        // moves to the next model. Once the soft deadline is reached, neither pool starts new
+        // I/O; active probes finish normally and only queued Paid work is deferred.
         const deadlineMs = runDeadlineMs(startedMs, env);
         let budgetExceeded = false,
             rejectedExecutions = 0;
-        for (let i = 0; i < executions.length; i += concurrency) {
+        let activeFree = 0,
+            activePaid = 0;
+        type WorkerResult =
+            | { pool: 'free'; task?: PaidProbeTask }
+            | { pool: 'paid' }
+            | { pool: 'error'; error: unknown };
+        const active = new Set<Promise<WorkerResult>>();
+        const settled: WorkerResult[] = [];
+        const track = (
+            pool: 'free' | 'paid',
+            work: Promise<PaidProbeTask | undefined> | Promise<void>,
+        ) => {
+            if (pool === 'free') activeFree += 1;
+            else activePaid += 1;
+            let tracked: Promise<WorkerResult>;
+            tracked = work
+                .then((task) =>
+                    pool === 'free'
+                        ? { pool, task: task as PaidProbeTask | undefined }
+                        : { pool },
+                )
+                .catch((error: unknown) => ({ pool: 'error' as const, error }))
+                .then((result) => {
+                    settled.push(result);
+                    return result;
+                })
+                .finally(() => {
+                    active.delete(tracked);
+                    if (pool === 'free') activeFree -= 1;
+                    else activePaid -= 1;
+                });
+            active.add(tracked);
+        };
+        const consumeSettled = () => {
+            for (const result of settled.splice(0)) {
+                if (result.pool === 'free' && result.task) paidQueue.push(result.task);
+                if (result.pool === 'error') {
+                    rejectedExecutions += 1;
+                    console.warn(`monitor probe rejected: ${result.error}`);
+                }
+            }
+        };
+        const deferPending = async () => {
+            const deferredAt = now();
+            await env.DB.prepare(
+                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+                 WHERE run_id=? AND state='SCHEDULED'`,
+            )
+                .bind(deferredAt, runId)
+                .run();
+            // A Paid task has already completed its Free classification and is RUNNING only
+            // because it waits for a Paid worker. Do not include active Free/Paid probes here:
+            // they are allowed to finish and preserve their normal terminal writes.
+            const waitingPaidIds = paidQueue.map((task) => task.id);
+            if (waitingPaidIds.length)
+                await env.DB.prepare(
+                    `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+                     WHERE run_id=? AND state='RUNNING' AND id IN (${waitingPaidIds.map(() => '?').join(',')})`,
+                )
+                    .bind(deferredAt, runId, ...waitingPaidIds)
+                    .run();
+        };
+        const waitForWorker = async () => {
+            if (active.size) await Promise.race(active);
+            consumeSettled();
+        };
+        while (freeQueue.length || paidQueue.length || active.size) {
             if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
                 throw new Error('run_hard_stop');
             if (Date.now() >= deadlineMs) {
                 budgetExceeded = true;
                 break;
             }
-            // Hard-stop guard: even if the in-flight batch is stuck on a non-cancellable await
-            // (a D1 write), stop starting new batches once the run has overstayed its budget. The
-            // AbortController cancels in-flight fetches; this guard prevents the loop from
-            // renewing the lock past the hard stop once such an await eventually resolves.
+            consumeSettled();
+            const canStartFree = freeQueue.length > 0 && activeFree < freeConcurrency;
+            const canStartPaid = paidQueue.length > 0 && activePaid < paidConcurrency;
+            if (!canStartFree && !canStartPaid) {
+                await waitForWorker();
+                continue;
+            }
+            // Renew before launching work, not while merely waiting for active probes. A lost
+            // lease still abandons every non-terminal execution in the catch path below.
             if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
-            // allSettled so a single probe/storeProbe failure (e.g. a transient D1 error) aborts
-            // only that model, not the whole run. The hard stop is enforced after the batch.
-            const results = await Promise.allSettled(
-                executions
-                    .slice(i, i + concurrency)
-                    .map((execution) =>
-                        probeByEntitlement(
-                            env,
-                            freeProvider,
-                            paidProvider,
-                            execution.model,
-                            runId,
-                            execution.id,
-                            scheduledTimeMs,
-                            runController.signal,
-                        ),
+            while (freeQueue.length && activeFree < freeConcurrency && Date.now() < deadlineMs) {
+                const execution = freeQueue.shift();
+                if (!execution) break;
+                track(
+                    'free',
+                    probeFree(
+                        env,
+                        freeProvider,
+                        paidProvider,
+                        execution,
+                        runId,
+                        scheduledTimeMs,
+                        runController.signal,
                     ),
-            );
-            for (const r of results)
-                if (r.status === 'rejected') {
-                    rejectedExecutions += 1;
-                    console.warn(`monitor probe rejected: ${r.reason}`);
-                }
-            if (runController.signal.aborted) throw new Error('run_hard_stop');
+                );
+            }
+            while (paidQueue.length && activePaid < paidConcurrency && Date.now() < deadlineMs) {
+                const task = paidQueue.shift();
+                if (!task || !paidProvider) break;
+                track(
+                    'paid',
+                    probePaid(
+                        env,
+                        freeProvider,
+                        paidProvider,
+                        task,
+                        runId,
+                        scheduledTimeMs,
+                        runController.signal,
+                    ),
+                );
+            }
         }
         if (budgetExceeded) {
             // Surface the infeasibility explicitly instead of silently drifting cadence: the
@@ -767,12 +913,15 @@ export async function runMonitor(
             console.warn(
                 `monitor run ${runId} budget_exceeded: ${due.results.length} due, deadline reached`,
             );
-            await env.DB.prepare(
-                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
-                 WHERE run_id=? AND state='SCHEDULED'`,
-            )
-                .bind(now(), runId)
-                .run();
+            // Let already-started Free/Paid probes write their normal results. Their Free
+            // completions may add more Paid tasks, which are collected before the final defer.
+            while (active.size) await waitForWorker();
+            // The hard-stop timer can fire while the soft-deadline drain waits for an active
+            // probe. Do not close that run as COMPLETED/PARTIAL: route it through the catch
+            // below so every non-terminal execution and the run itself become ABANDONED.
+            if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
+                throw new Error('run_hard_stop');
+            await deferPending();
         }
         const partial = budgetExceeded || rejectedExecutions > 0;
         const detail = [

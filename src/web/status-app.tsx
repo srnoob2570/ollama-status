@@ -176,8 +176,8 @@ export function App() {
             {status.infeasible && (
                 <section className="notice warning">
                     MONITOR OVERLOADED — recent runs couldn&apos;t check every model within the
-                    5-minute cadence. Lower PROBE_DELAY_MAX_MS, raise PROBE_CONCURRENCY (if the API
-                    key allows), or reduce the catalog.
+                    5-minute cadence. Lower PROBE_DELAY_MAX_MS, raise FREE_PROBE_CONCURRENCY or
+                    PAID_PROBE_CONCURRENCY (if the respective API key allows), or reduce the catalog.
                 </section>
             )}
             <section className="summary" aria-label="Catalog summary">
@@ -351,7 +351,12 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
             />
             <div className="model-copy">
                 <strong className="model-name">{model.remote_name}</strong>
-                <span className="access">{label}</span>
+                <div className="model-tags">
+                    {model.tier === 'PAID' && (
+                        <span className="tag access-tag">Requires subscription</span>
+                    )}
+                    <span className="access">{label}</span>
+                </div>
             </div>
             <History model={model} range={range} />
         </article>

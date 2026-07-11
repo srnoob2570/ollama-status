@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
     checkIntervalMinutes,
     classifyHttp,
@@ -32,7 +32,8 @@ import {
     materializeStatus,
     materializedStatus,
     nextCheckTier,
-    probeConcurrency,
+    freeProbeConcurrency,
+    paidProbeConcurrency,
     probeDelayMs,
     renewLock,
     runDeadlineMs,
@@ -974,20 +975,26 @@ describe('Ollama status classification', () => {
 describe('probe throttle configuration', () => {
     const env = (overrides: Partial<Env> = {}) =>
         ({
-            PROBE_CONCURRENCY: '1',
+            FREE_PROBE_CONCURRENCY: '1',
+            PAID_PROBE_CONCURRENCY: '6',
             PROBE_DELAY_MIN_MS: '0',
             PROBE_DELAY_MAX_MS: '5000',
             ...overrides,
         }) as unknown as Env;
 
-    it('clamps probe concurrency to a safe range with sensible defaults', () => {
-        expect(probeConcurrency(env())).toBe(1);
-        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '4' }))).toBe(4);
-        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '0' }))).toBe(1);
-        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '-3' }))).toBe(1);
-        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '999' }))).toBe(16);
-        expect(probeConcurrency(env({ PROBE_CONCURRENCY: 'garbage' }))).toBe(1);
-        expect(probeConcurrency(env({ PROBE_CONCURRENCY: undefined }))).toBe(1);
+    it('parses Free and Paid probe concurrency independently with safe defaults', () => {
+        expect(freeProbeConcurrency(env({ FREE_PROBE_CONCURRENCY: undefined }))).toBe(1);
+        expect(paidProbeConcurrency(env({ PAID_PROBE_CONCURRENCY: undefined }))).toBe(6);
+        expect(freeProbeConcurrency(env({ FREE_PROBE_CONCURRENCY: '4' }))).toBe(4);
+        expect(paidProbeConcurrency(env({ PAID_PROBE_CONCURRENCY: '7' }))).toBe(7);
+        expect(freeProbeConcurrency(env({ FREE_PROBE_CONCURRENCY: '0' }))).toBe(1);
+        expect(paidProbeConcurrency(env({ PAID_PROBE_CONCURRENCY: '-3' }))).toBe(6);
+        expect(freeProbeConcurrency(env({ FREE_PROBE_CONCURRENCY: '999' }))).toBe(16);
+        expect(paidProbeConcurrency(env({ PAID_PROBE_CONCURRENCY: '999' }))).toBe(16);
+        expect(freeProbeConcurrency(env({ FREE_PROBE_CONCURRENCY: 'garbage' }))).toBe(1);
+        expect(paidProbeConcurrency(env({ PAID_PROBE_CONCURRENCY: 'garbage' }))).toBe(6);
+        expect(freeProbeConcurrency(env({ FREE_PROBE_CONCURRENCY: '2.5' }))).toBe(1);
+        expect(paidProbeConcurrency(env({ PAID_PROBE_CONCURRENCY: '4workers' }))).toBe(6);
     });
 
     it('parses the configurable inter-probe delay range, swapping inverted bounds', () => {
@@ -1141,7 +1148,8 @@ describe('monitor retention cleanup', () => {
 describe('monitor run time-box (cadence preservation)', () => {
     const env = (overrides: Partial<Env> = {}) =>
         ({
-            PROBE_CONCURRENCY: '1',
+            FREE_PROBE_CONCURRENCY: '1',
+            PAID_PROBE_CONCURRENCY: '6',
             PROBE_DELAY_MIN_MS: '0',
             PROBE_DELAY_MAX_MS: '5000',
             ...overrides,
@@ -1182,6 +1190,262 @@ describe('monitor run time-box (cadence preservation)', () => {
 });
 
 describe('monitor run recovery', () => {
+    it('runs Free and Paid worker pools independently after Free classification', async () => {
+        const originalFetch = globalThis.fetch;
+        const events: Array<{ phase: 'start' | 'end'; pool: 'free' | 'paid'; model: string }> =
+            [];
+        let activeFree = 0,
+            activePaid = 0,
+            maxFree = 0,
+            maxPaid = 0;
+        const models = ['m1', 'm2', 'm3'].map((remote_name) => ({
+            id: `ollama:${remote_name}`,
+            provider_id: 'ollama-free',
+            remote_name,
+            digest: 'digest',
+            last_show_at: null,
+            tier: 'UNKNOWN' as const,
+        }));
+        const env = {
+            OLLAMA_BASE_URL: 'https://example.test/api',
+            OLLAMA_API_KEY_FREE: 'free-key',
+            OLLAMA_API_KEY_PAID: 'paid-key',
+            FREE_PROBE_CONCURRENCY: '1',
+            PAID_PROBE_CONCURRENCY: '2',
+            PROBE_DELAY_MIN_MS: '0',
+            PROBE_DELAY_MAX_MS: '0',
+            DB: {
+                prepare(sql: string) {
+                    return {
+                        bind() {
+                            return this;
+                        },
+                        run: async () => ({ meta: { changes: 1 } }),
+                        all: async () => {
+                            if (/FROM providers WHERE active=1/.test(sql))
+                                return {
+                                    results: [
+                                        {
+                                            id: 'ollama-free',
+                                            name: 'Free',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_FREE',
+                                        },
+                                        {
+                                            id: 'ollama-paid',
+                                            name: 'Paid',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_PAID',
+                                        },
+                                    ],
+                                };
+                            if (/FROM models WHERE provider_id='ollama-free' AND active=1/.test(sql))
+                                return { results: models };
+                            return { results: [] };
+                        },
+                        first: async () => null,
+                    };
+                },
+                async batch(statements: Array<{ run: () => Promise<unknown> }>) {
+                    return Promise.all(statements.map((statement) => statement.run()));
+                },
+            },
+        } as unknown as Env;
+        const ctx = { waitUntil() {} } as unknown as Parameters<typeof runMonitor>[1];
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = input.toString();
+            if (url.endsWith('/tags'))
+                return new Response(JSON.stringify({ models: models.map(({ remote_name, digest }) => ({ name: remote_name, digest })) }), { status: 200 });
+            if (url.endsWith('/show')) return new Response('{}', { status: 200 });
+            const model = JSON.parse(String(init?.body)).model as string;
+            const pool = new Headers(init?.headers).get('Authorization') === 'Bearer free-key' ? 'free' : 'paid';
+            events.push({ phase: 'start', pool, model });
+            if (pool === 'free') {
+                activeFree += 1;
+                maxFree = Math.max(maxFree, activeFree);
+                await new Promise((resolve) => setTimeout(resolve, 15));
+                activeFree -= 1;
+                events.push({ phase: 'end', pool, model });
+                return new Response('model requires a subscription', { status: 403 });
+            }
+            activePaid += 1;
+            maxPaid = Math.max(maxPaid, activePaid);
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            activePaid -= 1;
+            events.push({ phase: 'end', pool, model });
+            return new Response(
+                '{"model":"m","message":{"content":"OK"},"done":true}\n',
+                { status: 200 },
+            );
+        }) as typeof fetch;
+        try {
+            await runMonitor(env, ctx, Date.now());
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+
+        expect(maxFree).toBe(1);
+        expect(maxPaid).toBe(2);
+        for (const model of ['m1', 'm2', 'm3']) {
+            const freeEnd = events.findIndex(
+                (event) => event.phase === 'end' && event.pool === 'free' && event.model === model,
+            );
+            const paidStart = events.findIndex(
+                (event) => event.phase === 'start' && event.pool === 'paid' && event.model === model,
+            );
+            expect(freeEnd).toBeGreaterThanOrEqual(0);
+            expect(paidStart).toBeGreaterThan(freeEnd);
+        }
+        // m2's Free work starts while m1's Paid work remains active: the queues overlap rather
+        // than serializing every model through Free then Paid.
+        expect(
+            events.findIndex((event) => event.phase === 'start' && event.pool === 'free' && event.model === 'm2'),
+        ).toBeLessThan(
+            events.findIndex((event) => event.phase === 'end' && event.pool === 'paid' && event.model === 'm1'),
+        );
+    });
+
+    it('abandons a run when its hard stop fires while draining after the soft deadline', async () => {
+        const originalFetch = globalThis.fetch;
+        const OriginalAbortController = globalThis.AbortController;
+        const controllers: AbortController[] = [];
+        class CapturingAbortController extends OriginalAbortController {
+            constructor() {
+                super();
+                controllers.push(this);
+            }
+        }
+        globalThis.AbortController = CapturingAbortController;
+        const startedMs = Date.parse('2026-07-10T13:00:00.000Z');
+        let currentMs = startedMs;
+        const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => currentMs);
+        const writes: Array<{ sql: string; bindings: unknown[] }> = [];
+        const models = ['m1', 'm2'].map((remote_name) => ({
+            id: `ollama:${remote_name}`,
+            provider_id: 'ollama-free',
+            remote_name,
+            digest: 'digest',
+            last_show_at: null,
+            tier: 'UNKNOWN' as const,
+        }));
+        const env = {
+            OLLAMA_BASE_URL: 'https://example.test/api',
+            OLLAMA_API_KEY_FREE: 'free-key',
+            FREE_PROBE_CONCURRENCY: '2',
+            PAID_PROBE_CONCURRENCY: '6',
+            PROBE_DELAY_MIN_MS: '0',
+            PROBE_DELAY_MAX_MS: '0',
+            DB: {
+                prepare(sql: string) {
+                    let bindings: unknown[] = [];
+                    return {
+                        bind(...values: unknown[]) {
+                            bindings = values;
+                            return this;
+                        },
+                        async run() {
+                            writes.push({ sql, bindings });
+                            return { meta: { changes: 1 } };
+                        },
+                        async all() {
+                            if (/FROM providers WHERE active=1/.test(sql))
+                                return {
+                                    results: [
+                                        {
+                                            id: 'ollama-free',
+                                            name: 'Free',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_FREE',
+                                        },
+                                    ],
+                                };
+                            if (/FROM models WHERE provider_id='ollama-free' AND active=1/.test(sql))
+                                return { results: models };
+                            return { results: [] };
+                        },
+                        async first() {
+                            return null;
+                        },
+                    };
+                },
+                async batch(statements: Array<{ run: () => Promise<unknown> }>) {
+                    return Promise.all(statements.map((statement) => statement.run()));
+                },
+            },
+        } as unknown as Env;
+        const ctx = { waitUntil() {} } as unknown as Parameters<typeof runMonitor>[1];
+        let releaseFirst: ((response: Response) => void) | undefined;
+        let chatsStarted = 0;
+        let resolveChatsStarted: (() => void) | undefined;
+        const bothChatsStarted = new Promise<void>((resolve) => {
+            resolveChatsStarted = resolve;
+        });
+        globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+            const url = input.toString();
+            if (url.endsWith('/tags'))
+                return Promise.resolve(
+                    new Response(
+                        JSON.stringify({
+                            models: models.map(({ remote_name, digest }) => ({
+                                name: remote_name,
+                                digest,
+                            })),
+                        }),
+                        { status: 200 },
+                    ),
+                );
+            if (url.endsWith('/show')) return Promise.resolve(new Response('{}', { status: 200 }));
+            chatsStarted += 1;
+            if (chatsStarted === 2) resolveChatsStarted?.();
+            const model = JSON.parse(String(init?.body)).model as string;
+            if (model === 'm1')
+                return new Promise<Response>((resolve) => {
+                    releaseFirst = resolve;
+                });
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener(
+                    'abort',
+                    () => reject(new DOMException('aborted', 'AbortError')),
+                    { once: true },
+                );
+            });
+        }) as typeof fetch;
+
+        try {
+            const run = runMonitor(env, ctx, startedMs);
+            await bothChatsStarted;
+            // Move past the soft deadline, then let m1 finish so the coordinator enters its
+            // active-worker drain while m2 remains stalled.
+            currentMs += 251_000;
+            releaseFirst?.(
+                new Response('{"model":"m1","message":{"content":"OK"},"done":true}\n', {
+                    status: 200,
+                }),
+            );
+            for (let index = 0; index < 20; index += 1) await Promise.resolve();
+            // The run controller is the first controller created by runMonitor. Aborting it here
+            // models the hard-stop timer firing during the soft-deadline drain.
+            controllers[0]?.abort();
+            await run;
+        } finally {
+            globalThis.fetch = originalFetch;
+            globalThis.AbortController = OriginalAbortController;
+            dateNow.mockRestore();
+        }
+
+        expect(
+            writes.some(
+                (entry) =>
+                    /UPDATE monitor_runs SET finished_at=\?,outcome='ERROR',phase='ABANDONED'/.test(
+                        entry.sql,
+                    ) && entry.bindings.includes('hard_stop'),
+            ),
+        ).toBe(true);
+        expect(
+            writes.some((entry) => /outcome=\?,phase='COMPLETED'/.test(entry.sql)),
+        ).toBe(false);
+    });
+
     it('prevents duplicate concurrent runs by keeping the lock for its first owner', async () => {
         // The first acquireLock inserts the row (changes=1, lock granted). A second caller while
         // the lease is still valid must NOT take the lock: the ON CONFLICT DO UPDATE WHERE clause
@@ -1295,7 +1559,8 @@ describe('monitor run recovery', () => {
             OLLAMA_BASE_URL: 'https://example.test/api',
             OLLAMA_API_KEY_FREE: 'k',
             OLLAMA_API_KEY_PAID: 'paid-k',
-            PROBE_CONCURRENCY: '1',
+            FREE_PROBE_CONCURRENCY: '1',
+            PAID_PROBE_CONCURRENCY: '6',
             PROBE_DELAY_MIN_MS: '0',
             PROBE_DELAY_MAX_MS: '0',
             DB: {

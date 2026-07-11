@@ -1,8 +1,8 @@
 # Ollama Cloud Status
 
-Cloudflare Worker and React dashboard that monitors the Ollama Cloud free and paid accounts. It discovers one global catalog, probes each model with both accounts without retaining output, groups models by free or paid entitlement, and publishes public status.
+Cloudflare Worker and React dashboard that monitors the Ollama Cloud free and paid accounts. It discovers one global catalog, probes each model with the free account without retaining output, groups models by free or paid entitlement, and publishes public status.
 
-Models are categorized from the free-account result: a successful free probe means **Free**; a `403` saying the model requires a subscription means **Paid**. That response is expected entitlement information, not an outage or an excluded model. The paid account is still probed for both categories because it can use free models while consuming quota.
+Models are categorized from the free-account result: a successful free probe means **Free**; a `403` saying the model requires a subscription means **Paid**. That response is expected entitlement information, not an outage or an excluded model. The paid account is probed only after the free response identifies a model as requiring a subscription.
 
 ## Local setup
 
@@ -23,7 +23,8 @@ each deployment environment so they can be adjusted independently.
 | `OLLAMA_MAX_TOKENS`           | `8`                      | `num_predict` limit for each probe. Use a whole number from `1` to `4096`; larger values make checks slower and consume more quota.                                                       |
 | `FREE_CHECK_INTERVAL_MINUTES` | `5`                      | Normal interval between checks of free and unknown models. Allowed values: `5`, `10`, `15`, `20`, `30`, or `60`; other values use the default.                                            |
 | `PAID_CHECK_INTERVAL_MINUTES` | `10`                     | Normal interval between checks of paid models. Allowed values: `5`, `10`, `15`, `20`, `30`, or `60`; other values use the default.                                                        |
-| `PROBE_CONCURRENCY`           | `1`                      | Number of model checks processed concurrently. Values below `1` fall back to `1`; values above `16` are capped at `16`. Free keys should normally remain at `1` to avoid `429` responses. |
+| `FREE_PROBE_CONCURRENCY`      | `1`                      | Number of free-account probes processed concurrently. Values below `1` fall back to `1`; values above `16` are capped at `16`. Keep this at `1` to avoid free-key `429` responses.       |
+| `PAID_PROBE_CONCURRENCY`      | `6`                      | Number of paid-account probes processed concurrently after the corresponding free probe returns `SUBSCRIPTION_REQUIRED`. Values below `1` fall back to `1`; values above `16` are capped at `16`. |
 | `PROBE_DELAY_MIN_MS`          | `0`                      | Minimum random delay, in milliseconds, applied before each model check.                                                                                                                   |
 | `PROBE_DELAY_MAX_MS`          | `5000`                   | Maximum random delay, in milliseconds, applied before each model check. This value also contributes to the run deadline, so a large value can cause a run to finish only partially.       |
 | `EXCLUDED_MODELS`             | _(unset)_                | Comma-separated model names to exclude from monitoring. Set it as a Worker variable when needed.                                                                                          |

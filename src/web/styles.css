@@ -117,6 +117,23 @@ time,
     font-size: 0.82rem;
     margin: 0;
 }
+.model-tags {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.tag {
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid #1b2c45;
+    white-space: nowrap;
+}
+.access-tag {
+    color: #ff9f4d;
+    border-color: #684c2b;
+}
 .dot {
     width: 9px;
     height: 9px;
