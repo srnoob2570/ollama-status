@@ -21,13 +21,17 @@ each deployment environment so they can be adjusted independently.
 | ----------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `OLLAMA_BASE_URL`             | `https://ollama.com/api` | Base URL for the Ollama API.                                                                                                                                                              |
 | `OLLAMA_MAX_TOKENS`           | `8`                      | `num_predict` limit for each probe. Use a whole number from `1` to `4096`; larger values make checks slower and consume more quota.                                                       |
-| `FREE_CHECK_INTERVAL_MINUTES` | `5`                      | Normal interval, in whole minutes, between checks of free and unknown models. Invalid or non-positive values use the default.                                                             |
-| `PAID_CHECK_INTERVAL_MINUTES` | `10`                     | Normal interval, in whole minutes, between checks of paid models. Invalid or non-positive values use the default.                                                                         |
+| `FREE_CHECK_INTERVAL_MINUTES` | `5`                      | Normal interval between checks of free and unknown models. Allowed values: `5`, `10`, `15`, `20`, `30`, or `60`; other values use the default.                                            |
+| `PAID_CHECK_INTERVAL_MINUTES` | `10`                     | Normal interval between checks of paid models. Allowed values: `5`, `10`, `15`, `20`, `30`, or `60`; other values use the default.                                                        |
 | `PROBE_CONCURRENCY`           | `1`                      | Number of model checks processed concurrently. Values below `1` fall back to `1`; values above `16` are capped at `16`. Free keys should normally remain at `1` to avoid `429` responses. |
 | `PROBE_DELAY_MIN_MS`          | `0`                      | Minimum random delay, in milliseconds, applied before each model check.                                                                                                                   |
 | `PROBE_DELAY_MAX_MS`          | `5000`                   | Maximum random delay, in milliseconds, applied before each model check. This value also contributes to the run deadline, so a large value can cause a run to finish only partially.       |
 | `EXCLUDED_MODELS`             | _(unset)_                | Comma-separated model names to exclude from monitoring. Set it as a Worker variable when needed.                                                                                          |
 | `CONFIRMATION_CALLBACK_URL`   | _(unset)_                | Public endpoint that receives external incident confirmations. It must be set together with the GitHub confirmation options below.                                                        |
+
+The `1h` history is a strict rolling 60-minute window with one bucket per real scheduled model
+execution. Bucket counts therefore follow each model's effective interval. Longer ranges keep
+their hourly or daily aggregation.
 
 The following values are secrets and must be configured with `wrangler secret put --env <staging|production>`, never in `wrangler.jsonc` or browser code.
 

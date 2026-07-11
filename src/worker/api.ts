@@ -1,5 +1,5 @@
 import { ensureProviders } from './monitor';
-import { CRON_INTERVAL_MS } from './status';
+import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status';
 import type { Env } from './types';
 import { now } from './types';
 
@@ -18,9 +18,7 @@ function defaultCache(): Cache {
     return (caches as unknown as { default: Cache }).default;
 }
 
-// Fixed 5-minute buckets for the 1h range, decoupled from the per-tier check cadence so
-// staggered/async checks land wherever they land without creating false "no data" gaps.
-const HISTORY_1H_BUCKET_MINUTES = 5;
+const HISTORY_1H_WINDOW_MS = 60 * 60_000;
 
 export type HistoryRange = '1h' | '24h' | '7d' | '30d';
 export type StatusRow = {
@@ -39,6 +37,19 @@ export type HistoryCheck = {
     classification: string;
     total_duration_ms: number | null;
     rtt_ms: number | null;
+    execution_id?: string | null;
+};
+export type HistoryExecutionState =
+    'SCHEDULED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'DEFERRED' | 'ABANDONED';
+export type HistoryExecution = {
+    id: string;
+    model_id: string;
+    tier: string;
+    interval_minutes: number;
+    scheduled_at: string;
+    started_at: string | null;
+    completed_at: string | null;
+    state: HistoryExecutionState;
 };
 export type HistorySegment = { status: string; checks: number };
 export type HistoryBucket = {
@@ -48,9 +59,11 @@ export type HistoryBucket = {
     segments: HistorySegment[];
     averageLatencyMs: number | null;
     latencySamples: number;
-    // True on an empty bucket that contains "now" — the current cycle's check hasn't
-    // landed yet (run in progress or next check still pending). Older empty buckets are
-    // genuine "no data" gaps. Only meaningful when checks === 0.
+    checkedAt?: string | null;
+    completedAt?: string | null;
+    executionState?: HistoryExecutionState;
+    // True when a real scheduled execution exists but its availability result has not landed.
+    // Only meaningful when checks === 0.
     pending?: boolean;
 };
 type ScheduledModel = { tier: string; next_check_at: string | null };
@@ -63,29 +76,11 @@ const rangeConfiguration = (
         requestedRange === '24h' || requestedRange === '7d' || requestedRange === '30d'
             ? requestedRange
             : '1h';
-    const bucketDurationMs =
-        range === '1h'
-            ? HISTORY_1H_BUCKET_MINUTES * 60_000
-            : range === '24h'
-              ? 3_600_000
-              : 86_400_000;
-    const bucketCount =
-        range === '1h'
-            ? 60 / HISTORY_1H_BUCKET_MINUTES
-            : range === '24h'
-              ? 24
-              : range === '7d'
-                ? 7
-                : 30;
+    const bucketDurationMs = range === '1h' ? 0 : range === '24h' ? 3_600_000 : 86_400_000;
+    const bucketCount = range === '1h' ? 0 : range === '24h' ? 24 : range === '7d' ? 7 : 30;
     const start = new Date(timestamp);
     if (range === '1h') {
-        // Grid-align to the 5-minute slot containing `now` so bucket boundaries depend only
-        // on each check's timestamp, not on when the request happens. The window shifts
-        // discretely (only when `now` crosses a slot boundary) instead of sliding
-        // continuously, so a check never flits between buckets across refreshes — no
-        // transient holes that later "refill". The last bucket is the slot containing `now`.
-        const slotStartMs = Math.floor(timestamp.getTime() / bucketDurationMs) * bucketDurationMs;
-        start.setTime(slotStartMs - (bucketCount - 1) * bucketDurationMs);
+        start.setTime(timestamp.getTime() - HISTORY_1H_WINDOW_MS);
     } else {
         if (range === '24h') start.setUTCMinutes(0, 0, 0);
         else start.setUTCHours(0, 0, 0, 0);
@@ -123,10 +118,7 @@ export function historyBuckets(
     timestamp = new Date(),
 ): HistoryBucket[] {
     const config = rangeConfiguration(range, timestamp);
-    const lastIndex = config.bucketCount - 1;
-    // Only the 1h range distinguishes "pending" from "no data"; coarser ranges keep their
-    // existing semantics where an empty bucket is simply "no data".
-    const markPending = config.range === '1h';
+    if (config.range === '1h') return executionHistoryBuckets([], checks, timestamp);
     const buckets = Array.from({ length: config.bucketCount }, (_, index) => ({
         startAt: new Date(config.start.getTime() + index * config.bucketDurationMs).toISOString(),
         status: 'UNKNOWN',
@@ -134,9 +126,7 @@ export function historyBuckets(
         segmentCounts: new Map<string, number>(),
         totalDurations: [] as number[],
         rtts: [] as number[],
-        // The last bucket ends at `timestamp` (now); when empty it means the current cycle's
-        // check hasn't landed yet (run in progress or next check still pending), not a gap.
-        pending: markPending && index === lastIndex,
+        pending: false,
     }));
     for (const check of checks) {
         const index = Math.floor(
@@ -173,6 +163,95 @@ export function historyBuckets(
             );
         return { ...bucket, segments, averageLatencyMs, latencySamples: timings.length };
     });
+}
+
+function checkLatency(check: HistoryCheck): number | null {
+    return typeof check.total_duration_ms === 'number'
+        ? check.total_duration_ms
+        : typeof check.rtt_ms === 'number'
+          ? check.rtt_ms
+          : null;
+}
+
+function completedExecutionBucket(
+    startAt: string,
+    check: HistoryCheck,
+    completedAt: string,
+    executionState: HistoryExecutionState = 'COMPLETED',
+): HistoryBucket {
+    const latency = checkLatency(check);
+    return {
+        startAt,
+        checkedAt: check.checked_at,
+        completedAt,
+        executionState,
+        status: check.public_status,
+        checks: 1,
+        segments: [{ status: check.public_status, checks: 1 }],
+        averageLatencyMs: latency,
+        latencySamples: latency === null ? 0 : 1,
+        pending: false,
+    };
+}
+
+function effectiveExecutionCheck(
+    execution: HistoryExecution,
+    checks: HistoryCheck[],
+): HistoryCheck | undefined {
+    const executionChecks = checks.filter((check) => check.execution_id === execution.id);
+    if (execution.tier === 'PAID')
+        return (
+            executionChecks.find((check) => check.provider_id === 'ollama-paid') ??
+            executionChecks.find((check) => check.provider_id === 'ollama-free')
+        );
+    return (
+        executionChecks.find((check) => check.provider_id === 'ollama-free') ?? executionChecks[0]
+    );
+}
+
+export function executionHistoryBuckets(
+    executions: HistoryExecution[],
+    checks: HistoryCheck[],
+    timestamp = new Date(),
+): HistoryBucket[] {
+    const endMs = timestamp.getTime();
+    const startMs = endMs - HISTORY_1H_WINDOW_MS;
+    const executionBuckets = executions
+        .filter((execution) => {
+            const scheduledMs = Date.parse(execution.scheduled_at);
+            return scheduledMs >= startMs && scheduledMs <= endMs;
+        })
+        .map((execution): HistoryBucket => {
+            const check = effectiveExecutionCheck(execution, checks);
+            if (check && execution.state === 'COMPLETED')
+                return completedExecutionBucket(
+                    execution.scheduled_at,
+                    check,
+                    execution.completed_at ?? check.checked_at,
+                    execution.state,
+                );
+            return {
+                startAt: execution.scheduled_at,
+                checkedAt: null,
+                completedAt: execution.completed_at,
+                executionState: execution.state,
+                status: 'UNKNOWN',
+                checks: 0,
+                segments: [],
+                averageLatencyMs: null,
+                latencySamples: 0,
+                pending: execution.state === 'SCHEDULED' || execution.state === 'RUNNING',
+            };
+        });
+    const legacyBuckets = checks
+        .filter((check) => {
+            const checkedMs = Date.parse(check.checked_at);
+            return !check.execution_id && checkedMs >= startMs && checkedMs <= endMs;
+        })
+        .map((check) => completedExecutionBucket(check.checked_at, check, check.checked_at));
+    return [...executionBuckets, ...legacyBuckets].sort(
+        (left, right) => Date.parse(left.startAt) - Date.parse(right.startAt),
+    );
 }
 
 export function effectiveProvider(
@@ -385,7 +464,7 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
     await ensureProviders(env);
     const timestamp = new Date();
     const configuration = rangeConfiguration(requestedRange, timestamp);
-    const [providers, modelResult, statuses, checks, monitor] = await Promise.all([
+    const [providers, modelResult, statuses, checks, executions, monitor] = await Promise.all([
         env.DB.prepare(
             'SELECT id,name,catalog_status,catalog_checked_at FROM providers WHERE active=1 ORDER BY name',
         ).all(),
@@ -396,16 +475,27 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
             'SELECT provider_id,model_id,public_status,classification,last_check_at,last_latency_ms FROM provider_model_status',
         ).all<StatusRow>(),
         env.DB.prepare(
-            "SELECT c.provider_id,c.model_id,c.checked_at,c.public_status,c.classification,c.total_duration_ms,c.rtt_ms FROM checks c JOIN models m ON m.id=c.model_id WHERE m.provider_id='ollama-free' AND c.checked_at>=? ORDER BY c.checked_at",
+            "SELECT c.provider_id,c.model_id,c.checked_at,c.public_status,c.classification,c.total_duration_ms,c.rtt_ms,c.execution_id FROM checks c JOIN models m ON m.id=c.model_id WHERE m.provider_id='ollama-free' AND c.checked_at>=? AND c.checked_at<=? ORDER BY c.checked_at",
         )
-            .bind(configuration.start.toISOString())
+            .bind(configuration.start.toISOString(), timestamp.toISOString())
             .all<HistoryCheck>(),
+        env.DB.prepare(
+            `SELECT id,model_id,tier,interval_minutes,scheduled_at,started_at,completed_at,state
+             FROM model_check_executions
+             WHERE ?='1h' AND scheduled_at>=? AND scheduled_at<=?
+             ORDER BY scheduled_at`,
+        )
+            .bind(configuration.range, configuration.start.toISOString(), timestamp.toISOString())
+            .all<HistoryExecution>(),
         monitorRuns(env),
     ]);
     const models = modelResult.results.map((model) => {
         const providerId = effectiveProvider(model.tier, model.id, statuses.results);
-        const providerChecks = checks.results.filter(
-            (check) => check.model_id === model.id && check.provider_id === providerId,
+        const modelChecks = checks.results.filter((check) => check.model_id === model.id);
+        const providerChecks = modelChecks.filter((check) => check.provider_id === providerId);
+        const intervalMinutes = nominalCheckIntervalMinutes(
+            model.tier === 'PAID' ? 'PAID' : model.tier === 'FREE' ? 'FREE' : 'UNKNOWN',
+            env,
         );
         const effectiveStatus = statuses.results.find(
             (status) => status.model_id === model.id && status.provider_id === providerId,
@@ -417,12 +507,24 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
             effectiveClassification: effectiveStatus?.classification ?? 'UNKNOWN',
             lastCheckAt: effectiveStatus?.last_check_at ?? null,
             lastLatencyMs: effectiveStatus?.last_latency_ms ?? null,
+            intervalMinutes,
             metrics: latencyMetrics(providerChecks),
-            history: historyBuckets(providerChecks, configuration.range, timestamp),
+            history:
+                configuration.range === '1h'
+                    ? executionHistoryBuckets(
+                          executions.results.filter((execution) => execution.model_id === model.id),
+                          modelChecks,
+                          timestamp,
+                      )
+                    : historyBuckets(providerChecks, configuration.range, timestamp),
         };
     });
     return json({
         lastUpdatedAt: monitor.lastSuccessfulFinishedAt,
+        checkIntervals: {
+            free: nominalCheckIntervalMinutes('FREE', env),
+            paid: nominalCheckIntervalMinutes('PAID', env),
+        },
         nextUpdates: nextUpdatesForModels(modelResult.results),
         range: configuration.range,
         monitor: monitor.lastRun,

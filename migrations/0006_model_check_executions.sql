@@ -19,6 +19,8 @@ CREATE TABLE model_check_executions (
 
 CREATE INDEX idx_model_check_executions_model_time
   ON model_check_executions(model_id, scheduled_at DESC);
+CREATE INDEX idx_model_check_executions_scheduled_at
+  ON model_check_executions(scheduled_at);
 CREATE INDEX idx_model_check_executions_run_state
   ON model_check_executions(run_id, state);
 CREATE UNIQUE INDEX idx_model_check_executions_model_scheduled

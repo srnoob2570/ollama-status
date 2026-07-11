@@ -284,8 +284,10 @@ async function storeProbe(
     scheduledAtMs: number,
 ): Promise<void> {
     const timestamp = now();
-    await env.DB.prepare(
-        'INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,load_duration_ms,error_code,execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+    const inserted = await env.DB.prepare(
+        `INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,load_duration_ms,error_code,execution_id)
+         SELECT ?,?,?,?,?,?,?,?,?,?,?,?
+         WHERE EXISTS (SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING')`,
     )
         .bind(
             id('chk'),
@@ -300,8 +302,10 @@ async function storeProbe(
             result.loadDurationMs ?? null,
             result.errorCode ?? null,
             executionId,
+            executionId,
         )
         .run();
+    if (inserted.meta.changes !== 1) throw new Error('execution_not_running');
     await materializeStatus(env, provider, model, result, timestamp, scheduledAtMs);
 }
 

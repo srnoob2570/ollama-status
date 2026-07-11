@@ -15,6 +15,7 @@ import { maxResponseTokens } from '../src/worker/probe-config';
 import { OllamaProvider, PROBE_TIMEOUT_MS } from '../src/worker/ollama';
 import {
     effectiveProvider,
+    executionHistoryBuckets,
     findActiveRun,
     historyBuckets,
     isInfeasible,
@@ -39,164 +40,177 @@ import {
 import { now } from '../src/worker/types';
 import type { Env, Model, ProbeResult, Provider } from '../src/worker/types';
 import { nextUpdateLabel, roundUpToMonitorInterval } from '../src/web/next-update';
+import { cadenceLegend } from '../src/web/cadence';
 
 describe('Ollama status classification', () => {
-    it('uses a grid-aligned one-hour window with fixed 5-minute buckets for every tier', () => {
-        // reference 13:34 sits in the 5-minute slot [13:30,13:35); the window is the 12 slots
-        // ending at that slot, i.e. [12:35, 13:35) with bucket starts 12:35 .. 13:30.
+    it('uses one 1h bucket per real execution and selects the effective provider result', () => {
         const reference = new Date('2026-07-10T13:34:00.000Z');
-        const free = historyBuckets(
-            [
-                {
-                    provider_id: 'ollama-free',
-                    model_id: 'm1',
-                    checked_at: '2026-07-10T12:40:05.000Z',
-                    public_status: 'OPERATIONAL',
-                    classification: 'SUCCESS',
-                    total_duration_ms: 20,
-                    rtt_ms: 25,
-                },
-                {
-                    provider_id: 'ollama-free',
-                    model_id: 'm1',
-                    checked_at: '2026-07-10T13:30:05.000Z',
-                    public_status: 'OPERATIONAL',
-                    classification: 'SUCCESS',
-                    total_duration_ms: null,
-                    rtt_ms: 30,
-                },
-                {
-                    provider_id: 'ollama-free',
-                    model_id: 'm1',
-                    checked_at: '2026-07-10T13:30:50.000Z',
-                    public_status: 'OUTAGE',
-                    classification: 'TIMEOUT',
-                    total_duration_ms: null,
-                    rtt_ms: 40,
-                },
-            ],
-            null,
-            reference,
-        );
-        // Bucket size is decoupled from cadence: both tiers get 12 fixed 5-minute buckets.
-        const paid = historyBuckets([], '1h', reference);
-
-        expect(free).toHaveLength(12);
-        expect(paid).toHaveLength(12);
-        // Grid-aligned boundaries: first bucket [12:35,12:40), last (current slot) [13:30,13:35).
-        expect(free[0]).toMatchObject({ startAt: '2026-07-10T12:35:00.000Z', checks: 0 });
-        expect(free.at(-1)?.startAt).toBe('2026-07-10T13:30:00.000Z');
-        expect(paid[0].startAt).toBe('2026-07-10T12:35:00.000Z');
-        expect(paid.at(-1)?.startAt).toBe('2026-07-10T13:30:00.000Z');
-        // A check at 12:40:05 lands in the [12:40,12:45) bucket (one per slot, no redistribution).
-        expect(free[1]).toMatchObject({
-            startAt: '2026-07-10T12:40:00.000Z',
-            checks: 1,
-            status: 'OPERATIONAL',
-        });
-        // Two checks in the current slot [13:30,13:35) collapse to worst status (OUTAGE).
-        expect(free.at(-1)).toMatchObject({
-            startAt: '2026-07-10T13:30:00.000Z',
-            checks: 2,
-            status: 'OUTAGE',
-        });
-        expect(historyBuckets([], 'invalid', reference)).toHaveLength(12);
-    });
-
-    it('keeps each check in a stable, grid-aligned bucket across refreshes (no transient holes)', () => {
-        // 12 checks at a 5-minute cadence with small jitter (one per slot at :05), reflecting
-        // staggered execution. Two refreshes 90s apart (same slot) must assign every check to
-        // the SAME bucket — the old sliding `start = now - 60min` calculation would shift
-        // boundaries by 90s between these calls and redistribute checks, creating a hole that
-        // later refills. Grid alignment pins each check to its clock slot regardless of `now`.
-        const slotChecks = Array.from({ length: 12 }, (_, k) => {
-            const start = new Date('2026-07-10T12:35:00.000Z').getTime() + k * 5 * 60_000;
-            return {
+        const executions = [
+            {
+                id: 'exec-free',
+                model_id: 'm1',
+                tier: 'FREE',
+                interval_minutes: 5,
+                scheduled_at: '2026-07-10T13:20:00.000Z',
+                started_at: '2026-07-10T13:20:04.000Z',
+                completed_at: '2026-07-10T13:22:00.000Z',
+                state: 'COMPLETED' as const,
+            },
+            {
+                id: 'exec-paid',
+                model_id: 'm1',
+                tier: 'PAID',
+                interval_minutes: 10,
+                scheduled_at: '2026-07-10T13:30:00.000Z',
+                started_at: '2026-07-10T13:30:03.000Z',
+                completed_at: '2026-07-10T13:33:00.000Z',
+                state: 'COMPLETED' as const,
+            },
+        ];
+        const checks = [
+            {
                 provider_id: 'ollama-free',
                 model_id: 'm1',
-                checked_at: new Date(start + 5_000).toISOString(),
+                checked_at: '2026-07-10T13:21:58.000Z',
                 public_status: 'OPERATIONAL',
                 classification: 'SUCCESS',
-                total_duration_ms: 15,
-                rtt_ms: 20,
-            };
+                total_duration_ms: 120_000,
+                rtt_ms: 120_010,
+                execution_id: 'exec-free',
+            },
+            {
+                provider_id: 'ollama-free',
+                model_id: 'm1',
+                checked_at: '2026-07-10T13:30:30.000Z',
+                public_status: 'PLAN_REQUIRED',
+                classification: 'SUBSCRIPTION_REQUIRED',
+                total_duration_ms: null,
+                rtt_ms: 300,
+                execution_id: 'exec-paid',
+            },
+            {
+                provider_id: 'ollama-paid',
+                model_id: 'm1',
+                checked_at: '2026-07-10T13:32:55.000Z',
+                public_status: 'DEGRADED',
+                classification: 'HIGH_LATENCY',
+                total_duration_ms: 175_000,
+                rtt_ms: 175_010,
+                execution_id: 'exec-paid',
+            },
+        ];
+
+        const buckets = executionHistoryBuckets(executions, checks, reference);
+        expect(buckets).toHaveLength(2);
+        expect(buckets[0]).toMatchObject({
+            startAt: '2026-07-10T13:20:00.000Z',
+            checkedAt: '2026-07-10T13:21:58.000Z',
+            completedAt: '2026-07-10T13:22:00.000Z',
+            executionState: 'COMPLETED',
+            status: 'OPERATIONAL',
+            checks: 1,
+            averageLatencyMs: 120_000,
         });
-        const now1 = new Date('2026-07-10T13:32:00.000Z');
-        const now2 = new Date('2026-07-10T13:33:30.000Z'); // 90s later, still in slot [13:30,13:35)
-
-        const atNow1 = historyBuckets(slotChecks, '1h', now1);
-        const atNow2 = historyBuckets(slotChecks, '1h', now2);
-
-        // Identical boundaries and counts across refreshes — no redistribution, no flit.
-        expect(atNow1.map((b) => b.startAt)).toEqual(atNow2.map((b) => b.startAt));
-        expect(atNow1.map((b) => b.checks)).toEqual(atNow2.map((b) => b.checks));
-        // Every bucket holds exactly one check — no hole between filled buckets.
-        expect(atNow1.every((b) => b.checks === 1)).toBe(true);
-        // A fixed check stays in its clock slot regardless of `now`.
-        const slotOfCheck = (buckets: typeof atNow1) =>
-            buckets.find((b) => b.startAt === '2026-07-10T12:40:00.000Z')?.checks;
-        expect(slotOfCheck(atNow1)).toBe(1);
-        expect(slotOfCheck(atNow2)).toBe(1);
-    });
-
-    it('scrolls the 1h window by one slot when now crosses a 5-minute boundary', () => {
-        // A check at 13:30:05 belongs to slot [13:30,13:35). While now is in that slot it is the
-        // last bucket; after now crosses 13:35 it becomes the second-to-last — same clock slot,
-        // only the window position changed (discrete scroll, not a redistribution).
-        const check = {
-            provider_id: 'ollama-free',
-            model_id: 'm1',
-            checked_at: '2026-07-10T13:30:05.000Z',
-            public_status: 'OPERATIONAL',
-            classification: 'SUCCESS',
-            total_duration_ms: 10,
-            rtt_ms: 12,
-        };
-        const before = historyBuckets([check], '1h', new Date('2026-07-10T13:34:59.999Z'));
-        const after = historyBuckets([check], '1h', new Date('2026-07-10T13:35:00.000Z'));
-        expect(before.at(-1)?.startAt).toBe('2026-07-10T13:30:00.000Z');
-        expect(before.at(-1)?.checks).toBe(1);
-        // After crossing the boundary the check is still in slot [13:30,13:35) (now second-to-last).
-        expect(after.at(-2)?.startAt).toBe('2026-07-10T13:30:00.000Z');
-        expect(after.at(-2)?.checks).toBe(1);
-        // The new current slot [13:35,13:40) is empty → pending.
-        expect(after.at(-1)).toMatchObject({
-            startAt: '2026-07-10T13:35:00.000Z',
-            checks: 0,
-            pending: true,
+        expect(buckets[1]).toMatchObject({
+            startAt: '2026-07-10T13:30:00.000Z',
+            checkedAt: '2026-07-10T13:32:55.000Z',
+            executionState: 'COMPLETED',
+            status: 'DEGRADED',
+            checks: 1,
+            averageLatencyMs: 175_000,
         });
     });
 
-    it('marks the empty bucket containing now as pending, older empty buckets as no data', () => {
+    it('keeps 1h strictly within the inclusive 60-minute window and preserves real states', () => {
         const reference = new Date('2026-07-10T13:34:00.000Z');
-        const buckets = historyBuckets([], '1h', reference);
-
-        expect(buckets).toHaveLength(12);
-        // Only the last bucket (ends at `now`) is pending when empty.
-        expect(buckets.at(-1)).toMatchObject({ checks: 0, pending: true });
-        // Every older empty bucket is a genuine no-data gap, not pending.
-        for (let i = 0; i < buckets.length - 1; i++) {
-            expect(buckets[i]).toMatchObject({ checks: 0, pending: false });
-        }
-        // A check landing in the last bucket (current slot [13:30,13:35)) clears its pending flag.
-        const withLastCheck = historyBuckets(
+        const makeExecution = (id: string, scheduledAt: string, state: 'RUNNING' | 'FAILED') => ({
+            id,
+            model_id: 'm1',
+            tier: 'FREE',
+            interval_minutes: 5,
+            scheduled_at: scheduledAt,
+            started_at: state === 'RUNNING' ? scheduledAt : null,
+            completed_at: state === 'FAILED' ? scheduledAt : null,
+            state,
+        });
+        const buckets = executionHistoryBuckets(
+            [
+                makeExecution('old', '2026-07-10T12:33:59.999Z', 'FAILED'),
+                makeExecution('boundary', '2026-07-10T12:34:00.000Z', 'FAILED'),
+                makeExecution('running', '2026-07-10T13:30:00.000Z', 'RUNNING'),
+                makeExecution('future', '2026-07-10T13:34:00.001Z', 'RUNNING'),
+            ],
             [
                 {
                     provider_id: 'ollama-free',
                     model_id: 'm1',
-                    checked_at: '2026-07-10T13:30:30.000Z',
+                    checked_at: '2026-07-10T12:34:00.000Z',
                     public_status: 'OPERATIONAL',
                     classification: 'SUCCESS',
-                    total_duration_ms: 20,
-                    rtt_ms: 25,
+                    total_duration_ms: 10,
+                    rtt_ms: 12,
+                    execution_id: null,
+                },
+                {
+                    provider_id: 'ollama-free',
+                    model_id: 'm1',
+                    checked_at: '2026-07-10T13:31:00.000Z',
+                    public_status: 'PLAN_REQUIRED',
+                    classification: 'SUBSCRIPTION_REQUIRED',
+                    total_duration_ms: null,
+                    rtt_ms: 500,
+                    execution_id: 'running',
                 },
             ],
-            '1h',
             reference,
         );
-        expect(withLastCheck.at(-1)).toMatchObject({ checks: 1, pending: false });
-        // The bucket before it stays a no-data gap (still empty, not now).
-        expect(withLastCheck.at(-2)).toMatchObject({ checks: 0, pending: false });
+        expect(buckets.map((bucket) => bucket.startAt)).toEqual([
+            '2026-07-10T12:34:00.000Z',
+            '2026-07-10T12:34:00.000Z',
+            '2026-07-10T13:30:00.000Z',
+        ]);
+        expect(buckets[0]).toMatchObject({ executionState: 'FAILED', checks: 0 });
+        expect(buckets[1]).toMatchObject({ executionState: 'COMPLETED', checks: 1 });
+        expect(buckets[2]).toMatchObject({
+            executionState: 'RUNNING',
+            pending: true,
+            checks: 0,
+            status: 'UNKNOWN',
+        });
+    });
+
+    it('returns the configured number of real executions without merging neighboring results', () => {
+        const reference = new Date('2026-07-10T13:34:00.000Z');
+        for (const interval of [5, 10, 15, 20, 30, 60]) {
+            const count = 60 / interval;
+            const executions = Array.from({ length: count }, (_, index) => {
+                const scheduledAt = reference.getTime() - (count - 1 - index) * interval * 60_000;
+                return {
+                    id: `exec-${interval}-${index}`,
+                    model_id: 'm1',
+                    tier: interval === 10 ? 'PAID' : 'FREE',
+                    interval_minutes: interval,
+                    scheduled_at: new Date(scheduledAt).toISOString(),
+                    started_at: new Date(scheduledAt + 1_000).toISOString(),
+                    completed_at: new Date(scheduledAt + 2_000).toISOString(),
+                    state: 'COMPLETED' as const,
+                };
+            });
+            const checks = executions.map((execution, index) => ({
+                provider_id: execution.tier === 'PAID' ? 'ollama-paid' : 'ollama-free',
+                model_id: 'm1',
+                checked_at: execution.completed_at!,
+                public_status: index % 2 ? 'OPERATIONAL' : 'OUTAGE',
+                classification: index % 2 ? 'SUCCESS' : 'TIMEOUT',
+                total_duration_ms: 2_000,
+                rtt_ms: 2_010,
+                execution_id: execution.id,
+            }));
+            const buckets = executionHistoryBuckets(executions, checks, reference);
+            expect(buckets).toHaveLength(count);
+            expect(buckets.every((bucket) => bucket.checks === 1)).toBe(true);
+        }
+        expect(historyBuckets([], 'invalid', reference)).toEqual([]);
     });
 
     it('generates UTC hourly buckets and leaves periods without checks unknown', () => {
@@ -596,6 +610,9 @@ describe('Ollama status classification', () => {
         expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'FREE')).toBe(5);
         expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'PAID')).toBe(10);
         expect(checkIntervalMinutes('DEGRADED', false, undefined, 'PAID')).toBe(15);
+        expect(cadenceLegend({ free: 15, paid: 20 })).toBe(
+            'Free models are checked every 15 minutes; paid models every 20 minutes. Completion times may vary.',
+        );
     });
 
     it('anchors the next check to the scheduled tick instead of probe completion time', () => {

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { cadenceLegend } from './cadence';
 import { nextUpdateLabel } from './next-update';
 
 type HistoryRange = '1h' | '24h' | '7d' | '30d';
@@ -15,11 +16,15 @@ type HistoryBucket = {
     latencySamples: number;
     segments?: HistorySegment[];
     pending?: boolean;
+    checkedAt?: string | null;
+    completedAt?: string | null;
+    executionState?: 'SCHEDULED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'DEFERRED' | 'ABANDONED';
 };
 type Model = {
     id: string;
     remote_name: string;
     tier: 'FREE' | 'PAID' | 'UNKNOWN';
+    intervalMinutes: number;
     effectiveStatus: string;
     history: HistoryBucket[];
 };
@@ -35,6 +40,7 @@ type MonitorRun = {
 };
 type Status = {
     lastUpdatedAt: string | null;
+    checkIntervals: { free: number; paid: number };
     nextUpdates: { free: string | null; paid: string | null };
     range: HistoryRange;
     stale: boolean;
@@ -148,9 +154,7 @@ export function App() {
                 <div>
                     <p className="eyebrow">OLLAMA CLOUD</p>
                     <h1>Service status</h1>
-                    <p className="subtle">
-                        Models are checked every 15 minutes.
-                    </p>
+                    <p className="subtle">{cadenceLegend(status.checkIntervals)}</p>
                 </div>
                 <div className="monitor-meta">
                     <LastDataUpdate value={status.lastUpdatedAt} />
@@ -371,10 +375,17 @@ type BucketDescription = {
     averageLatencyMs: number | null;
     segments: BucketSegmentView[];
     ariaLabel: string;
+    isExecution: boolean;
+    checkedTime: string | null;
+    completedTime: string | null;
+    executionState: HistoryBucket['executionState'];
 };
 
 function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescription {
     const time = bucketLabel(bucket.startAt, range);
+    const isExecution = range === '1h' && bucket.executionState !== undefined;
+    const checkedTime = bucket.checkedAt ? bucketLabel(bucket.checkedAt, '1h') : null;
+    const completedTime = bucket.completedAt ? bucketLabel(bucket.completedAt, '1h') : null;
     const hasData = bucket.checks > 0;
     const ranked = (bucket.segments ?? [])
         .filter((segment) => segment.checks > 0)
@@ -399,7 +410,13 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
         ? (labels[bucket.status] ?? 'Unknown')
         : bucket.pending
           ? 'Pending'
-          : 'No data';
+          : isExecution && bucket.executionState === 'DEFERRED'
+            ? 'Deferred'
+            : isExecution && bucket.executionState === 'ABANDONED'
+              ? 'Abandoned'
+              : isExecution
+                ? 'No observation'
+                : 'No data';
     const headlineTone = hasData
         ? (statusTone[bucket.status] ?? 'unknown')
         : bucket.pending
@@ -412,10 +429,14 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
             : `average ${Math.round(bucket.averageLatencyMs)} ms`;
     const headline = headlinePrefix ? `worst status ${headlineLabel}` : headlineLabel;
     const ariaLabel = hasData
-        ? `${time} · ${headline} · ${checksText} · ${averageText}`
+        ? isExecution
+            ? `${time} scheduled · ${checkedTime ?? 'unknown result time'} · ${headline} · ${averageText}`
+            : `${time} · ${headline} · ${checksText} · ${averageText}`
         : bucket.pending
           ? `${time} · pending next check`
-          : `${time} · no data`;
+          : isExecution
+            ? `${time} · ${headlineLabel.toLowerCase()}`
+            : `${time} · no data`;
     return {
         time,
         hasData,
@@ -426,6 +447,10 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
         averageLatencyMs: bucket.averageLatencyMs,
         segments,
         ariaLabel,
+        isExecution,
+        checkedTime,
+        completedTime,
+        executionState: bucket.executionState,
     };
 }
 
@@ -438,10 +463,10 @@ function History({ model, range }: { model: Model; range: HistoryRange }) {
     return (
         <div
             className={`history history-${range}`}
-            aria-label={`${model.remote_name} ${range} status history`}
+            aria-label={`${model.remote_name} ${range} status history; nominal interval ${model.intervalMinutes} minutes`}
         >
-            {model.history.map((bucket) => {
-                const key = bucket.startAt;
+            {model.history.map((bucket, index) => {
+                const key = `${bucket.startAt}-${bucket.checkedAt ?? bucket.executionState ?? index}`;
                 const data = describeBucket(bucket, range);
                 const show = (event: { currentTarget: HTMLElement }) =>
                     setActive({ key, rect: event.currentTarget.getBoundingClientRect(), data });
@@ -506,7 +531,7 @@ function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription
                 visibility: position ? 'visible' : 'hidden',
             }}
         >
-            <div className="tt-header">{data.time}</div>
+            <div className="tt-header">{data.isExecution ? 'Execution details' : data.time}</div>
             <div className="tt-status">
                 <span aria-hidden="true" className={`dot ${data.headlineTone}`} />
                 <span>
@@ -515,19 +540,39 @@ function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription
                         : data.headlineLabel}
                 </span>
             </div>
+            {data.isExecution && (
+                <div className="tt-metrics">
+                    <span className="tt-metric-label">Scheduled</span>
+                    <span className="tt-metric-value">{data.time}</span>
+                    <span className="tt-metric-label">Execution</span>
+                    <span className="tt-metric-value">
+                        {data.executionState?.toLowerCase() ?? '—'}
+                    </span>
+                    <span className="tt-metric-label">Result</span>
+                    <span className="tt-metric-value">{data.checkedTime ?? '—'}</span>
+                    <span className="tt-metric-label">Completed</span>
+                    <span className="tt-metric-value">{data.completedTime ?? '—'}</span>
+                </div>
+            )}
             {data.hasData && (
                 <>
                     <div className="tt-metrics">
-                        <span className="tt-metric-label">Checks</span>
-                        <span className="tt-metric-value">{data.checks}</span>
-                        <span className="tt-metric-label">Avg latency</span>
+                        {!data.isExecution && (
+                            <>
+                                <span className="tt-metric-label">Checks</span>
+                                <span className="tt-metric-value">{data.checks}</span>
+                            </>
+                        )}
+                        <span className="tt-metric-label">
+                            {data.isExecution ? 'Latency' : 'Avg latency'}
+                        </span>
                         <span className="tt-metric-value">
                             {data.averageLatencyMs === null
                                 ? '—'
                                 : `${Math.round(data.averageLatencyMs)} ms`}
                         </span>
                     </div>
-                    {data.segments.length > 0 && (
+                    {!data.isExecution && data.segments.length > 0 && (
                         <div className="tt-breakdown">
                             <div className="tt-bar">
                                 {data.segments.map((segment) => (
