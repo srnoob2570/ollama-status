@@ -27,7 +27,6 @@ export type PublicStatus =
 
 export interface Env {
     DB: D1Database;
-    INCIDENT_EVENTS: Queue<IncidentEvent>;
     ASSETS: Fetcher;
     OLLAMA_BASE_URL: string;
     OLLAMA_MAX_TOKENS?: string;
@@ -38,8 +37,6 @@ export interface Env {
     PROBE_DELAY_MAX_MS?: string;
     OLLAMA_API_KEY_FREE: string;
     OLLAMA_API_KEY_PAID: string;
-    DISCORD_WEBHOOK_URL?: string;
-    GENERIC_WEBHOOK_URL?: string;
     CONFIRMATION_HMAC_SECRET?: string;
     CONFIRMATION_CALLBACK_URL?: string;
     GITHUB_REPOSITORY?: string;
@@ -71,12 +68,6 @@ export interface ProbeResult {
     loadDurationMs?: number;
     errorCode?: string;
     retryAfterSeconds?: number;
-}
-export interface IncidentEvent {
-    incidentId: string;
-    eventType: 'opened' | 'updated' | 'resolved';
-    summary: string;
-    occurredAt: string;
 }
 
 export const now = () => new Date().toISOString();

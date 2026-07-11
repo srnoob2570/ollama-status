@@ -26,6 +26,8 @@ type Model = {
 type MonitorRun = {
     phase: string;
     outcome: string | null;
+    detail: string | null;
+    started_at?: string;
     scheduled_model_count: number;
     completed_model_count: number;
     failed_probe_count: number;
@@ -40,6 +42,7 @@ type Status = {
     monitor: { started_at?: string } | null;
     monitorProgress: MonitorRun | null;
     monitorActive: boolean;
+    stuckRun: MonitorRun | null;
     providers: Array<{ id: string; name: string; catalog_status: string }>;
     models: Model[];
 };
@@ -160,6 +163,12 @@ export function App() {
                     MONITOR STALE — no scheduler run has started in the last 20 minutes.
                 </section>
             )}
+            {status.stuckRun && (
+                <section className="notice error">
+                    MONITOR STUCK — the last run started over 5 minutes ago and hasn&apos;t
+                    finished. It will be abandoned and recovered on the next scheduler cycle.
+                </section>
+            )}
             {status.infeasible && (
                 <section className="notice warning">
                     MONITOR OVERLOADED — recent runs couldn&apos;t check every model within the
@@ -218,19 +227,30 @@ function StatusSignals({ status }: { status: Status }) {
         'UNKNOWN';
     const run = status.monitorProgress;
     const running = status.monitorActive;
-    const progress =
-        running && run
-            ? `Run ${run.completed_model_count}/${run.scheduled_model_count}`
-            : run?.outcome === 'ERROR'
-              ? 'Last run failed'
-              : 'Monitor ready';
+    // Distinguish a genuinely active run from a stuck one (no finished_at but older than one cron
+    // interval), and a failed/abandoned run from a completed one, instead of collapsing every
+    // in-flight or errored state into the same "Run X/Y" / "Last run failed" label.
+    const progress = status.stuckRun
+        ? 'Monitor stuck'
+        : running && run
+          ? `Run ${run.completed_model_count}/${run.scheduled_model_count}`
+          : run?.outcome === 'ERROR'
+            ? run.phase === 'ABANDONED'
+                ? 'Last run abandoned'
+                : 'Last run failed'
+            : 'Monitor ready';
+    const signalTone = status.stuckRun || running || run?.outcome === 'ERROR' ? 'warn' : 'ok';
+    const title = status.stuckRun
+        ? `Stuck since ${run?.started_at ?? status.stuckRun.started_at ?? 'unknown'}`
+        : running && run?.current_model
+          ? `Checking ${run.current_model}`
+          : run?.detail
+            ? run.detail
+            : undefined;
     return (
         <div className="signals" aria-label="Monitor status">
             <span className={catalog === 'OK' ? 'ok' : 'warn'}>Catalog {catalog}</span>
-            <span
-                className={running || run?.outcome === 'ERROR' ? 'warn' : 'ok'}
-                title={running && run?.current_model ? `Checking ${run.current_model}` : undefined}
-            >
+            <span className={signalTone} title={title}>
                 {progress}
             </span>
         </div>

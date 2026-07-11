@@ -1,4 +1,5 @@
 import { ensureProviders } from './monitor';
+import { CRON_INTERVAL_MS } from './status';
 import type { Env } from './types';
 import { now } from './types';
 
@@ -237,6 +238,36 @@ export function isInfeasible(runs: Pick<MonitorRun, 'outcome' | 'finished_at'>[]
     return completed.slice(0, INFEASIBLE_STREAK).every((run) => run.outcome === 'PARTIAL');
 }
 
+// A run is "stuck" when it has no finished_at yet is older than one cron interval: its Worker
+// isolate is either still hung on a stalled fetch or was evicted mid-run. Read-side only (no
+// writes): the next cron tick reclaims the lock and closes the orphaned run for real (see
+// runMonitor's ABANDONED sweep). Kept as an exported pure helper so the reconciliation is
+// unit-testable without a live D1.
+export const RUN_STALE_AGE_MS = CRON_INTERVAL_MS;
+export function isStuckRun(
+    run: { finished_at: string | null; started_at?: string | null },
+    nowMs: number,
+    maxAgeMs: number = RUN_STALE_AGE_MS,
+): boolean {
+    return (
+        !run.finished_at &&
+        !!run.started_at &&
+        nowMs - new Date(run.started_at).getTime() > maxAgeMs
+    );
+}
+// Splits the most recent runs into a genuinely-active run (no finished_at, younger than the
+// staleness threshold) and a stuck one (no finished_at, older than the threshold). Returns nulls
+// when none match, so the dashboard can distinguish "active", "stuck/recovering", and "no recent
+// run" instead of freezing on a stale `Run X/Y`.
+export function findActiveRun<T extends { finished_at: string | null; started_at?: string | null }>(
+    runs: T[],
+    nowMs: number,
+): { current: T | null; stuck: T | null } {
+    const current = runs.find((run) => !run.finished_at && !isStuckRun(run, nowMs)) ?? null;
+    const stuck = runs.find((run) => isStuckRun(run, nowMs)) ?? null;
+    return { current, stuck };
+}
+
 function latencyMetrics(checks: HistoryCheck[]) {
     const totalDurations = checks
         .map((check) => check.total_duration_ms)
@@ -397,6 +428,7 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
         monitor: monitor.lastRun,
         monitorProgress: monitor.currentRun ?? monitor.lastRun,
         monitorActive: monitor.currentRun !== null,
+        stuckRun: monitor.stuckRun,
         stale: monitor.stale,
         infeasible: monitor.infeasible,
         providers: providers.results,
@@ -474,7 +506,11 @@ async function monitorRuns(env: Env) {
         ).all<Pick<MonitorRun, 'outcome' | 'finished_at'>>(),
     ]);
     const latest = result.results[0] ?? null;
-    const current = result.results.find((run) => !run.finished_at) ?? null;
+    // Reconcile a genuinely-active run vs a stuck one (no finished_at but older than one cron
+    // interval) so the dashboard doesn't freeze on a stale `Run X/Y`. Read-side only; the next
+    // cron tick reclaims the lock and closes the orphaned run for real (runMonitor's ABANDONED
+    // sweep).
+    const { current, stuck: stuckRun } = findActiveRun(result.results, Date.now());
     const stale =
         !latest?.started_at || Date.now() - new Date(latest.started_at).getTime() > 20 * 60_000;
     return {
@@ -482,6 +518,7 @@ async function monitorRuns(env: Env) {
         infeasible: isInfeasible(result.results),
         lastRun: latest,
         currentRun: current,
+        stuckRun,
         lastSuccessfulFinishedAt: lastSuccessfulFinishedAt(successfulResult.results),
         runs: result.results,
     };

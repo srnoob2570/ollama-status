@@ -49,8 +49,10 @@ export class OllamaProvider {
         return `${this.provider.base_url.replace(/\/$/, '')}${path}`;
     }
 
-    async tags(): Promise<{ models: Array<{ name: string; digest?: string }> }> {
-        const response = await fetch(this.url('/tags'), { headers: this.headers() });
+    async tags(
+        signal?: AbortSignal,
+    ): Promise<{ models: Array<{ name: string; digest?: string }> }> {
+        const response = await fetch(this.url('/tags'), { headers: this.headers(), signal });
         if (!response.ok) throw new OllamaHttpError(response.status);
         const body = (await response.json()) as {
             models?: Array<{ name: string; digest?: string }>;
@@ -59,25 +61,36 @@ export class OllamaProvider {
         return { models: body.models };
     }
 
-    async show(model: string): Promise<unknown> {
+    async show(model: string, signal?: AbortSignal): Promise<unknown> {
         const response = await fetch(this.url('/show'), {
             method: 'POST',
             headers: this.headers(),
             body: JSON.stringify({ model }),
+            signal,
         });
         if (!response.ok) throw new OllamaHttpError(response.status);
         return response.json();
     }
 
-    async probe(model: string, baseline?: number): Promise<ProbeResult> {
+    async probe(
+        model: string,
+        baseline?: number,
+        parentSignal?: AbortSignal,
+    ): Promise<ProbeResult> {
         const started = performance.now();
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+        // A hard stop at the run level aborts `parentSignal` when the whole run has overstayed its
+        // budget, so a probe stuck on a slow/stalled Ollama stream can't hold the run (and the
+        // scheduler lock) open indefinitely. Either signal aborting cancels the in-flight fetch.
+        const signal = parentSignal
+            ? AbortSignal.any([controller.signal, parentSignal])
+            : controller.signal;
         try {
             const response = await fetch(this.url('/chat'), {
                 method: 'POST',
                 headers: this.headers(),
-                signal: controller.signal,
+                signal,
                 // Chat validates the account's model entitlement; an empty /generate request only preloads a model.
                 body: JSON.stringify({
                     model,
@@ -107,6 +120,11 @@ export class OllamaProvider {
             }
             return await firstChatToken(response, started, baseline);
         } catch (error) {
+            // A run-level hard stop (parentSignal) means the whole run is being aborted; rethrow so
+            // runMonitor's catch closes the run as abandoned instead of silently persisting a
+            // TIMEOUT check that would mask the stuck run. Only the probe's own 45s timer produces
+            // a real TIMEOUT result.
+            if (parentSignal?.aborted) throw error;
             const classification =
                 error instanceof DOMException && error.name === 'AbortError'
                     ? 'TIMEOUT'

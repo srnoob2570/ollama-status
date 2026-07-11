@@ -10,6 +10,7 @@
     "check": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.app.json",
     "test": "vitest run",
     "spike": "node scripts/spike.mjs",
+    "quota:test": "node scripts/quota-test.mjs",
     "lint": "eslint .",
     "deploy:staging": "npm run build && wrangler deploy --env staging",
     "deploy:production": "npm run build && wrangler deploy --env production",

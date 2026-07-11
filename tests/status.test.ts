@@ -15,13 +15,17 @@ import { maxResponseTokens } from '../src/worker/probe-config';
 import { OllamaProvider, PROBE_TIMEOUT_MS } from '../src/worker/ollama';
 import {
     effectiveProvider,
+    findActiveRun,
     historyBuckets,
     isInfeasible,
+    isStuckRun,
     lastSuccessfulFinishedAt,
     nextUpdatesForModels,
+    RUN_STALE_AGE_MS,
     worstStatus,
 } from '../src/worker/api';
 import {
+    acquireLock,
     materializeStatus,
     materializedStatus,
     nextCheckTier,
@@ -29,6 +33,7 @@ import {
     probeDelayMs,
     renewLock,
     runDeadlineMs,
+    runMonitor,
 } from '../src/worker/monitor';
 import { now } from '../src/worker/types';
 import type { Env, Model, ProbeResult, Provider } from '../src/worker/types';
@@ -972,5 +977,212 @@ describe('monitor run time-box (cadence preservation)', () => {
         const started = new Date('2026-07-10T13:00:00.000Z').getTime();
         const deadline = runDeadlineMs(started, env({ PROBE_DELAY_MAX_MS: '600000' }));
         expect(deadline).toBeLessThanOrEqual(started);
+    });
+});
+
+describe('monitor run recovery', () => {
+    it('prevents duplicate concurrent runs by keeping the lock for its first owner', async () => {
+        // The first acquireLock inserts the row (changes=1, lock granted). A second caller while
+        // the lease is still valid must NOT take the lock: the ON CONFLICT DO UPDATE WHERE clause
+        // matches no row, so the driver reports changes=0 and acquireLock returns false — no
+        // duplicate run is ever created by a racing cron tick.
+        let calls = 0;
+        const env = {
+            DB: {
+                prepare() {
+                    return {
+                        bind() {
+                            // First call inserts the lock (changes=1); every later call finds the
+                            // lease still valid and updates zero rows (changes=0).
+                            return {
+                                run: async () => ({ meta: { changes: ++calls === 1 ? 1 : 0 } }),
+                            };
+                        },
+                    };
+                },
+            },
+        } as unknown as Env;
+
+        expect(await acquireLock(env, 'monitor', 'owner-A')).toBe(true);
+        expect(await acquireLock(env, 'monitor', 'owner-B')).toBe(false);
+    });
+
+    it('treats an unfinished run older than one cron interval as stuck, not active', () => {
+        const nowMs = Date.parse('2026-07-10T13:10:00.000Z');
+        const recent = new Date(nowMs - 30_000).toISOString(); // 30s ago — genuinely in progress
+        const old = new Date(nowMs - RUN_STALE_AGE_MS - 1).toISOString(); // just past one interval
+        const runs = [
+            { id: 'stuck', started_at: old, finished_at: null },
+            { id: 'fresh', started_at: recent, finished_at: null },
+            { id: 'done', started_at: new Date(nowMs - 60_000).toISOString(), finished_at: 'x' },
+        ];
+
+        // A fresh in-flight run is the active one; the old in-flight one is stuck, not active.
+        const reconciled = findActiveRun(runs, nowMs);
+        expect(reconciled.current?.id).toBe('fresh');
+        expect(reconciled.stuck?.id).toBe('stuck');
+        expect(isStuckRun(runs[0], nowMs)).toBe(true);
+        expect(isStuckRun(runs[1], nowMs)).toBe(false);
+        // A finished run, however old, is neither active nor stuck.
+        expect(isStuckRun(runs[2], nowMs)).toBe(false);
+    });
+
+    it('reports no active and no stuck run when the latest run already finished', () => {
+        const nowMs = Date.parse('2026-07-10T13:10:00.000Z');
+        const runs = [
+            { id: 'done', started_at: new Date(nowMs - 60_000).toISOString(), finished_at: 'x' },
+        ];
+        const reconciled = findActiveRun(runs, nowMs);
+        expect(reconciled.current).toBeNull();
+        expect(reconciled.stuck).toBeNull();
+    });
+
+    it('aborts a probe whose run-level signal fires, rethrowing instead of masking it as TIMEOUT', async () => {
+        // When the run's hard stop aborts, a probe stuck on a stalled Ollama stream must not settle
+        // for a TIMEOUT result (which would silently persist a check and hide the stuck run); it
+        // must rethrow so runMonitor closes the run as abandoned.
+        const originalFetch = globalThis.fetch;
+        const runSignal = AbortSignal.abort();
+        globalThis.fetch = async () => {
+            throw new DOMException('aborted', 'AbortError');
+        };
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            await expect(provider.probe('cloud', undefined, runSignal)).rejects.toThrow();
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('recovers on the next cycle: marks an orphaned prior run abandoned and starts a clean one', async () => {
+        // Simulate a prior run that never finished (a stuck/evicted run) plus a catalog of one due
+        // model. runMonitor must: (1) sweep the orphaned run to ABANDONED, (2) insert a new run,
+        // (3) probe the model and complete the new run OK — recovering automatically without a
+        // manual restart and without duplicating runs.
+        const originalFetch = globalThis.fetch;
+        const statements: string[] = [];
+        const orphan = {
+            id: 'run_old',
+            started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+            finished_at: null,
+            outcome: null,
+            detail: null,
+            phase: 'CHECKING',
+            catalog_model_count: 1,
+            scheduled_model_count: 1,
+            completed_model_count: 0,
+            free_probe_count: 0,
+            paid_probe_count: 0,
+            paid_skipped_count: 0,
+            failed_probe_count: 0,
+            current_model: null,
+        };
+        const env = {
+            OLLAMA_BASE_URL: 'https://example.test/api',
+            OLLAMA_API_KEY_FREE: 'k',
+            PROBE_CONCURRENCY: '1',
+            PROBE_DELAY_MIN_MS: '0',
+            PROBE_DELAY_MAX_MS: '0',
+            DB: {
+                prepare(sql: string) {
+                    const prepared = {
+                        run: async () => {
+                            statements.push(sql);
+                            return { meta: { changes: 1 } };
+                        },
+                        all: async () => {
+                            statements.push(sql);
+                            if (/FROM models WHERE provider_id='ollama-free'/.test(sql))
+                                return {
+                                    results: [
+                                        {
+                                            id: 'ollama:m',
+                                            provider_id: 'ollama-free',
+                                            remote_name: 'm',
+                                            digest: null,
+                                            last_show_at: null,
+                                            tier: 'UNKNOWN',
+                                        },
+                                    ],
+                                };
+                            if (/FROM providers WHERE active=1/.test(sql))
+                                return {
+                                    results: [
+                                        {
+                                            id: 'ollama-free',
+                                            name: 'Free',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_FREE',
+                                        },
+                                    ],
+                                };
+                            if (/FROM provider_model_status/.test(sql)) return { results: [] };
+                            if (/FROM incidents WHERE id=/.test(sql)) return { results: [] };
+                            if (/classification FROM checks/.test(sql)) return { results: [] };
+                            if (/total_duration_ms FROM checks/.test(sql)) return { results: [] };
+                            return { results: [orphan] }; // monitor_runs fallback
+                        },
+                        first: async () => {
+                            statements.push(sql);
+                            if (
+                                /FROM models WHERE provider_id='ollama-free' AND remote_name=/.test(
+                                    sql,
+                                )
+                            )
+                                return null; // new model
+                            if (/FROM provider_model_status/.test(sql)) return null;
+                            if (/FROM incidents WHERE id=/.test(sql)) return null;
+                            return null;
+                        },
+                        bind(..._b: unknown[]) {
+                            return prepared; // bound and unbound access resolve to the same routes
+                        },
+                    };
+                    return prepared;
+                },
+                batch(arr: { run: () => Promise<unknown> }[]) {
+                    return Promise.all(arr.map((s) => s.run()));
+                },
+            },
+        } as unknown as Env;
+        const ctx = {
+            waitUntil(p: Promise<unknown>) {
+                void p.catch(() => {});
+            },
+        } as unknown as Parameters<typeof runMonitor>[1];
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const url = typeof input === 'string' ? input : input.toString();
+            if (url.endsWith('/tags'))
+                // Catalog listing with one model.
+                return new Response(JSON.stringify({ models: [{ name: 'm', digest: 'd' }] }), {
+                    status: 200,
+                });
+            if (url.endsWith('/show')) return new Response('{}', { status: 200 });
+            // /chat stream: first content chunk proves inference started.
+            return new Response('{"model":"m","message":{"content":"OK"},"done":true}\n', {
+                status: 200,
+            });
+        }) as typeof fetch;
+        try {
+            await runMonitor(env, ctx);
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+        // (1) The orphaned in-flight run is swept to ABANDONED before any new run is created.
+        expect(
+            statements.some((s) => /finished_at=\?,outcome='ERROR',phase='ABANDONED'/.test(s)),
+        ).toBe(true);
+        // (2) A new run is inserted.
+        expect(statements.some((s) => /INSERT INTO monitor_runs/.test(s))).toBe(true);
+        // (3) The new run completes OK (not PARTIAL, not ERROR) after probing the due model.
+        expect(statements.some((s) => /outcome=\?,phase='COMPLETED'/.test(s))).toBe(true);
     });
 });

@@ -19,6 +19,20 @@ const PROBE_CONCURRENCY_MAX = 16;
 const PROBE_DELAY_MIN_MS_DEFAULT = 0;
 const PROBE_DELAY_MAX_MS_DEFAULT = 5_000;
 const LOCK_LEASE_MS = 6 * 60_000;
+// Absolute wall-clock budget after which a run is forcibly aborted regardless of why it stalled.
+// A legitimate run finishes within one cron interval (the soft deadline in runDeadlineMs stops it
+// starting new batches ~245s in, and the in-flight batch adds ~55s of margin). This hard stop only
+// fires when a run has already overstayed that budget — i.e. it is stuck on a stalled fetch (a
+// probe stream, a catalog /tags, or the GitHub confirmation dispatch) that the per-probe 45s timer
+// or the fetch's own timeout didn't catch. Aborting cancels only in-flight fetches (D1 writes don't
+// accept a signal and already have Cloudflare-side timeouts), so a legitimate run in its final D1
+// write phase is unaffected. The run is then closed as ABANDONED/hard_stop and the next cron tick
+// reclaims the lock, so a stuck run can never block the scheduler indefinitely or renew its lease
+// past the next tick. Capped at one cron interval so recovery happens on the next cycle.
+const RUN_HARD_STOP_MS = CRON_INTERVAL_MS;
+// Upper bound for the external-confirmation GitHub dispatch, which has no per-request timeout of
+// its own. A slow/hung GitHub API must not hold a probe batch (and thus the run) open.
+const CONFIRMATION_TIMEOUT_MS = 15_000;
 
 // Process-local guards that skip idempotent D1 writes repeated every cron tick. They reset if
 // the Worker isolate is evicted, in which case the guarded write runs once more (still
@@ -153,14 +167,18 @@ async function providers(env: Env): Promise<Provider[]> {
     }));
 }
 
-async function syncCatalog(env: Env, provider: Provider): Promise<number | null> {
+async function syncCatalog(
+    env: Env,
+    provider: Provider,
+    signal?: AbortSignal,
+): Promise<number | null> {
     const client = new OllamaProvider(
         provider,
         keyFor(env, provider.secret_ref),
         maxResponseTokens(env.OLLAMA_MAX_TOKENS),
     );
     try {
-        const catalog = await client.tags();
+        const catalog = await client.tags(signal);
         const timestamp = now();
         for (const remote of catalog.models) {
             // Reuse the former free-account ID during the one-time schema transition.
@@ -205,7 +223,7 @@ async function syncCatalog(env: Env, provider: Provider): Promise<number | null>
                 Date.now() - new Date(existing.last_show_at).getTime() >= 24 * 60 * 60_000
             ) {
                 try {
-                    const details = await client.show(remote.name);
+                    const details = await client.show(remote.name, signal);
                     await env.DB.prepare(
                         'UPDATE models SET details_json=?,last_show_at=? WHERE id=?',
                     )
@@ -388,12 +406,6 @@ export async function materializeStatus(
                 'UPDATE provider_model_status SET incident_id=? WHERE provider_id=? AND model_id=?',
             ).bind(incidentId, provider.id, model.id),
         ]);
-        await env.INCIDENT_EVENTS.send({
-            incidentId,
-            eventType: 'opened',
-            summary: `${model.remote_name} is ${status.toLowerCase()}`,
-            occurredAt: timestamp,
-        });
         await requestExternalConfirmation(env, incidentId);
     } else if (status === 'OPERATIONAL' && active && successes >= 2) {
         await env.DB.batch([
@@ -404,12 +416,6 @@ export async function materializeStatus(
                 'UPDATE provider_model_status SET incident_id=NULL WHERE provider_id=? AND model_id=?',
             ).bind(provider.id, model.id),
         ]);
-        await env.INCIDENT_EVENTS.send({
-            incidentId: active.id,
-            eventType: 'resolved',
-            summary: `${model.remote_name} recovered`,
-            occurredAt: timestamp,
-        });
     }
 }
 
@@ -442,22 +448,34 @@ async function requestExternalConfirmation(env: Env, incidentId: string): Promis
     )
         .bind(id('confirm'), incidentId, nonce, expiresAt)
         .run();
-    const response = await fetch(
-        `https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/workflows/external-confirmation.yml/dispatches`,
-        {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${env.GITHUB_ACTIONS_TOKEN}`,
-                Accept: 'application/vnd.github+json',
-                'content-type': 'application/json',
-                'user-agent': 'ollama-status-monitor',
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CONFIRMATION_TIMEOUT_MS);
+    let response: Response;
+    try {
+        response = await fetch(
+            `https://api.github.com/repos/${env.GITHUB_REPOSITORY}/actions/workflows/external-confirmation.yml/dispatches`,
+            {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${env.GITHUB_ACTIONS_TOKEN}`,
+                    Accept: 'application/vnd.github+json',
+                    'content-type': 'application/json',
+                    'user-agent': 'ollama-status-monitor',
+                },
+                body: JSON.stringify({
+                    ref: 'master',
+                    inputs: {
+                        endpoint: env.CONFIRMATION_CALLBACK_URL,
+                        nonce,
+                        incident_id: incidentId,
+                    },
+                }),
+                signal: controller.signal,
             },
-            body: JSON.stringify({
-                ref: 'master',
-                inputs: { endpoint: env.CONFIRMATION_CALLBACK_URL, nonce, incident_id: incidentId },
-            }),
-        },
-    );
+        );
+    } finally {
+        clearTimeout(timer);
+    }
     if (!response.ok) throw new Error('confirmation_dispatch_failed');
     await env.DB.prepare('UPDATE incidents SET external_confirmation_requested_at=? WHERE id=?')
         .bind(now(), incidentId)
@@ -473,7 +491,12 @@ async function fiveCheckFailures(env: Env, providerId: string, modelId: string):
     return result.results.filter((x) => isFailure(x.classification)).length;
 }
 
-async function probeModel(env: Env, provider: Provider, model: Model): Promise<ProbeResult> {
+async function probeModel(
+    env: Env,
+    provider: Provider,
+    model: Model,
+    signal?: AbortSignal,
+): Promise<ProbeResult> {
     // Configurable delay spreads probes over time so free API keys (1 concurrent model)
     // don't burst into 429s, without making a scheduled run take minutes.
     await new Promise((resolve) => setTimeout(resolve, randomDelay(env)));
@@ -488,6 +511,7 @@ async function probeModel(env: Env, provider: Provider, model: Model): Promise<P
     const result = await client.probe(
         model.remote_name,
         await baseline(env, provider.id, model.id),
+        signal,
     );
     if (provider.id === 'ollama-free' && result.classification === 'MODEL_NOT_FOUND')
         await env.DB.prepare(
@@ -532,12 +556,13 @@ async function probeByEntitlement(
     paidProvider: Provider | undefined,
     model: Model,
     runId: string,
+    signal?: AbortSignal,
 ): Promise<void> {
     // Per-model live progress is recorded once at the end by recordModelProgress, which already
     // sets current_model. The run-level phase is already 'CHECKING' from runMonitor, so a second
     // per-model write here only refreshed current_model a few seconds earlier at the cost of one
     // write per model per cycle.
-    const freeResult = await probeModel(env, freeProvider, model);
+    const freeResult = await probeModel(env, freeProvider, model, signal);
     const entitlement = entitlementFromFreeProbe(freeResult.classification);
     const paidAvailable = Boolean(paidProvider && hasKey(env, paidProvider));
     let paid = 0,
@@ -545,7 +570,7 @@ async function probeByEntitlement(
         failed = failedProbe(freeResult);
 
     if (shouldProbePaid(freeResult.classification, paidAvailable) && paidProvider) {
-        const paidResult = await probeModel(env, paidProvider, model);
+        const paidResult = await probeModel(env, paidProvider, model, signal);
         paid = 1;
         failed += failedProbe(paidResult);
     } else if (entitlement === 'PAID') {
@@ -558,8 +583,16 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
     const owner = crypto.randomUUID();
     if (!(await acquireLock(env, 'monitor', owner))) return;
     const runId = id('run'),
-        started = now();
+        started = now(),
+        startedMs = Date.now();
     let runCreated = false;
+    // Hard stop: a run that overstays RUN_HARD_STOP_MS is forcibly aborted so a stalled fetch (probe
+    // stream, /tags, /show, or the GitHub confirmation dispatch) can't hold the run and the lock
+    // open indefinitely. Aborting cancels in-flight fetches via this signal; D1 writes don't accept
+    // it and complete on their own Cloudflare-side timeouts. The run is closed as ABANDONED and the
+    // next cron tick reclaims the lock — recovery never depends on the lease expiring.
+    const runController = new AbortController();
+    const hardStop = setTimeout(() => runController.abort(), RUN_HARD_STOP_MS);
     try {
         // A lock owner must always have a visible run, including initialization failures.
         await env.DB.prepare(
@@ -576,7 +609,7 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         const freeProvider = activeProviders.find((provider) => provider.id === 'ollama-free');
         const paidProvider = activeProviders.find((provider) => provider.id === 'ollama-paid');
         if (!freeProvider) throw new Error('global_catalog_unavailable');
-        const catalogModelCount = await syncCatalog(env, freeProvider);
+        const catalogModelCount = await syncCatalog(env, freeProvider, runController.signal);
         if (catalogModelCount === null) throw new Error('global_catalog_unavailable');
         const due = await env.DB.prepare(
             `SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT ${MAX_MODELS_PER_RUN}`,
@@ -594,21 +627,38 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         // probed stay due and are picked up first next tick (the due query orders by
         // next_check_at). Without this, a slow/long run holds the lock past the next tick and
         // that tick is silently skipped, doubling the effective cadence to ~10 min.
-        const deadlineMs = runDeadlineMs(Date.parse(started), env);
+        const deadlineMs = runDeadlineMs(startedMs, env);
         let budgetExceeded = false;
         for (let i = 0; i < due.results.length; i += concurrency) {
             if (Date.now() >= deadlineMs) {
                 budgetExceeded = true;
                 break;
             }
+            // Hard-stop guard: even if the in-flight batch is stuck on a non-cancellable await
+            // (a D1 write), stop starting new batches once the run has overstayed its budget. The
+            // AbortController cancels in-flight fetches; this guard prevents the loop from
+            // renewing the lock past the hard stop once such an await eventually resolves.
+            if (Date.now() >= startedMs + RUN_HARD_STOP_MS) break;
             if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
-            await Promise.all(
+            // allSettled so a single probe/storeProbe failure (e.g. a transient D1 error) aborts
+            // only that model, not the whole run. The hard stop is enforced after the batch.
+            const results = await Promise.allSettled(
                 due.results
                     .slice(i, i + concurrency)
                     .map((model) =>
-                        probeByEntitlement(env, freeProvider, paidProvider, model, runId),
+                        probeByEntitlement(
+                            env,
+                            freeProvider,
+                            paidProvider,
+                            model,
+                            runId,
+                            runController.signal,
+                        ),
                     ),
             );
+            for (const r of results)
+                if (r.status === 'rejected') console.warn(`monitor probe rejected: ${r.reason}`);
+            if (runController.signal.aborted) throw new Error('run_hard_stop');
         }
         if (budgetExceeded) {
             // Surface the infeasibility explicitly instead of silently drifting cadence: the
@@ -628,17 +678,25 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
             )
             .run();
     } catch (error) {
-        const detail =
-            error instanceof Error && error.message === 'global_catalog_unavailable'
-                ? 'catalog_unavailable'
-                : 'monitor_failed';
+        // A hard stop means the run overstayed its budget and was aborted mid-flight; close it as
+        // abandoned (not failed) so the UI can distinguish a stuck/interrupted run from a real
+        // monitor error, and so the next tick reclaims the lock cleanly. Keep `detail` diagnostic.
+        const hardStopHit =
+            runController.signal.aborted ||
+            (error instanceof Error && error.message === 'run_hard_stop');
+        const detail = hardStopHit
+            ? 'hard_stop'
+            : error instanceof Error && error.message === 'global_catalog_unavailable'
+              ? 'catalog_unavailable'
+              : 'monitor_failed';
         if (runCreated)
             await env.DB.prepare(
-                "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='FAILED',detail=?,current_model=NULL WHERE id=?",
+                `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
             )
                 .bind(now(), detail, runId)
                 .run();
     } finally {
+        clearTimeout(hardStop);
         try {
             await releaseLock(env, 'monitor', owner);
         } finally {
