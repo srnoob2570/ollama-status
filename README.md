@@ -12,7 +12,34 @@ Models are categorized from the free-account result: a successful free probe mea
 
 The dashboard is public at `/`; APIs are under `/api/v1`.
 
-`OLLAMA_MAX_TOKENS` configures the `num_predict` limit for each probe. It defaults to `8`; use a whole number from `1` to `4096`. Higher values make each check slower and consume more Ollama quota.
+## Options
+
+Worker options are configured under `vars` in `wrangler.jsonc`. The same values are repeated for
+each deployment environment so they can be adjusted independently.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OLLAMA_BASE_URL` | `https://ollama.com/api` | Base URL for the Ollama API. |
+| `OLLAMA_MAX_TOKENS` | `8` | `num_predict` limit for each probe. Use a whole number from `1` to `4096`; larger values make checks slower and consume more quota. |
+| `PROBE_CONCURRENCY` | `1` | Number of model checks processed concurrently. Values below `1` fall back to `1`; values above `16` are capped at `16`. Free keys should normally remain at `1` to avoid `429` responses. |
+| `PROBE_DELAY_MIN_MS` | `0` | Minimum random delay, in milliseconds, applied before each model check. |
+| `PROBE_DELAY_MAX_MS` | `5000` | Maximum random delay, in milliseconds, applied before each model check. This value also contributes to the run deadline, so a large value can cause a run to finish only partially. |
+| `EXCLUDED_MODELS` | _(unset)_ | Comma-separated model names to exclude from monitoring. Set it as a Worker variable when needed. |
+| `CONFIRMATION_CALLBACK_URL` | _(unset)_ | Public endpoint that receives external incident confirmations. It must be set together with the GitHub confirmation options below. |
+
+The following values are secrets and must be configured with `wrangler secret put --env <staging|production>`, never in `wrangler.jsonc` or browser code.
+
+| Secret | Description |
+| --- | --- |
+| `OLLAMA_API_KEY_FREE` | API key used for catalog discovery and free-account probes. |
+| `OLLAMA_API_KEY_PAID` | API key used to check models that require a paid entitlement. Leave it unset to skip paid probes. |
+| `CONFIRMATION_HMAC_SECRET` | HMAC secret used to validate incoming external-confirmation callbacks. |
+| `GITHUB_REPOSITORY` | Repository in `owner/repository` form whose confirmation workflow is dispatched. |
+| `GITHUB_ACTIONS_TOKEN` | Token authorized to dispatch that GitHub Actions workflow. |
+
+External confirmation dispatch is enabled only when `CONFIRMATION_CALLBACK_URL`,
+`GITHUB_REPOSITORY`, and `GITHUB_ACTIONS_TOKEN` are all configured. `ENVIRONMENT` is present in
+the current environment configuration as a label, but the Worker does not currently read it.
 
 ## Controlled quota test
 
