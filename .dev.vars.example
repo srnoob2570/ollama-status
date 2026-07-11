@@ -1,0 +1,12 @@
+# Never commit .dev.vars. Use `wrangler secret put` for deployed environments.
+OLLAMA_API_KEY_FREE=
+OLLAMA_API_KEY_PAID=
+OLLAMA_MAX_TOKENS=8
+DISCORD_WEBHOOK_URL=
+GENERIC_WEBHOOK_URL=
+ACCESS_AUD=
+ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
+CONFIRMATION_HMAC_SECRET=
+CONFIRMATION_CALLBACK_URL=https://status.example.com/api/internal/confirmation
+GITHUB_REPOSITORY=owner/repository
+GITHUB_ACTIONS_TOKEN=

@@ -1,0 +1,21 @@
+name: External confirmation
+on:
+  workflow_dispatch:
+    inputs:
+      endpoint: { description: 'Signed confirmation endpoint', required: true }
+      nonce: { description: 'One-time nonce', required: true }
+      incident_id: { description: 'Incident ID', required: true }
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe canary model
+        env: { OLLAMA_API_KEY: '${{ secrets.OLLAMA_CANARY_API_KEY }}' }
+        run: |
+          curl --fail --silent --show-error https://ollama.com/api/generate -H "Authorization: Bearer $OLLAMA_API_KEY" -H 'content-type: application/json' --data '{"model":"gpt-oss:20b","prompt":"","stream":false,"think":false,"options":{"num_predict":1,"temperature":0}}' > result.json
+      - name: Return signed result
+        env: { ENDPOINT: '${{ inputs.endpoint }}', NONCE: '${{ inputs.nonce }}', INCIDENT_ID: '${{ inputs.incident_id }}', HMAC: '${{ secrets.CONFIRMATION_HMAC_SECRET }}' }
+        run: |
+          body=$(jq -nc --arg incidentId "$INCIDENT_ID" --arg nonce "$NONCE" --arg classification SUCCESS '{incidentId:$incidentId,nonce:$nonce,classification:$classification}')
+          signature=$(printf %s "$body" | openssl dgst -sha256 -hmac "$HMAC" -hex | sed 's/^.* //')
+          curl --fail --silent --show-error "$ENDPOINT" -H 'content-type: application/json' -H "x-confirmation-signature: $signature" --data "$body"
