@@ -16,6 +16,7 @@ import { OllamaProvider, PROBE_TIMEOUT_MS } from '../src/worker/ollama';
 import {
     effectiveProvider,
     historyBuckets,
+    isInfeasible,
     lastSuccessfulFinishedAt,
     nextUpdatesForModels,
     worstStatus,
@@ -358,6 +359,25 @@ describe('Ollama status classification', () => {
                 { outcome: 'PARTIAL', finished_at: '2026-07-10T13:00:00.000Z' },
             ]),
         ).toBe('2026-07-10T13:00:00.000Z');
+    });
+
+    it('flags infeasibility only when the last few completed runs are all PARTIAL', () => {
+        // runs are ordered most-recent first (as monitorRuns returns them). A single transient
+        // PARTIAL among OK runs is NOT infeasible; only sustained budget exhaustion is.
+        const ok = { outcome: 'OK', finished_at: '2026-07-10T13:00:00.000Z' };
+        const partial = { outcome: 'PARTIAL', finished_at: '2026-07-10T13:05:00.000Z' };
+        const errored = { outcome: 'ERROR', finished_at: '2026-07-10T13:05:00.000Z' };
+        expect(isInfeasible([partial, partial, partial])).toBe(true);
+        // An OK run breaks the streak → not infeasible.
+        expect(isInfeasible([partial, ok, partial])).toBe(false);
+        // An ERROR run breaks the streak too (different problem, not budget infeasibility).
+        expect(isInfeasible([partial, errored, partial])).toBe(false);
+        // Fewer than 3 completed runs → insufficient evidence, not infeasible.
+        expect(isInfeasible([partial, partial])).toBe(false);
+        // In-flight (unfinished) runs don't count toward the streak.
+        expect(
+            isInfeasible([{ outcome: 'PARTIAL', finished_at: null }, partial, partial, partial]),
+        ).toBe(true);
     });
 
     it('finds the earliest scheduled active check for each monitored tier', () => {

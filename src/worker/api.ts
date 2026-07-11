@@ -206,18 +206,36 @@ export function nextUpdatesForModels(models: ScheduledModel[]): {
     return nextUpdates;
 }
 
+// Run outcomes that count as a successful (alive) monitor run for "last updated" purposes.
+// `OK` = fully probed every due model; `PARTIAL` = completed without error but the per-tick budget
+// ran out before probing every due model (monitor is alive, just couldn't keep up). The SQL
+// query in monitorRuns mirrors this exact set — keep them in sync when adding outcomes.
+const SUCCESSFUL_OUTCOMES = ['OK', 'PARTIAL'] as const;
+
 export function lastSuccessfulFinishedAt(
     runs: Pick<MonitorRun, 'outcome' | 'finished_at'>[],
 ): string | null {
     return runs.reduce<string | null>(
         (latest, run) =>
-            (run.outcome === 'OK' || run.outcome === 'PARTIAL') &&
+            (SUCCESSFUL_OUTCOMES as readonly string[]).includes(run.outcome ?? '') &&
             run.finished_at &&
             (!latest || run.finished_at > latest)
                 ? run.finished_at
                 : latest,
         null,
     );
+}
+
+// A configuration is infeasible when the monitor keeps completing without error but can't probe
+// every due model within the per-tick budget — i.e. the most recent completed runs are ALL
+// PARTIAL. A single transient PARTIAL (one slow probe) must NOT trip it; only sustained budget
+// exhaustion signals an incompatible cadence/concurrency/delay combination. `runs` must be
+// ordered most-recent first (as monitorRuns returns them).
+const INFEASIBLE_STREAK = 3;
+export function isInfeasible(runs: Pick<MonitorRun, 'outcome' | 'finished_at'>[]): boolean {
+    const completed = runs.filter((run) => run.finished_at && run.outcome);
+    if (completed.length < INFEASIBLE_STREAK) return false;
+    return completed.slice(0, INFEASIBLE_STREAK).every((run) => run.outcome === 'PARTIAL');
 }
 
 function latencyMetrics(checks: HistoryCheck[]) {
@@ -382,6 +400,7 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
         monitorProgress: monitor.currentRun ?? monitor.lastRun,
         monitorActive: monitor.currentRun !== null,
         stale: monitor.stale,
+        infeasible: monitor.infeasible,
         providers: providers.results,
         models,
     });
@@ -452,6 +471,7 @@ async function monitorRuns(env: Env) {
     FROM monitor_runs ORDER BY started_at DESC LIMIT 20`,
         ).all<MonitorRun>(),
         env.DB.prepare(
+            // Mirrors SUCCESSFUL_OUTCOMES — keep in sync when adding run outcomes.
             "SELECT outcome,finished_at FROM monitor_runs WHERE outcome IN ('OK','PARTIAL') AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1",
         ).all<Pick<MonitorRun, 'outcome' | 'finished_at'>>(),
     ]);
@@ -461,6 +481,7 @@ async function monitorRuns(env: Env) {
         !latest?.started_at || Date.now() - new Date(latest.started_at).getTime() > 20 * 60_000;
     return {
         stale,
+        infeasible: isInfeasible(result.results),
         lastRun: latest,
         currentRun: current,
         lastSuccessfulFinishedAt: lastSuccessfulFinishedAt(successfulResult.results),

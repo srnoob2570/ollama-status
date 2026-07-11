@@ -267,8 +267,14 @@ time,
 .notice.error {
     margin-top: 16px;
 }
+.notice.warning {
+    margin-top: 16px;
+}
 .error {
     border-color: #733342;
+}
+.warning {
+    border-color: #b07a2e;
 }
 .monitor-meta {
     display: grid;

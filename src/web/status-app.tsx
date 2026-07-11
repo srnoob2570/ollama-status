@@ -36,6 +36,7 @@ type Status = {
     nextUpdates: { free: string | null; paid: string | null };
     range: HistoryRange;
     stale: boolean;
+    infeasible: boolean;
     monitor: { started_at?: string } | null;
     monitorProgress: MonitorRun | null;
     monitorActive: boolean;
@@ -157,6 +158,13 @@ export function App() {
             {status.stale && (
                 <section className="notice error">
                     MONITOR STALE — no scheduler run has started in the last 20 minutes.
+                </section>
+            )}
+            {status.infeasible && (
+                <section className="notice warning">
+                    MONITOR OVERLOADED — recent runs couldn&apos;t check every model within the
+                    5-minute cadence. Lower PROBE_DELAY_MAX_MS, raise PROBE_CONCURRENCY (if the API
+                    key allows), or reduce the catalog.
                 </section>
             )}
             <section className="summary" aria-label="Catalog summary">
