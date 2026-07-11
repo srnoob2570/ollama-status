@@ -1,5 +1,4 @@
 import { api } from './api';
-import { requireAccess } from './auth';
 import { runMonitor } from './monitor';
 import type { Env, IncidentEvent } from './types';
 import { id, now } from './types';
@@ -8,13 +7,6 @@ export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url);
         if (url.pathname.startsWith('/api/')) return api(request, env, ctx, url.pathname);
-        if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
-            try {
-                await requireAccess(request, env);
-            } catch {
-                return new Response('Forbidden', { status: 403 });
-            }
-        }
         return env.ASSETS.fetch(request);
     },
     async scheduled(

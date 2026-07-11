@@ -1,7 +1,6 @@
-import { ensureProviders, runMonitor } from './monitor';
+import { ensureProviders } from './monitor';
 import type { Env } from './types';
-import { id, now } from './types';
-import { requireAccess } from './auth';
+import { now } from './types';
 
 const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -267,7 +266,6 @@ export async function api(
 ): Promise<Response> {
     if (path === '/api/internal/confirmation' && request.method === 'POST')
         return confirmation(request, env);
-    if (path.startsWith('/api/admin/')) return admin(request, env, ctx, path);
     if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
     // Public GET endpoints change only when the monitor writes (every ~5 min), so a 60s Cache API
     // TTL serves the dashboard's 30s polling from cache ~98% of the time. Data is at most ~1 min
@@ -487,78 +485,4 @@ async function monitorRuns(env: Env) {
         lastSuccessfulFinishedAt: lastSuccessfulFinishedAt(successfulResult.results),
         runs: result.results,
     };
-}
-
-async function admin(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext,
-    path: string,
-): Promise<Response> {
-    let actor: { email: string };
-    try {
-        actor = await requireAccess(request, env);
-    } catch (response) {
-        return response instanceof Response ? response : new Response('Forbidden', { status: 403 });
-    }
-    if (path === '/api/admin/models' && request.method === 'GET') {
-        const rows = await env.DB.prepare(
-            "SELECT id,remote_name,tier,active,excluded,exclusion_reason,next_check_at FROM models WHERE provider_id='ollama-free' ORDER BY remote_name",
-        ).all();
-        return json({ models: rows.results });
-    }
-    if (path === '/api/admin/run' && request.method === 'POST') {
-        ctx.waitUntil(runMonitor(env, ctx));
-        await audit(env, actor.email, 'monitor.run', 'monitor', null);
-        return json({ accepted: true }, 202);
-    }
-    const match = path.match(/^\/api\/admin\/models\/([^/]+)$/);
-    if (match && request.method === 'PATCH') {
-        const body = (await request.json().catch(() => null)) as {
-            active?: boolean;
-            excluded?: boolean;
-            exclusionReason?: string;
-        } | null;
-        if (
-            !body ||
-            (body.active !== undefined && typeof body.active !== 'boolean') ||
-            (body.excluded !== undefined && typeof body.excluded !== 'boolean')
-        )
-            return invalid('Invalid model update');
-        const changes = await env.DB.prepare(
-            'UPDATE models SET active=COALESCE(?,active),excluded=COALESCE(?,excluded),exclusion_reason=?,updated_at=? WHERE id=?',
-        )
-            .bind(
-                body.active === undefined ? null : Number(body.active),
-                body.excluded === undefined ? null : Number(body.excluded),
-                body.exclusionReason?.slice(0, 200) ?? null,
-                now(),
-                decodeURIComponent(match[1]),
-            )
-            .run();
-        if (!changes.meta.changes) return json({ error: 'Model not found' }, 404);
-        await audit(env, actor.email, 'model.update', 'model', decodeURIComponent(match[1]));
-        return json({ updated: true });
-    }
-    if (path === '/api/admin/audit' && request.method === 'GET') {
-        const rows = await env.DB.prepare(
-            'SELECT occurred_at,actor,action,target_type,target_id,detail FROM audit_log ORDER BY occurred_at DESC LIMIT 100',
-        ).all();
-        return json({ entries: rows.results });
-    }
-    return json({ error: 'Not found' }, 404);
-}
-
-async function audit(
-    env: Env,
-    actor: string,
-    action: string,
-    targetType: string,
-    targetId: string | null,
-) {
-    return env.DB.prepare(
-        'INSERT INTO audit_log(id,occurred_at,actor,action,target_type,target_id) VALUES (?,?,?,?,?,?)',
-    )
-        .bind(id('audit'), now(), actor, action, targetType, targetId)
-        .run();
 }

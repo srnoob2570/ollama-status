@@ -179,8 +179,8 @@ async function syncCatalog(env: Env, provider: Provider): Promise<number | null>
             const modelId = existing?.id ?? `ollama:${remote.name}`;
             // Skip the upsert when nothing material changed: re-running it would only rewrite
             // updated_at and reactivate an already-active row with the same digest, burning one
-            // write per model per cycle for no effect. A new model, a digest change, or an
-            // admin-deactivated row (active=0) still re-upserts to (re)insert/refresh as before.
+            // write per model per cycle for no effect. A new model, a digest change, or a
+            // previously deactivated row (active=0) still re-upserts to (re)insert/refresh as before.
             if (!existing || existing.digest !== remoteDigest || existing.active !== 1) {
                 await env.DB.prepare(
                     `INSERT INTO models(id,provider_id,remote_name,active,excluded,digest,next_check_at,created_at,updated_at)

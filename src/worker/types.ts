@@ -40,8 +40,6 @@ export interface Env {
     OLLAMA_API_KEY_PAID: string;
     DISCORD_WEBHOOK_URL?: string;
     GENERIC_WEBHOOK_URL?: string;
-    ACCESS_TEAM_DOMAIN?: string;
-    ACCESS_AUD?: string;
     CONFIRMATION_HMAC_SECRET?: string;
     CONFIRMATION_CALLBACK_URL?: string;
     GITHUB_REPOSITORY?: string;
