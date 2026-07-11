@@ -352,9 +352,6 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
             <div className="model-copy">
                 <strong className="model-name">{model.remote_name}</strong>
                 <div className="model-tags">
-                    {model.tier === 'PAID' && (
-                        <span className="tag access-tag">Requires subscription</span>
-                    )}
                     <span className="access">{label}</span>
                 </div>
             </div>
