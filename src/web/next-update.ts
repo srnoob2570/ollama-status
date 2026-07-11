@@ -1,4 +1,4 @@
-export const MONITOR_INTERVAL_MS = 15 * 60_000;
+export const MONITOR_INTERVAL_MS = 5 * 60_000;
 
 export function roundUpToMonitorInterval(timestamp: string): number | null {
     const time = new Date(timestamp).getTime();
