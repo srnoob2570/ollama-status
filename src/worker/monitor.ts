@@ -186,20 +186,25 @@ async function syncCatalog(
     try {
         const catalog = await client.tags(signal);
         const timestamp = now();
+        const existingModels = await env.DB.prepare(
+            'SELECT id,remote_name,last_show_at,digest,active FROM models WHERE provider_id=?',
+        )
+            .bind('ollama-free')
+            .all<{
+                id: string;
+                remote_name: string;
+                last_show_at: string | null;
+                digest: string | null;
+                active: number;
+            }>();
+        const existingByRemoteName = new Map(
+            existingModels.results.map((model) => [model.remote_name, model]),
+        );
         for (const remote of catalog.models) {
             // Reuse the former free-account ID during the one-time schema transition.
             // It is now the global model identity and preserves all compatible history.
             const remoteDigest = remote.digest ?? null;
-            const existing = await env.DB.prepare(
-                'SELECT id,last_show_at,digest,active FROM models WHERE provider_id=? AND remote_name=?',
-            )
-                .bind('ollama-free', remote.name)
-                .first<{
-                    id: string;
-                    last_show_at: string | null;
-                    digest: string | null;
-                    active: number;
-                }>();
+            const existing = existingByRemoteName.get(remote.name);
             const modelId = existing?.id ?? `ollama:${remote.name}`;
             // Skip the upsert when nothing material changed: re-running it would only rewrite
             // updated_at and reactivate an already-active row with the same digest, burning one
@@ -412,7 +417,11 @@ export async function materializeStatus(
                 'UPDATE provider_model_status SET incident_id=? WHERE provider_id=? AND model_id=?',
             ).bind(incidentId, provider.id, model.id),
         ]);
-        await requestExternalConfirmation(env, incidentId);
+        try {
+            await requestExternalConfirmation(env, incidentId);
+        } catch (error) {
+            console.warn(`external confirmation dispatch failed: ${error}`);
+        }
     } else if (status === 'OPERATIONAL' && active && successes >= 2) {
         await env.DB.batch([
             env.DB.prepare(
@@ -804,7 +813,7 @@ export async function runMonitor(
         try {
             await releaseLock(env, 'monitor', owner);
         } finally {
-            ctx.waitUntil(cleanup(env));
+            ctx.waitUntil(cleanup(env).catch((error) => console.warn(`cleanup failed: ${error}`)));
         }
     }
 }

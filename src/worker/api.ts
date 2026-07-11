@@ -1,4 +1,3 @@
-import { ensureProviders } from './monitor';
 import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status';
 import type { Env } from './types';
 import { now } from './types';
@@ -19,6 +18,7 @@ function defaultCache(): Cache {
 }
 
 const HISTORY_1H_WINDOW_MS = 60 * 60_000;
+const CONFIRMATION_MAX_BYTES = 8 * 1024;
 
 export type HistoryRange = '1h' | '24h' | '7d' | '30d';
 export type StatusRow = {
@@ -67,6 +67,17 @@ export type HistoryBucket = {
     pending?: boolean;
 };
 type ScheduledModel = { tier: string; next_check_at: string | null };
+
+function groupBy<T, K>(items: T[], keyForItem: (item: T) => K): Map<K, T[]> {
+    const grouped = new Map<K, T[]>();
+    for (const item of items) {
+        const key = keyForItem(item);
+        const existing = grouped.get(key);
+        if (existing) existing.push(item);
+        else grouped.set(key, [item]);
+    }
+    return grouped;
+}
 
 const rangeConfiguration = (
     requestedRange: string | null,
@@ -285,6 +296,28 @@ export function nextUpdatesForModels(models: ScheduledModel[]): {
     return nextUpdates;
 }
 
+export function publicApiCacheKey(request: Request, path: string): Request {
+    const url = new URL(request.url);
+    const cacheUrl = new URL(url.origin);
+    cacheUrl.pathname = path;
+    if (path === '/api/v1/status') {
+        const requestedRange = url.searchParams.get('range');
+        const range =
+            requestedRange === '24h' || requestedRange === '7d' || requestedRange === '30d'
+                ? requestedRange
+                : '1h';
+        cacheUrl.searchParams.set('range', range);
+    } else if (/^\/api\/v1\/models\/[^/]+\/history$/.test(path)) {
+        const requestedRange = url.searchParams.get('range');
+        const range =
+            requestedRange === '24h' || requestedRange === '7d' || requestedRange === '30d'
+                ? requestedRange
+                : '1h';
+        cacheUrl.searchParams.set('range', range);
+    }
+    return new Request(cacheUrl.toString(), { method: 'GET' });
+}
+
 // Run outcomes that count as a successful (alive) monitor run for "last updated" purposes.
 // `OK` = fully probed every due model; `PARTIAL` = completed without error but the per-tick budget
 // ran out before probing every due model (monitor is alive, just couldn't keep up). The SQL
@@ -381,7 +414,7 @@ export async function api(
     // TTL serves the dashboard's 30s polling from cache ~98% of the time. Data is at most ~1 min
     // stale while the next check is up to 5 min away, so this never hides a state change that the
     // dashboard would otherwise already see as fresh.
-    const cacheKey = new Request(request.url, { method: 'GET' });
+    const cacheKey = publicApiCacheKey(request, path);
     const cacheStore = defaultCache();
     const cached = await cacheStore.match(cacheKey);
     if (cached) return cached;
@@ -411,16 +444,26 @@ async function publicGetResponse(request: Request, env: Env, path: string): Prom
 
 async function confirmation(request: Request, env: Env): Promise<Response> {
     if (!env.CONFIRMATION_HMAC_SECRET) return new Response('Not configured', { status: 503 });
+    const contentLength = request.headers.get('content-length');
+    if (contentLength && Number.parseInt(contentLength, 10) > CONFIRMATION_MAX_BYTES)
+        return new Response('Payload too large', { status: 413 });
     const raw = await request.text();
+    if (new TextEncoder().encode(raw).byteLength > CONFIRMATION_MAX_BYTES)
+        return new Response('Payload too large', { status: 413 });
     const signature = request.headers.get('x-confirmation-signature') ?? '';
     const expected = await hmac(raw, env.CONFIRMATION_HMAC_SECRET);
     if (!constantTimeEqual(signature, expected))
         return new Response('Unauthorized', { status: 401 });
-    const body = JSON.parse(raw) as {
+    let body: {
         incidentId?: string;
         nonce?: string;
         classification?: string;
     };
+    try {
+        body = JSON.parse(raw) as typeof body;
+    } catch {
+        return invalid('Invalid JSON');
+    }
     if (
         !body.incidentId ||
         !body.nonce ||
@@ -461,7 +504,6 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 async function publicStatus(env: Env, requestedRange: string | null): Promise<Response> {
-    await ensureProviders(env);
     const timestamp = new Date();
     const configuration = rangeConfiguration(requestedRange, timestamp);
     const [providers, modelResult, statuses, checks, executions, monitor] = await Promise.all([
@@ -489,17 +531,22 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
             .all<HistoryExecution>(),
         monitorRuns(env),
     ]);
+    const statusesByModelProvider = new Map(
+        statuses.results.map((status) => [`${status.provider_id}:${status.model_id}`, status]),
+    );
+    const statusesByModel = groupBy(statuses.results, (status) => status.model_id);
+    const checksByModel = groupBy(checks.results, (check) => check.model_id);
+    const executionsByModel = groupBy(executions.results, (execution) => execution.model_id);
     const models = modelResult.results.map((model) => {
-        const providerId = effectiveProvider(model.tier, model.id, statuses.results);
-        const modelChecks = checks.results.filter((check) => check.model_id === model.id);
+        const modelStatuses = statusesByModel.get(model.id) ?? [];
+        const providerId = effectiveProvider(model.tier, model.id, modelStatuses);
+        const modelChecks = checksByModel.get(model.id) ?? [];
         const providerChecks = modelChecks.filter((check) => check.provider_id === providerId);
         const intervalMinutes = nominalCheckIntervalMinutes(
             model.tier === 'PAID' ? 'PAID' : model.tier === 'FREE' ? 'FREE' : 'UNKNOWN',
             env,
         );
-        const effectiveStatus = statuses.results.find(
-            (status) => status.model_id === model.id && status.provider_id === providerId,
-        );
+        const effectiveStatus = statusesByModelProvider.get(`${providerId}:${model.id}`);
         return {
             ...model,
             effectiveProvider: providerId.replace('ollama-', ''),
@@ -512,7 +559,7 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
             history:
                 configuration.range === '1h'
                     ? executionHistoryBuckets(
-                          executions.results.filter((execution) => execution.model_id === model.id),
+                          executionsByModel.get(model.id) ?? [],
                           modelChecks,
                           timestamp,
                       )
