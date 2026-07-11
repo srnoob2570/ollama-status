@@ -58,7 +58,10 @@ export function isLatencyAnomalous(latencyMs: number, baseline?: number): boolea
 }
 
 export function nominalCheckIntervalMinutes(tier: 'FREE' | 'PAID' | 'UNKNOWN'): number {
-    return tier === 'PAID' ? 15 : 5;
+    // Cadence aligned to the 15-minute cron tick (wrangler crons */15). Both tiers check every
+    // tick; the tier argument is kept for callers and future divergence.
+    void tier;
+    return 15;
 }
 
 export function checkIntervalMinutes(
@@ -72,10 +75,10 @@ export function checkIntervalMinutes(
         : status === 'RATE_LIMITED'
           ? // A 429 here is usually self-inflicted burst throttling, not an exhausted quota,
             // so honor any Retry-After but otherwise recover on the next cycle (floored to the
-            // 5-minute cron cadence) instead of locking the model out for a full hour.
-            Math.max(5, Math.ceil((retryAfterSeconds ?? 300) / 60))
+            // 15-minute cron cadence) instead of locking the model out for a full hour.
+            Math.max(15, Math.ceil((retryAfterSeconds ?? 300) / 60))
           : status === 'DEGRADED' || (status === 'OUTAGE' && hadRecentIncident)
-            ? 5
+            ? 15
             : status === 'OUTAGE'
               ? 15
               : nominalCheckIntervalMinutes(tier);
@@ -91,15 +94,14 @@ export function nextCheckAt(
     return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
-// The monitor only ever runs on a cron tick (every 5 minutes; see wrangler crons).
+// The monitor only ever runs on a cron tick (every 15 minutes; see wrangler crons).
 // A model whose next_check_at lands even a second after a tick would otherwise wait a
-// whole extra cycle, drifting the free cadence from ~5 toward ~10 minutes. Admitting
+// whole extra cycle, drifting the cadence from ~15 toward ~30 minutes. Admitting
 // anything that comes due before the next tick pins every tier to its exact nominal
-// multiple of the cron period (free → 5m, paid → 15m). The margin must stay STRICTLY
-// below one cron interval: at or above it, the 15-minute paid cadence would be pulled
-// down to 10. The 1s shy of a full interval keeps the widest drift tolerance under
-// that ceiling.
-export const CRON_INTERVAL_MS = 5 * 60_000;
+// multiple of the cron period (15m). The margin must stay STRICTLY below one cron
+// interval: at or above it, the cadence would be pulled down toward a shorter period.
+// The 1s shy of a full interval keeps the widest drift tolerance under that ceiling.
+export const CRON_INTERVAL_MS = 15 * 60_000;
 export const SCHEDULE_GRACE_MS = CRON_INTERVAL_MS - 1_000;
 
 export function eligibilityCutoff(nowMs: number): string {

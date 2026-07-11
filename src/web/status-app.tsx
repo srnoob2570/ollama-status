@@ -149,7 +149,7 @@ export function App() {
                     <p className="eyebrow">OLLAMA CLOUD</p>
                     <h1>Service status</h1>
                     <p className="subtle">
-                        Free models are checked every 5 minutes; paid models every 15 minutes.
+                        Models are checked every 15 minutes.
                     </p>
                 </div>
                 <div className="monitor-meta">

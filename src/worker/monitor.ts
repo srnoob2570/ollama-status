@@ -723,7 +723,7 @@ async function cleanup(env: Env): Promise<void> {
             .run();
         lastRolledHour = hour;
     }
-    // Retention deletes are idempotent; run them once per UTC day instead of every 5-minute cycle.
+    // Retention deletes are idempotent; run them once per UTC day instead of every 15-minute cycle.
     const today = new Date().toISOString().slice(0, 10);
     if (today !== lastCleanupDay) {
         const threshold = new Date(Date.now() - 90 * 24 * 60 * 60_000).toISOString();

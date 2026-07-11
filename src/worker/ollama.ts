@@ -141,6 +141,24 @@ export class OllamaProvider {
     }
 }
 
+function successResult(
+    started: number,
+    firstTokenAt: number,
+    baseline: number | undefined,
+    httpStatus: number,
+): ProbeResult {
+    // rttMs is time-to-first-token, preserving the latency baseline semantics (monitor.ts uses
+    // historical total_duration_ms as baseline); it is NOT total generation time.
+    const rttMs = firstTokenAt - started;
+    const classification = isLatencyAnomalous(rttMs, baseline) ? 'HIGH_LATENCY' : 'SUCCESS';
+    return {
+        classification,
+        publicStatus: publicStatusFor(classification),
+        httpStatus,
+        rttMs,
+    };
+}
+
 async function firstChatToken(
     response: Response,
     started: number,
@@ -151,6 +169,11 @@ async function firstChatToken(
         decoder = new TextDecoder();
     let buffer = '';
     let receivedBytes = 0;
+    // Time-to-first-token, captured at the first chunk that proves inference started. The stream
+    // is then consumed to completion (no reader.cancel()) so the server finishes generation and
+    // Ollama Cloud bills the full, consistent GPU time — canceling mid-stream left partial GPU
+    // time that read as quota under-accounting and risked violating the Cloud terms of use.
+    let firstTokenAt: number | null = null;
     try {
         while (true) {
             const { done, value } = await reader.read();
@@ -175,26 +198,23 @@ async function firstChatToken(
                 if (chunk.error !== undefined) return protocolError(started, 'stream_error');
                 // Some thinking-capable models emit only a thinking fragment before the
                 // configured token limit. Either field proves that inference started.
-                if (
-                    (typeof chunk.message?.content === 'string' &&
-                        chunk.message.content.trim().length > 0) ||
-                    (typeof chunk.message?.thinking === 'string' &&
-                        chunk.message.thinking.trim().length > 0)
-                ) {
-                    await reader.cancel();
-                    const rttMs = performance.now() - started;
-                    const classification = isLatencyAnomalous(rttMs, baseline)
-                        ? 'HIGH_LATENCY'
-                        : 'SUCCESS';
-                    return {
-                        classification,
-                        publicStatus: publicStatusFor(classification),
-                        httpStatus: response.status,
-                        rttMs,
-                    };
+                if (firstTokenAt === null) {
+                    const hasContent =
+                        (typeof chunk.message?.content === 'string' &&
+                            chunk.message.content.trim().length > 0) ||
+                        (typeof chunk.message?.thinking === 'string' &&
+                            chunk.message.thinking.trim().length > 0);
+                    if (hasContent) firstTokenAt = performance.now();
                 }
+                // The server signals generation is complete with done:true. Reading to here
+                // (instead of canceling at the first token) lets Ollama account the full GPU time.
+                if (chunk.done === true && firstTokenAt !== null)
+                    return successResult(started, firstTokenAt, baseline, response.status);
             }
-            if (done) return emptyResponse(started);
+            if (done)
+                return firstTokenAt !== null
+                    ? successResult(started, firstTokenAt, baseline, response.status)
+                    : emptyResponse(started);
         }
     } finally {
         reader.releaseLock();

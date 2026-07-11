@@ -402,9 +402,9 @@ describe('Ollama status classification', () => {
         });
     });
 
-    it('rounds checks to the next five-minute scheduler boundary and pauses countdowns while updating', () => {
+    it('rounds checks to the next fifteen-minute scheduler boundary and pauses countdowns while updating', () => {
         expect(roundUpToMonitorInterval('2026-07-10T12:01:01.000Z')).toBe(
-            Date.parse('2026-07-10T12:05:00.000Z'),
+            Date.parse('2026-07-10T12:15:00.000Z'),
         );
         expect(
             nextUpdateLabel(
@@ -412,7 +412,7 @@ describe('Ollama status classification', () => {
                 false,
                 Date.parse('2026-07-10T12:00:00.000Z'),
             ),
-        ).toBe('in 5m 0s');
+        ).toBe('in 15m 0s');
         expect(
             nextUpdateLabel(
                 '2026-07-10T12:01:01.000Z',
@@ -533,14 +533,14 @@ describe('Ollama status classification', () => {
 
     it('recovers a self-inflicted rate limit on the next cycle instead of a full hour', () => {
         const now = Date.now();
-        // No Retry-After header → short default (~5 min), not the old 60-minute lockout.
+        // No Retry-After header → short default (~15 min, the cron tick), not the old 60-minute lockout.
         const noHeader = new Date(nextCheckAt('RATE_LIMITED', false)).getTime() - now;
-        expect(noHeader).toBeLessThanOrEqual(6 * 60_000);
-        expect(noHeader).toBeGreaterThanOrEqual(4 * 60_000);
-        // A shorter Retry-After is still floored to the 5-minute cron cadence.
+        expect(noHeader).toBeLessThanOrEqual(16 * 60_000);
+        expect(noHeader).toBeGreaterThanOrEqual(14 * 60_000);
+        // A shorter Retry-After is still floored to the 15-minute cron cadence.
         expect(
             new Date(nextCheckAt('RATE_LIMITED', false, 30)).getTime() - now,
-        ).toBeGreaterThanOrEqual(4 * 60_000);
+        ).toBeGreaterThanOrEqual(14 * 60_000);
     });
 
     it('admits any check that comes due before the next cron tick so a late run does not drift the cadence', () => {
@@ -552,13 +552,13 @@ describe('Ollama status classification', () => {
         expect(grace).toBeLessThan(CRON_INTERVAL_MS);
     });
 
-    it('checks free models every five minutes and paid models every fifteen', () => {
-        expect(nominalCheckIntervalMinutes('FREE')).toBe(5);
-        expect(nominalCheckIntervalMinutes('UNKNOWN')).toBe(5);
+    it('checks every model every fifteen minutes regardless of tier', () => {
+        expect(nominalCheckIntervalMinutes('FREE')).toBe(15);
+        expect(nominalCheckIntervalMinutes('UNKNOWN')).toBe(15);
         expect(nominalCheckIntervalMinutes('PAID')).toBe(15);
-        expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'FREE')).toBe(5);
+        expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'FREE')).toBe(15);
         expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'PAID')).toBe(15);
-        expect(checkIntervalMinutes('DEGRADED', false, undefined, 'PAID')).toBe(5);
+        expect(checkIntervalMinutes('DEGRADED', false, undefined, 'PAID')).toBe(15);
     });
 
     it('keeps the paid cadence after a paid-provider probe', () => {
@@ -673,6 +673,63 @@ describe('Ollama status classification', () => {
                 'test-key',
             );
             expect((await provider.probe('thinking-model')).classification).toBe('SUCCESS');
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('reads the stream through multiple content chunks to the done terminator (no mid-stream cancel)', async () => {
+        // The probe must consume the whole stream to the done:true terminator so Ollama Cloud
+        // accounts the full GPU time, instead of canceling the reader at the first token. rttMs
+        // is captured at the first token (TTFT), not at the done terminator.
+        const originalFetch = globalThis.fetch;
+        const stream =
+            [
+                JSON.stringify({ model: 'm', message: { content: 'OK' }, done: false }),
+                JSON.stringify({ model: 'm', message: { content: '!' }, done: false }),
+                JSON.stringify({ model: 'm', done: true, total_duration: 1 }),
+            ].join('\n') + '\n';
+        globalThis.fetch = async () => new Response(stream, { status: 200 });
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            const result = await provider.probe('cloud');
+            expect(result.classification).toBe('SUCCESS');
+            expect(result.rttMs).toBeGreaterThanOrEqual(0);
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('surfaces a malformed chunk after the first token instead of canceling and masking it as success', async () => {
+        // Regression guard for the no-cancel behavior: the old code returned SUCCESS at the first
+        // content chunk and canceled the reader, so it never saw a later malformed chunk. The new
+        // code reads to completion, so a corrupt chunk after the first token now surfaces as
+        // PROTOCOL_ERROR — proving the stream is consumed rather than canceled at the first token.
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () =>
+            new Response(
+                `${JSON.stringify({ message: { content: 'OK' }, done: false })}\nnot-json\n`,
+                { status: 200 },
+            );
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            expect((await provider.probe('cloud')).classification).toBe('PROTOCOL_ERROR');
         } finally {
             globalThis.fetch = originalFetch;
         }
@@ -973,9 +1030,9 @@ describe('monitor run time-box (cadence preservation)', () => {
     it('flags infeasibility when a single probe+delay exceeds the cron interval', () => {
         // A huge configured delay makes one probe+delay longer than the whole tick: the deadline
         // falls at or before the start, so the run can't process any model and is marked PARTIAL
-        // (explicit infeasibility detection instead of silently drifting cadence to ~10 min).
+        // (explicit infeasibility detection instead of silently drifting cadence to ~30 min).
         const started = new Date('2026-07-10T13:00:00.000Z').getTime();
-        const deadline = runDeadlineMs(started, env({ PROBE_DELAY_MAX_MS: '600000' }));
+        const deadline = runDeadlineMs(started, env({ PROBE_DELAY_MAX_MS: '960000' }));
         expect(deadline).toBeLessThanOrEqual(started);
     });
 });
