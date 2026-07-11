@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { nextUpdateLabel } from './next-update';
 
 type HistoryRange = '1h' | '24h' | '7d' | '30d';
@@ -335,51 +336,105 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
     );
 }
 
+type BucketSegmentView = {
+    status: string;
+    label: string;
+    tone: string;
+    checks: number;
+    proportion: number;
+};
+type BucketDescription = {
+    time: string;
+    hasData: boolean;
+    headlineLabel: string;
+    headlineTone: string;
+    headlinePrefix: string | null;
+    checks: number;
+    averageLatencyMs: number | null;
+    segments: BucketSegmentView[];
+    ariaLabel: string;
+};
+
+function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescription {
+    const time = bucketLabel(bucket.startAt, range);
+    const hasData = bucket.checks > 0;
+    const ranked = (bucket.segments ?? [])
+        .filter((segment) => segment.checks > 0)
+        .sort(
+            (left, right) =>
+                (statusSeverity[left.status] ?? statusSeverity.UNKNOWN) -
+                    (statusSeverity[right.status] ?? statusSeverity.UNKNOWN) ||
+                left.status.localeCompare(right.status),
+        );
+    const segmentTotal = ranked.reduce((total, segment) => total + segment.checks, 0);
+    const segments = ranked.map((segment) => ({
+        status: segment.status,
+        label: labels[segment.status] ?? 'Unknown',
+        tone: statusTone[segment.status] ?? 'unknown',
+        checks: segment.checks,
+        proportion: segmentTotal ? Math.round((segment.checks / segmentTotal) * 100) : 0,
+    }));
+    // "worst" only makes sense when the segment mixes several statuses; a single
+    // status reads plainly (e.g. "Operational") instead of "worst status Operational".
+    const headlinePrefix = segments.length > 1 ? 'Worst' : null;
+    const headlineLabel = hasData ? (labels[bucket.status] ?? 'Unknown') : 'No data';
+    const headlineTone = hasData ? (statusTone[bucket.status] ?? 'unknown') : 'unknown';
+    const checksText = bucket.checks === 1 ? '1 check' : `${bucket.checks} checks`;
+    const averageText =
+        bucket.averageLatencyMs === null
+            ? 'no latency samples'
+            : `average ${Math.round(bucket.averageLatencyMs)} ms`;
+    const headline = headlinePrefix ? `worst status ${headlineLabel}` : headlineLabel;
+    const ariaLabel = hasData
+        ? `${time} · ${headline} · ${checksText} · ${averageText}`
+        : `${time} · no data`;
+    return {
+        time,
+        hasData,
+        headlineLabel,
+        headlineTone,
+        headlinePrefix,
+        checks: bucket.checks,
+        averageLatencyMs: bucket.averageLatencyMs,
+        segments,
+        ariaLabel,
+    };
+}
+
 function History({ model, range }: { model: Model; range: HistoryRange }) {
+    const [active, setActive] = useState<{
+        key: string;
+        rect: DOMRect;
+        data: BucketDescription;
+    } | null>(null);
     return (
         <div
             className={`history history-${range}`}
             aria-label={`${model.remote_name} ${range} status history`}
         >
             {model.history.map((bucket) => {
-                const label = labels[bucket.status] ?? 'Unknown';
-                const checks = bucket.checks === 1 ? '1 check' : `${bucket.checks} checks`;
-                const average =
-                    bucket.averageLatencyMs === null
-                        ? 'no latency samples'
-                        : `average ${Math.round(bucket.averageLatencyMs)} ms`;
-                const segments = bucket.segments
-                    ?.filter((segment) => segment.checks > 0)
-                    .sort(
-                        (left, right) =>
-                            (statusSeverity[left.status] ?? statusSeverity.UNKNOWN) -
-                                (statusSeverity[right.status] ?? statusSeverity.UNKNOWN) ||
-                            left.status.localeCompare(right.status),
-                    );
-                const segmentTotal =
-                    segments?.reduce((total, segment) => total + segment.checks, 0) ?? 0;
-                const breakdown = segments?.length
-                    ? segments
-                          .map((segment) => {
-                              const segmentLabel = labels[segment.status] ?? 'Unknown';
-                              const proportion = Math.round((segment.checks / segmentTotal) * 100);
-                              return `${segmentLabel}: ${segment.checks} (${proportion}%)`;
-                          })
-                          .join(', ')
-                    : `${label}: ${bucket.checks}`;
-                const description = `${bucketLabel(bucket.startAt, range)} · worst status ${label} · ${checks} · ${average} · ${breakdown}`;
+                const key = bucket.startAt;
+                const data = describeBucket(bucket, range);
+                const show = (event: { currentTarget: HTMLElement }) =>
+                    setActive({ key, rect: event.currentTarget.getBoundingClientRect(), data });
+                const hide = () =>
+                    setActive((current) => (current?.key === key ? null : current));
                 return (
                     <span
-                        className={`history-bar ${segments?.length ? '' : (statusTone[bucket.status] ?? 'unknown')}`}
-                        key={bucket.startAt}
+                        className={`history-bar ${data.segments.length ? '' : data.headlineTone}`}
+                        key={key}
                         role="img"
-                        title={description}
-                        aria-label={description}
+                        tabIndex={0}
+                        aria-label={data.ariaLabel}
+                        onMouseEnter={show}
+                        onMouseLeave={hide}
+                        onFocus={show}
+                        onBlur={hide}
                     >
-                        {segments?.map((segment) => (
+                        {data.segments.map((segment) => (
                             <span
                                 aria-hidden="true"
-                                className={`history-segment ${statusTone[segment.status] ?? 'unknown'}`}
+                                className={`history-segment ${segment.tone}`}
                                 key={segment.status}
                                 style={{ flexGrow: segment.checks }}
                             />
@@ -387,7 +442,95 @@ function History({ model, range }: { model: Model; range: HistoryRange }) {
                     </span>
                 );
             })}
+            {active && <HistoryTooltip rect={active.rect} data={active.data} />}
         </div>
+    );
+}
+
+function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription }) {
+    const ref = useRef<HTMLDivElement>(null);
+    const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+    useLayoutEffect(() => {
+        const element = ref.current;
+        if (!element) return;
+        const box = element.getBoundingClientRect();
+        const margin = 8;
+        const gap = 10;
+        const left = Math.max(
+            margin,
+            Math.min(
+                rect.left + rect.width / 2 - box.width / 2,
+                window.innerWidth - box.width - margin,
+            ),
+        );
+        const above = rect.top - box.height - gap;
+        const top = above >= margin ? above : rect.bottom + gap;
+        setPosition({ left, top });
+    }, [rect, data]);
+    return createPortal(
+        <div
+            ref={ref}
+            className="history-tooltip"
+            role="tooltip"
+            aria-hidden="true"
+            style={{
+                left: `${position ? position.left : rect.left}px`,
+                top: `${position ? position.top : rect.top}px`,
+                visibility: position ? 'visible' : 'hidden',
+            }}
+        >
+            <div className="tt-header">{data.time}</div>
+            <div className="tt-status">
+                <span aria-hidden="true" className={`dot ${data.headlineTone}`} />
+                <span>
+                    {data.headlinePrefix
+                        ? `${data.headlinePrefix}: ${data.headlineLabel}`
+                        : data.headlineLabel}
+                </span>
+            </div>
+            {data.hasData && (
+                <>
+                    <div className="tt-metrics">
+                        <span className="tt-metric-label">Checks</span>
+                        <span className="tt-metric-value">{data.checks}</span>
+                        <span className="tt-metric-label">Avg latency</span>
+                        <span className="tt-metric-value">
+                            {data.averageLatencyMs === null
+                                ? '—'
+                                : `${Math.round(data.averageLatencyMs)} ms`}
+                        </span>
+                    </div>
+                    {data.segments.length > 0 && (
+                        <div className="tt-breakdown">
+                            <div className="tt-bar">
+                                {data.segments.map((segment) => (
+                                    <span
+                                        aria-hidden="true"
+                                        className={`history-segment ${segment.tone}`}
+                                        key={segment.status}
+                                        style={{ flexGrow: segment.checks }}
+                                    />
+                                ))}
+                            </div>
+                            <ul className="tt-legend">
+                                {data.segments.map((segment) => (
+                                    <li key={segment.status}>
+                                        <span
+                                            aria-hidden="true"
+                                            className={`dot ${segment.tone}`}
+                                        />
+                                        <span className="tt-legend-label">{segment.label}</span>
+                                        <span className="tt-legend-count">{segment.checks}</span>
+                                        <span className="tt-legend-pct">{segment.proportion}%</span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+                </>
+            )}
+        </div>,
+        document.body,
     );
 }
 

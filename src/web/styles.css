@@ -178,6 +178,85 @@ time,
     flex-basis: 0;
     min-height: 1px;
 }
+.history-bar {
+    cursor: default;
+}
+.history-tooltip {
+    position: fixed;
+    z-index: 20;
+    pointer-events: none;
+    min-width: 180px;
+    max-width: 260px;
+    padding: 12px 14px;
+    background: #0d1a2d;
+    border: 1px solid #24374f;
+    border-radius: 12px;
+    box-shadow: 0 12px 30px #020812cc;
+    display: grid;
+    gap: 10px;
+    font-size: 0.8rem;
+    color: #e8edf5;
+}
+.tt-header {
+    color: #91a2bc;
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+}
+.tt-status {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-weight: 600;
+}
+.tt-metrics {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 12px;
+    padding-top: 8px;
+    border-top: 1px solid #1b2c45;
+}
+.tt-metric-label {
+    color: #91a2bc;
+}
+.tt-metric-value {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.tt-breakdown {
+    display: grid;
+    gap: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #1b2c45;
+}
+.tt-bar {
+    display: flex;
+    height: 6px;
+    gap: 1px;
+    border-radius: 3px;
+    overflow: hidden;
+}
+.tt-legend {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 5px;
+}
+.tt-legend li {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    align-items: center;
+    gap: 8px;
+}
+.tt-legend-label {
+    color: #c3cede;
+}
+.tt-legend-count,
+.tt-legend-pct {
+    color: #91a2bc;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+}
 .loading {
     color: #91a2bc;
     padding: 10vh 0;
