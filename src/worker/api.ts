@@ -2,7 +2,6 @@ import { ensureProviders, runMonitor } from './monitor';
 import type { Env } from './types';
 import { id, now } from './types';
 import { requireAccess } from './auth';
-import { nominalCheckIntervalMinutes } from './status';
 
 const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -11,8 +10,11 @@ const json = (body: unknown, status = 200) =>
     });
 const invalid = (message: string) => json({ error: message }, 400);
 
+// Fixed 5-minute buckets for the 1h range, decoupled from the per-tier check cadence so
+// staggered/async checks land wherever they land without creating false "no data" gaps.
+const HISTORY_1H_BUCKET_MINUTES = 5;
+
 export type HistoryRange = '1h' | '24h' | '7d' | '30d';
-type ModelTier = 'FREE' | 'PAID' | 'UNKNOWN';
 export type StatusRow = {
     provider_id: string;
     model_id: string;
@@ -38,12 +40,15 @@ export type HistoryBucket = {
     segments: HistorySegment[];
     averageLatencyMs: number | null;
     latencySamples: number;
+    // True on an empty bucket that contains "now" — the current cycle's check hasn't
+    // landed yet (run in progress or next check still pending). Older empty buckets are
+    // genuine "no data" gaps. Only meaningful when checks === 0.
+    pending?: boolean;
 };
 type ScheduledModel = { tier: string; next_check_at: string | null };
 
 const rangeConfiguration = (
     requestedRange: string | null,
-    tier: ModelTier = 'UNKNOWN',
     timestamp = new Date(),
 ): { range: HistoryRange; bucketCount: number; bucketDurationMs: number; start: Date } => {
     const range: HistoryRange =
@@ -52,13 +57,13 @@ const rangeConfiguration = (
             : '1h';
     const bucketDurationMs =
         range === '1h'
-            ? nominalCheckIntervalMinutes(tier) * 60_000
+            ? HISTORY_1H_BUCKET_MINUTES * 60_000
             : range === '24h'
               ? 3_600_000
               : 86_400_000;
     const bucketCount =
         range === '1h'
-            ? 60 / nominalCheckIntervalMinutes(tier)
+            ? 60 / HISTORY_1H_BUCKET_MINUTES
             : range === '24h'
               ? 24
               : range === '7d'
@@ -101,9 +106,12 @@ export function historyBuckets(
     checks: HistoryCheck[],
     range: string | null,
     timestamp = new Date(),
-    tier: ModelTier = 'UNKNOWN',
 ): HistoryBucket[] {
-    const config = rangeConfiguration(range, tier, timestamp);
+    const config = rangeConfiguration(range, timestamp);
+    const lastIndex = config.bucketCount - 1;
+    // Only the 1h range distinguishes "pending" from "no data"; coarser ranges keep their
+    // existing semantics where an empty bucket is simply "no data".
+    const markPending = config.range === '1h';
     const buckets = Array.from({ length: config.bucketCount }, (_, index) => ({
         startAt: new Date(config.start.getTime() + index * config.bucketDurationMs).toISOString(),
         status: 'UNKNOWN',
@@ -111,6 +119,9 @@ export function historyBuckets(
         segmentCounts: new Map<string, number>(),
         totalDurations: [] as number[],
         rtts: [] as number[],
+        // The last bucket ends at `timestamp` (now); when empty it means the current cycle's
+        // check hasn't landed yet (run in progress or next check still pending), not a gap.
+        pending: markPending && index === lastIndex,
     }));
     for (const check of checks) {
         const index = Math.floor(
@@ -123,6 +134,7 @@ export function historyBuckets(
             ? worstStatus([bucket.status, check.public_status])
             : check.public_status;
         bucket.checks += 1;
+        bucket.pending = false;
         bucket.segmentCounts.set(
             check.public_status,
             (bucket.segmentCounts.get(check.public_status) ?? 0) + 1,
@@ -291,7 +303,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 async function publicStatus(env: Env, requestedRange: string | null): Promise<Response> {
     await ensureProviders(env);
     const timestamp = new Date();
-    const configuration = rangeConfiguration(requestedRange, 'UNKNOWN', timestamp);
+    const configuration = rangeConfiguration(requestedRange, timestamp);
     const [providers, modelResult, statuses, checks, monitor] = await Promise.all([
         env.DB.prepare(
             'SELECT id,name,catalog_status,catalog_checked_at FROM providers WHERE active=1 ORDER BY name',
@@ -325,12 +337,7 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
             lastCheckAt: effectiveStatus?.last_check_at ?? null,
             lastLatencyMs: effectiveStatus?.last_latency_ms ?? null,
             metrics: latencyMetrics(providerChecks),
-            history: historyBuckets(
-                providerChecks,
-                configuration.range,
-                timestamp,
-                model.tier === 'FREE' || model.tier === 'PAID' ? model.tier : 'UNKNOWN',
-            ),
+            history: historyBuckets(providerChecks, configuration.range, timestamp),
         };
     });
     return json({
@@ -359,10 +366,7 @@ async function modelDetail(
         .first<{ tier: string }>();
     if (!model) return json({ error: 'Model not found' }, 404);
     if (!history) return json({ model });
-    const configuration = rangeConfiguration(
-        range,
-        model.tier === 'FREE' || model.tier === 'PAID' ? model.tier : 'UNKNOWN',
-    );
+    const configuration = rangeConfiguration(range);
     const from = configuration.start.toISOString();
     const checks = await env.DB.prepare(
         'SELECT provider_id,checked_at,classification,public_status,total_duration_ms,rtt_ms,load_duration_ms FROM checks WHERE model_id=? AND checked_at>=? ORDER BY checked_at',

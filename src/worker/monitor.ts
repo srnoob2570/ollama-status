@@ -12,12 +12,42 @@ const providerSeeds = [
 
 // The whole active catalog (34 models today) must fit in one run, or models get starved
 // past their cadence and drift to "checked N minutes ago". Kept above catalog size with
-// room to grow; raise PROBE_CONCURRENCY too if the catalog ever outgrows this.
+// room to grow.
 const MAX_MODELS_PER_RUN = 40;
+const PROBE_CONCURRENCY_DEFAULT = 1;
+const PROBE_CONCURRENCY_MAX = 16;
+const PROBE_DELAY_MIN_MS_DEFAULT = 0;
+const PROBE_DELAY_MAX_MS_DEFAULT = 5_000;
+const LOCK_LEASE_MS = 6 * 60_000;
+
 // Probes run in parallel batches so one slow or timing-out model can't stagger the rest of
-// the run across minutes. Kept low to avoid bursting Ollama into per-model 429s (which a
-// larger batch triggered on the heaviest models) while still finishing runs in seconds.
-const PROBE_CONCURRENCY = 1;
+// the run across minutes. Concurrency is configurable via PROBE_CONCURRENCY: free API keys
+// allow only 1 in-flight model, so the default stays at 1 to avoid per-model 429s; paid keys
+// can raise it (~3-10) to finish runs faster. The inter-probe delay (PROBE_DELAY_MIN_MS ..
+// PROBE_DELAY_MAX_MS) spreads requests over time instead of bursting them all at once.
+export function probeConcurrency(env: Env): number {
+    const parsed = Number.parseInt(env.PROBE_CONCURRENCY ?? '', 10);
+    if (!Number.isFinite(parsed) || parsed < 1) return PROBE_CONCURRENCY_DEFAULT;
+    return Math.min(parsed, PROBE_CONCURRENCY_MAX);
+}
+
+// Random delay in [min, max] applied before each probe so staggered requests don't burst.
+export function probeDelayMs(env: Env): { min: number; max: number } {
+    const minParsed = Number.parseInt(env.PROBE_DELAY_MIN_MS ?? '', 10);
+    const maxParsed = Number.parseInt(env.PROBE_DELAY_MAX_MS ?? '', 10);
+    const min =
+        Number.isFinite(minParsed) && minParsed >= 0 ? minParsed : PROBE_DELAY_MIN_MS_DEFAULT;
+    const max =
+        Number.isFinite(maxParsed) && maxParsed >= 0 ? maxParsed : PROBE_DELAY_MAX_MS_DEFAULT;
+    if (min > max) return { min: max, max: min };
+    return { min, max };
+}
+
+export function randomDelay(env: Env): number {
+    const { min, max } = probeDelayMs(env);
+    if (max === min) return min;
+    return min + Math.floor(Math.random() * (max - min + 1));
+}
 
 function keyFor(env: Env, ref: Provider['secret_ref']) {
     return env[ref] ?? '';
@@ -61,7 +91,7 @@ export async function ensureProviders(env: Env): Promise<void> {
 
 export async function acquireLock(env: Env, name: string, owner: string): Promise<boolean> {
     const timestamp = now(),
-        lease = new Date(Date.now() + 4 * 60_000).toISOString();
+        lease = new Date(Date.now() + LOCK_LEASE_MS).toISOString();
     const result = await env.DB.prepare(
         `INSERT INTO scheduler_locks(name, lease_until, owner, updated_at) VALUES (?,?,?,?)
     ON CONFLICT(name) DO UPDATE SET lease_until=excluded.lease_until, owner=excluded.owner, updated_at=excluded.updated_at
@@ -80,7 +110,7 @@ async function releaseLock(env: Env, name: string, owner: string): Promise<void>
 
 export async function renewLock(env: Env, name: string, owner: string): Promise<boolean> {
     const timestamp = now(),
-        lease = new Date(Date.now() + 4 * 60_000).toISOString();
+        lease = new Date(Date.now() + LOCK_LEASE_MS).toISOString();
     const result = await env.DB.prepare(
         'UPDATE scheduler_locks SET lease_until=?,updated_at=? WHERE name=? AND owner=?',
     )
@@ -406,8 +436,9 @@ async function fiveCheckFailures(env: Env, providerId: string, modelId: string):
 }
 
 async function probeModel(env: Env, provider: Provider, model: Model): Promise<ProbeResult> {
-    // Small jitter avoids synchronized bursts without making a scheduled run take minutes.
-    await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 1_500)));
+    // Configurable delay spreads probes over time so free API keys (1 concurrent model)
+    // don't burst into 429s, without making a scheduled run take minutes.
+    await new Promise((resolve) => setTimeout(resolve, randomDelay(env)));
     const client = new OllamaProvider(
         provider,
         keyFor(env, provider.secret_ref),
@@ -518,11 +549,12 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         )
             .bind(catalogModelCount, due.results.length, runId)
             .run();
-        for (let i = 0; i < due.results.length; i += PROBE_CONCURRENCY) {
+        const concurrency = probeConcurrency(env);
+        for (let i = 0; i < due.results.length; i += concurrency) {
             if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
             await Promise.all(
                 due.results
-                    .slice(i, i + PROBE_CONCURRENCY)
+                    .slice(i, i + concurrency)
                     .map((model) =>
                         probeByEntitlement(env, freeProvider, paidProvider, model, runId),
                     ),

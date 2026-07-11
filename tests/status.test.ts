@@ -20,12 +20,18 @@ import {
     nextUpdatesForModels,
     worstStatus,
 } from '../src/worker/api';
-import { materializedStatus, nextCheckTier, renewLock } from '../src/worker/monitor';
+import {
+    materializedStatus,
+    nextCheckTier,
+    probeConcurrency,
+    probeDelayMs,
+    renewLock,
+} from '../src/worker/monitor';
 import type { Env } from '../src/worker/types';
 import { nextUpdateLabel, roundUpToMonitorInterval } from '../src/web/next-update';
 
 describe('Ollama status classification', () => {
-    it('uses a moving one-hour window by default with bucket counts based on model tier', () => {
+    it('uses a moving one-hour window with fixed 5-minute buckets for every tier', () => {
         const reference = new Date('2026-07-10T13:34:00.000Z');
         const free = historyBuckets(
             [
@@ -59,17 +65,49 @@ describe('Ollama status classification', () => {
             ],
             null,
             reference,
-            'FREE',
         );
-        const paid = historyBuckets([], '1h', reference, 'PAID');
+        // Bucket size is decoupled from cadence: both tiers get 12 fixed 5-minute buckets.
+        const paid = historyBuckets([], '1h', reference);
 
         expect(free).toHaveLength(12);
-        expect(paid).toHaveLength(4);
+        expect(paid).toHaveLength(12);
         expect(free[0]).toMatchObject({ startAt: '2026-07-10T12:34:00.000Z', checks: 1 });
         expect(free.at(-1)?.startAt).toBe('2026-07-10T13:29:00.000Z');
         expect(paid[0].startAt).toBe('2026-07-10T12:34:00.000Z');
-        expect(paid.at(-1)?.startAt).toBe('2026-07-10T13:19:00.000Z');
-        expect(historyBuckets([], 'invalid', reference, 'FREE')).toHaveLength(12);
+        expect(paid.at(-1)?.startAt).toBe('2026-07-10T13:29:00.000Z');
+        expect(historyBuckets([], 'invalid', reference)).toHaveLength(12);
+    });
+
+    it('marks the empty bucket containing now as pending, older empty buckets as no data', () => {
+        const reference = new Date('2026-07-10T13:34:00.000Z');
+        const buckets = historyBuckets([], '1h', reference);
+
+        expect(buckets).toHaveLength(12);
+        // Only the last bucket (ends at `now`) is pending when empty.
+        expect(buckets.at(-1)).toMatchObject({ checks: 0, pending: true });
+        // Every older empty bucket is a genuine no-data gap, not pending.
+        for (let i = 0; i < buckets.length - 1; i++) {
+            expect(buckets[i]).toMatchObject({ checks: 0, pending: false });
+        }
+        // A check landing in the last bucket clears its pending flag (run reached it).
+        const withLastCheck = historyBuckets(
+            [
+                {
+                    provider_id: 'ollama-free',
+                    model_id: 'm1',
+                    checked_at: '2026-07-10T13:29:30.000Z',
+                    public_status: 'OPERATIONAL',
+                    classification: 'SUCCESS',
+                    total_duration_ms: 20,
+                    rtt_ms: 25,
+                },
+            ],
+            '1h',
+            reference,
+        );
+        expect(withLastCheck.at(-1)).toMatchObject({ checks: 1, pending: false });
+        // The bucket before it stays a no-data gap (still empty, not now).
+        expect(withLastCheck.at(-2)).toMatchObject({ checks: 0, pending: false });
     });
 
     it('generates UTC hourly buckets and leaves periods without checks unknown', () => {
@@ -651,5 +689,47 @@ describe('Ollama status classification', () => {
         } finally {
             globalThis.fetch = originalFetch;
         }
+    });
+});
+
+describe('probe throttle configuration', () => {
+    const env = (overrides: Partial<Env> = {}) =>
+        ({
+            PROBE_CONCURRENCY: '1',
+            PROBE_DELAY_MIN_MS: '0',
+            PROBE_DELAY_MAX_MS: '5000',
+            ...overrides,
+        }) as unknown as Env;
+
+    it('clamps probe concurrency to a safe range with sensible defaults', () => {
+        expect(probeConcurrency(env())).toBe(1);
+        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '4' }))).toBe(4);
+        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '0' }))).toBe(1);
+        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '-3' }))).toBe(1);
+        expect(probeConcurrency(env({ PROBE_CONCURRENCY: '999' }))).toBe(16);
+        expect(probeConcurrency(env({ PROBE_CONCURRENCY: 'garbage' }))).toBe(1);
+        expect(probeConcurrency(env({ PROBE_CONCURRENCY: undefined }))).toBe(1);
+    });
+
+    it('parses the configurable inter-probe delay range, swapping inverted bounds', () => {
+        expect(probeDelayMs(env())).toEqual({ min: 0, max: 5000 });
+        expect(
+            probeDelayMs(env({ PROBE_DELAY_MIN_MS: '1000', PROBE_DELAY_MAX_MS: '3000' })),
+        ).toEqual({
+            min: 1000,
+            max: 3000,
+        });
+        // Inverted bounds are normalized so min <= max.
+        expect(
+            probeDelayMs(env({ PROBE_DELAY_MIN_MS: '4000', PROBE_DELAY_MAX_MS: '500' })),
+        ).toEqual({
+            min: 500,
+            max: 4000,
+        });
+        // Unparseable / missing values fall back to defaults.
+        expect(probeDelayMs(env({ PROBE_DELAY_MIN_MS: 'nope', PROBE_DELAY_MAX_MS: '' }))).toEqual({
+            min: 0,
+            max: 5000,
+        });
     });
 });

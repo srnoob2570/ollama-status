@@ -14,6 +14,7 @@ type HistoryBucket = {
     averageLatencyMs: number | null;
     latencySamples: number;
     segments?: HistorySegment[];
+    pending?: boolean;
 };
 type Model = {
     id: string;
@@ -366,8 +367,16 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
     // "worst" only makes sense when the segment mixes several statuses; a single
     // status reads plainly (e.g. "Operational") instead of "worst status Operational".
     const headlinePrefix = segments.length > 1 ? 'Worst' : null;
-    const headlineLabel = hasData ? (labels[bucket.status] ?? 'Unknown') : 'No data';
-    const headlineTone = hasData ? (statusTone[bucket.status] ?? 'unknown') : 'unknown';
+    const headlineLabel = hasData
+        ? (labels[bucket.status] ?? 'Unknown')
+        : bucket.pending
+          ? 'Pending'
+          : 'No data';
+    const headlineTone = hasData
+        ? (statusTone[bucket.status] ?? 'unknown')
+        : bucket.pending
+          ? 'pending'
+          : 'unknown';
     const checksText = bucket.checks === 1 ? '1 check' : `${bucket.checks} checks`;
     const averageText =
         bucket.averageLatencyMs === null
@@ -376,7 +385,9 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
     const headline = headlinePrefix ? `worst status ${headlineLabel}` : headlineLabel;
     const ariaLabel = hasData
         ? `${time} · ${headline} · ${checksText} · ${averageText}`
-        : `${time} · no data`;
+        : bucket.pending
+          ? `${time} · pending next check`
+          : `${time} · no data`;
     return {
         time,
         hasData,

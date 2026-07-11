@@ -149,6 +149,11 @@ time,
 .history-segment.unknown {
     background: #72819a;
 }
+/* Empty bucket whose check hasn't landed yet (run in progress / next check pending):
+   lighter than the "no data" gray so pending is visually distinct from a real gap. */
+.history-bar.pending {
+    background: #b9c4d4;
+}
 .history {
     width: 100%;
     max-width: 390px;
