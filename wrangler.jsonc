@@ -73,7 +73,7 @@
                 {
                     "binding": "DB",
                     "database_name": "ollama-status",
-                    "database_id": "16bb1ba2-eb9e-4e36-9399-8eb9ce89c127",
+                    "database_id": "55d84318-9b85-4a1e-8007-c57af9f27880",
                 },
             ],
             "vars": {
