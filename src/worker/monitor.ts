@@ -453,7 +453,7 @@ async function requestExternalConfirmation(env: Env, incidentId: string): Promis
                 'user-agent': 'ollama-status-monitor',
             },
             body: JSON.stringify({
-                ref: 'main',
+                ref: 'master',
                 inputs: { endpoint: env.CONFIRMATION_CALLBACK_URL, nonce, incident_id: incidentId },
             }),
         },
