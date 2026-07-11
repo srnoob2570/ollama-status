@@ -760,18 +760,16 @@ describe('Ollama status classification', () => {
         }
     });
 
-    it('reads the stream through multiple content chunks to the done terminator (no mid-stream cancel)', async () => {
-        // The probe must consume the whole stream to the done:true terminator so Ollama Cloud
-        // accounts the full GPU time, instead of canceling the reader at the first token. rttMs
-        // is captured at the first token (TTFT), not at the done terminator.
+    it('cancels the reader at the first content chunk instead of draining the stream', async () => {
+        // The probe returns SUCCESS as soon as a content token proves inference started and cancels
+        // the reader, measuring time-to-first-token. Any chunks after the first token — including a
+        // malformed one — are never read, so they cannot change the result to PROTOCOL_ERROR.
         const originalFetch = globalThis.fetch;
-        const stream =
-            [
-                JSON.stringify({ model: 'm', message: { content: 'OK' }, done: false }),
-                JSON.stringify({ model: 'm', message: { content: '!' }, done: false }),
-                JSON.stringify({ model: 'm', done: true, total_duration: 1 }),
-            ].join('\n') + '\n';
-        globalThis.fetch = async () => new Response(stream, { status: 200 });
+        globalThis.fetch = async () =>
+            new Response(
+                `${JSON.stringify({ message: { content: 'OK' }, done: false })}\nnot-json\n`,
+                { status: 200 },
+            );
         try {
             const provider = new OllamaProvider(
                 {
@@ -790,70 +788,7 @@ describe('Ollama status classification', () => {
         }
     });
 
-    it('surfaces a malformed chunk after the first token instead of canceling and masking it as success', async () => {
-        // Regression guard for the no-cancel behavior: the old code returned SUCCESS at the first
-        // content chunk and canceled the reader, so it never saw a later malformed chunk. The new
-        // code reads to completion, so a corrupt chunk after the first token now surfaces as
-        // PROTOCOL_ERROR — proving the stream is consumed rather than canceled at the first token.
-        const originalFetch = globalThis.fetch;
-        globalThis.fetch = async () =>
-            new Response(
-                `${JSON.stringify({ message: { content: 'OK' }, done: false })}\nnot-json\n`,
-                { status: 200 },
-            );
-        try {
-            const provider = new OllamaProvider(
-                {
-                    id: 'ollama-free',
-                    name: 'Free',
-                    base_url: 'https://example.test/api',
-                    secret_ref: 'OLLAMA_API_KEY_FREE',
-                },
-                'test-key',
-            );
-            expect((await provider.probe('cloud')).classification).toBe('PROTOCOL_ERROR');
-        } finally {
-            globalThis.fetch = originalFetch;
-        }
-    });
-
-    it('classifies a read error after the first token as success since inference already started', async () => {
-        // Slow/large models can drop the connection mid-stream after emitting the first token.
-        // Inference already started and the GPU time is accounted server-side, so the probe must
-        // report SUCCESS (the model did respond), not NETWORK_ERROR. Only an abort (probe timer
-        // or run hard-stop) still propagates as TIMEOUT/abandoned.
-        const originalFetch = globalThis.fetch;
-        const stream = new ReadableStream<Uint8Array>({
-            start(controller) {
-                controller.enqueue(
-                    new TextEncoder().encode(
-                        `${JSON.stringify({ message: { content: 'OK' }, done: false })}\n`,
-                    ),
-                );
-                // Error on a later tick so the first read delivers the token before the drop.
-                setTimeout(() => controller.error(new TypeError('connection reset')), 0);
-            },
-        });
-        globalThis.fetch = async () => new Response(stream, { status: 200 });
-        try {
-            const provider = new OllamaProvider(
-                {
-                    id: 'ollama-free',
-                    name: 'Free',
-                    base_url: 'https://example.test/api',
-                    secret_ref: 'OLLAMA_API_KEY_FREE',
-                },
-                'test-key',
-            );
-            const result = await provider.probe('cloud');
-            expect(result.classification).toBe('SUCCESS');
-            expect(result.publicStatus).toBe('OPERATIONAL');
-        } finally {
-            globalThis.fetch = originalFetch;
-        }
-    });
-
-    it('still classifies a read error before the first token as a network error', async () => {
+    it('classifies a read error before the first token as a network error', async () => {
         // If the connection drops before any token proves inference started, there is no GPU time
         // to account and the model did not respond — keep that as NETWORK_ERROR.
         const originalFetch = globalThis.fetch;

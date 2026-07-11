@@ -141,24 +141,6 @@ export class OllamaProvider {
     }
 }
 
-function successResult(
-    started: number,
-    firstTokenAt: number,
-    baseline: number | undefined,
-    httpStatus: number,
-): ProbeResult {
-    // rttMs is time-to-first-token, preserving the latency baseline semantics (monitor.ts uses
-    // historical total_duration_ms as baseline); it is NOT total generation time.
-    const rttMs = firstTokenAt - started;
-    const classification = isLatencyAnomalous(rttMs, baseline) ? 'HIGH_LATENCY' : 'SUCCESS';
-    return {
-        classification,
-        publicStatus: publicStatusFor(classification),
-        httpStatus,
-        rttMs,
-    };
-}
-
 async function firstChatToken(
     response: Response,
     started: number,
@@ -169,11 +151,6 @@ async function firstChatToken(
         decoder = new TextDecoder();
     let buffer = '';
     let receivedBytes = 0;
-    // Time-to-first-token, captured at the first chunk that proves inference started. The stream
-    // is then consumed to completion (no reader.cancel()) so the server finishes generation and
-    // Ollama Cloud bills the full, consistent GPU time — canceling mid-stream left partial GPU
-    // time that read as quota under-accounting and risked violating the Cloud terms of use.
-    let firstTokenAt: number | null = null;
     try {
         while (true) {
             const { done, value } = await reader.read();
@@ -197,35 +174,30 @@ async function firstChatToken(
                 }
                 if (chunk.error !== undefined) return protocolError(started, 'stream_error');
                 // Some thinking-capable models emit only a thinking fragment before the
-                // configured token limit. Either field proves that inference started.
-                if (firstTokenAt === null) {
-                    const hasContent =
-                        (typeof chunk.message?.content === 'string' &&
-                            chunk.message.content.trim().length > 0) ||
-                        (typeof chunk.message?.thinking === 'string' &&
-                            chunk.message.thinking.trim().length > 0);
-                    if (hasContent) firstTokenAt = performance.now();
+                // configured token limit. Either field proves that inference started. Cancel the
+                // reader at the first token so the probe measures time-to-first-token and releases
+                // the stream immediately instead of waiting for the full generation.
+                if (
+                    (typeof chunk.message?.content === 'string' &&
+                        chunk.message.content.trim().length > 0) ||
+                    (typeof chunk.message?.thinking === 'string' &&
+                        chunk.message.thinking.trim().length > 0)
+                ) {
+                    await reader.cancel();
+                    const rttMs = performance.now() - started;
+                    const classification = isLatencyAnomalous(rttMs, baseline)
+                        ? 'HIGH_LATENCY'
+                        : 'SUCCESS';
+                    return {
+                        classification,
+                        publicStatus: publicStatusFor(classification),
+                        httpStatus: response.status,
+                        rttMs,
+                    };
                 }
-                // The server signals generation is complete with done:true. Reading to here
-                // (instead of canceling at the first token) lets Ollama account the full GPU time.
-                if (chunk.done === true && firstTokenAt !== null)
-                    return successResult(started, firstTokenAt, baseline, response.status);
             }
-            if (done)
-                return firstTokenAt !== null
-                    ? successResult(started, firstTokenAt, baseline, response.status)
-                    : emptyResponse(started);
+            if (done) return emptyResponse(started);
         }
-    } catch (error) {
-        // If inference already started (a first token was received), the server generated it and
-        // the GPU time is accounted on Ollama's side — a read error later in the stream (connection
-        // drop on slow/large models that finishes after the first token) does not undo that. Classify
-        // it as SUCCESS rather than NETWORK_ERROR, since the model did respond. A probe timer abort
-        // (45s) or a run hard-stop still propagates so it classifies as TIMEOUT or abandons the run.
-        if (firstTokenAt !== null && !(error instanceof DOMException && error.name === 'AbortError')) {
-            return successResult(started, firstTokenAt, baseline, response.status);
-        }
-        throw error;
     } finally {
         reader.releaseLock();
     }
