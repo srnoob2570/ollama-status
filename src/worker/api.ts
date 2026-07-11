@@ -78,8 +78,15 @@ const rangeConfiguration = (
                 ? 7
                 : 30;
     const start = new Date(timestamp);
-    if (range === '1h') start.setTime(start.getTime() - 60 * 60_000);
-    else {
+    if (range === '1h') {
+        // Grid-align to the 5-minute slot containing `now` so bucket boundaries depend only
+        // on each check's timestamp, not on when the request happens. The window shifts
+        // discretely (only when `now` crosses a slot boundary) instead of sliding
+        // continuously, so a check never flits between buckets across refreshes — no
+        // transient holes that later "refill". The last bucket is the slot containing `now`.
+        const slotStartMs = Math.floor(timestamp.getTime() / bucketDurationMs) * bucketDurationMs;
+        start.setTime(slotStartMs - (bucketCount - 1) * bucketDurationMs);
+    } else {
         if (range === '24h') start.setUTCMinutes(0, 0, 0);
         else start.setUTCHours(0, 0, 0, 0);
         start.setTime(start.getTime() - (bucketCount - 1) * bucketDurationMs);
@@ -204,7 +211,9 @@ export function lastSuccessfulFinishedAt(
 ): string | null {
     return runs.reduce<string | null>(
         (latest, run) =>
-            run.outcome === 'OK' && run.finished_at && (!latest || run.finished_at > latest)
+            (run.outcome === 'OK' || run.outcome === 'PARTIAL') &&
+            run.finished_at &&
+            (!latest || run.finished_at > latest)
                 ? run.finished_at
                 : latest,
         null,
@@ -443,7 +452,7 @@ async function monitorRuns(env: Env) {
     FROM monitor_runs ORDER BY started_at DESC LIMIT 20`,
         ).all<MonitorRun>(),
         env.DB.prepare(
-            "SELECT outcome,finished_at FROM monitor_runs WHERE outcome='OK' AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1",
+            "SELECT outcome,finished_at FROM monitor_runs WHERE outcome IN ('OK','PARTIAL') AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1",
         ).all<Pick<MonitorRun, 'outcome' | 'finished_at'>>(),
     ]);
     const latest = result.results[0] ?? null;

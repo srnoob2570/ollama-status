@@ -1,7 +1,7 @@
-import { OllamaHttpError, OllamaProvider } from './ollama';
+import { OllamaHttpError, OllamaProvider, PROBE_TIMEOUT_MS } from './ollama';
 import { entitlementFromFreeProbe, shouldProbePaid } from './entitlement';
 import { maxResponseTokens } from './probe-config';
-import { eligibilityCutoff, nextCheckAt, trimmedMean } from './status';
+import { CRON_INTERVAL_MS, eligibilityCutoff, nextCheckAt, trimmedMean } from './status';
 import type { Classification, Env, Model, ProbeResult, Provider } from './types';
 import { id, now } from './types';
 
@@ -54,6 +54,21 @@ export function randomDelay(env: Env): number {
     const { min, max } = probeDelayMs(env);
     if (max === min) return min;
     return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+// Buffer beyond probe timeout + max delay so a last in-flight batch started just before the
+// deadline still finishes inside the cron interval (and the lock is released before the next
+// tick, preventing skipped ticks that would double the effective cadence to ~10 min).
+const RUN_DEADLINE_BUFFER_MS = 5_000;
+
+// Absolute wall-clock deadline by which the probe loop must stop starting new batches so the
+// run finishes within one cron interval. `startedMs` is the run's started_at epoch ms. The
+// margin absorbs a full in-flight batch (one probe up to PROBE_TIMEOUT_MS + the configured max
+// delay) plus a small buffer. If the margin alone exceeds the cron interval (e.g. a huge
+// configured delay), the deadline falls at/ before the start, marking the run infeasible.
+export function runDeadlineMs(startedMs: number, env: Env): number {
+    const safetyMarginMs = PROBE_TIMEOUT_MS + probeDelayMs(env).max + RUN_DEADLINE_BUFFER_MS;
+    return startedMs + CRON_INTERVAL_MS - safetyMarginMs;
 }
 
 function keyFor(env: Env, ref: Provider['secret_ref']) {
@@ -155,7 +170,12 @@ async function syncCatalog(env: Env, provider: Provider): Promise<number | null>
                 'SELECT id,last_show_at,digest,active FROM models WHERE provider_id=? AND remote_name=?',
             )
                 .bind('ollama-free', remote.name)
-                .first<{ id: string; last_show_at: string | null; digest: string | null; active: number }>();
+                .first<{
+                    id: string;
+                    last_show_at: string | null;
+                    digest: string | null;
+                    active: number;
+                }>();
             const modelId = existing?.id ?? `ollama:${remote.name}`;
             // Skip the upsert when nothing material changed: re-running it would only rewrite
             // updated_at and reactivate an already-active row with the same digest, burning one
@@ -569,7 +589,18 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
             .bind(catalogModelCount, due.results.length, runId)
             .run();
         const concurrency = probeConcurrency(env);
+        // Time-box the run so it finishes within one cron interval: stop starting new batches
+        // once the deadline is reached, leaving the lock free for the next tick. Models not
+        // probed stay due and are picked up first next tick (the due query orders by
+        // next_check_at). Without this, a slow/long run holds the lock past the next tick and
+        // that tick is silently skipped, doubling the effective cadence to ~10 min.
+        const deadlineMs = runDeadlineMs(Date.parse(started), env);
+        let budgetExceeded = false;
         for (let i = 0; i < due.results.length; i += concurrency) {
+            if (Date.now() >= deadlineMs) {
+                budgetExceeded = true;
+                break;
+            }
             if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
             await Promise.all(
                 due.results
@@ -579,10 +610,22 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
                     ),
             );
         }
+        if (budgetExceeded) {
+            // Surface the infeasibility explicitly instead of silently drifting cadence: the
+            // run completed without error but couldn't probe every due model within the budget.
+            console.warn(
+                `monitor run ${runId} budget_exceeded: ${due.results.length} due, deadline reached`,
+            );
+        }
         await env.DB.prepare(
-            "UPDATE monitor_runs SET finished_at=?,outcome='OK',phase='COMPLETED',current_model=NULL WHERE id=?",
+            "UPDATE monitor_runs SET finished_at=?,outcome=?,phase='COMPLETED',detail=?,current_model=NULL WHERE id=?",
         )
-            .bind(now(), runId)
+            .bind(
+                now(),
+                budgetExceeded ? 'PARTIAL' : 'OK',
+                budgetExceeded ? `budget_exceeded:${due.results.length}` : null,
+                runId,
+            )
             .run();
     } catch (error) {
         const detail =

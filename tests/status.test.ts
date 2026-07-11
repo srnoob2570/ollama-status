@@ -12,7 +12,7 @@ import {
 } from '../src/worker/status';
 import { entitlementFromFreeProbe, shouldProbePaid } from '../src/worker/entitlement';
 import { maxResponseTokens } from '../src/worker/probe-config';
-import { OllamaProvider } from '../src/worker/ollama';
+import { OllamaProvider, PROBE_TIMEOUT_MS } from '../src/worker/ollama';
 import {
     effectiveProvider,
     historyBuckets,
@@ -27,42 +27,45 @@ import {
     probeConcurrency,
     probeDelayMs,
     renewLock,
+    runDeadlineMs,
 } from '../src/worker/monitor';
 import { now } from '../src/worker/types';
 import type { Env, Model, ProbeResult, Provider } from '../src/worker/types';
 import { nextUpdateLabel, roundUpToMonitorInterval } from '../src/web/next-update';
 
 describe('Ollama status classification', () => {
-    it('uses a moving one-hour window with fixed 5-minute buckets for every tier', () => {
+    it('uses a grid-aligned one-hour window with fixed 5-minute buckets for every tier', () => {
+        // reference 13:34 sits in the 5-minute slot [13:30,13:35); the window is the 12 slots
+        // ending at that slot, i.e. [12:35, 13:35) with bucket starts 12:35 .. 13:30.
         const reference = new Date('2026-07-10T13:34:00.000Z');
         const free = historyBuckets(
             [
                 {
                     provider_id: 'ollama-free',
                     model_id: 'm1',
-                    checked_at: '2026-07-10T12:33:59.999Z',
-                    public_status: 'OUTAGE',
-                    classification: 'TIMEOUT',
-                    total_duration_ms: null,
-                    rtt_ms: 1,
+                    checked_at: '2026-07-10T12:40:05.000Z',
+                    public_status: 'OPERATIONAL',
+                    classification: 'SUCCESS',
+                    total_duration_ms: 20,
+                    rtt_ms: 25,
                 },
                 {
                     provider_id: 'ollama-free',
                     model_id: 'm1',
-                    checked_at: '2026-07-10T12:34:00.000Z',
+                    checked_at: '2026-07-10T13:30:05.000Z',
                     public_status: 'OPERATIONAL',
                     classification: 'SUCCESS',
                     total_duration_ms: null,
-                    rtt_ms: 2,
+                    rtt_ms: 30,
                 },
                 {
                     provider_id: 'ollama-free',
                     model_id: 'm1',
-                    checked_at: '2026-07-10T13:34:00.000Z',
+                    checked_at: '2026-07-10T13:30:50.000Z',
                     public_status: 'OUTAGE',
                     classification: 'TIMEOUT',
                     total_duration_ms: null,
-                    rtt_ms: 3,
+                    rtt_ms: 40,
                 },
             ],
             null,
@@ -73,11 +76,88 @@ describe('Ollama status classification', () => {
 
         expect(free).toHaveLength(12);
         expect(paid).toHaveLength(12);
-        expect(free[0]).toMatchObject({ startAt: '2026-07-10T12:34:00.000Z', checks: 1 });
-        expect(free.at(-1)?.startAt).toBe('2026-07-10T13:29:00.000Z');
-        expect(paid[0].startAt).toBe('2026-07-10T12:34:00.000Z');
-        expect(paid.at(-1)?.startAt).toBe('2026-07-10T13:29:00.000Z');
+        // Grid-aligned boundaries: first bucket [12:35,12:40), last (current slot) [13:30,13:35).
+        expect(free[0]).toMatchObject({ startAt: '2026-07-10T12:35:00.000Z', checks: 0 });
+        expect(free.at(-1)?.startAt).toBe('2026-07-10T13:30:00.000Z');
+        expect(paid[0].startAt).toBe('2026-07-10T12:35:00.000Z');
+        expect(paid.at(-1)?.startAt).toBe('2026-07-10T13:30:00.000Z');
+        // A check at 12:40:05 lands in the [12:40,12:45) bucket (one per slot, no redistribution).
+        expect(free[1]).toMatchObject({
+            startAt: '2026-07-10T12:40:00.000Z',
+            checks: 1,
+            status: 'OPERATIONAL',
+        });
+        // Two checks in the current slot [13:30,13:35) collapse to worst status (OUTAGE).
+        expect(free.at(-1)).toMatchObject({
+            startAt: '2026-07-10T13:30:00.000Z',
+            checks: 2,
+            status: 'OUTAGE',
+        });
         expect(historyBuckets([], 'invalid', reference)).toHaveLength(12);
+    });
+
+    it('keeps each check in a stable, grid-aligned bucket across refreshes (no transient holes)', () => {
+        // 12 checks at a 5-minute cadence with small jitter (one per slot at :05), reflecting
+        // staggered execution. Two refreshes 90s apart (same slot) must assign every check to
+        // the SAME bucket — the old sliding `start = now - 60min` calculation would shift
+        // boundaries by 90s between these calls and redistribute checks, creating a hole that
+        // later refills. Grid alignment pins each check to its clock slot regardless of `now`.
+        const slotChecks = Array.from({ length: 12 }, (_, k) => {
+            const start = new Date('2026-07-10T12:35:00.000Z').getTime() + k * 5 * 60_000;
+            return {
+                provider_id: 'ollama-free',
+                model_id: 'm1',
+                checked_at: new Date(start + 5_000).toISOString(),
+                public_status: 'OPERATIONAL',
+                classification: 'SUCCESS',
+                total_duration_ms: 15,
+                rtt_ms: 20,
+            };
+        });
+        const now1 = new Date('2026-07-10T13:32:00.000Z');
+        const now2 = new Date('2026-07-10T13:33:30.000Z'); // 90s later, still in slot [13:30,13:35)
+
+        const atNow1 = historyBuckets(slotChecks, '1h', now1);
+        const atNow2 = historyBuckets(slotChecks, '1h', now2);
+
+        // Identical boundaries and counts across refreshes — no redistribution, no flit.
+        expect(atNow1.map((b) => b.startAt)).toEqual(atNow2.map((b) => b.startAt));
+        expect(atNow1.map((b) => b.checks)).toEqual(atNow2.map((b) => b.checks));
+        // Every bucket holds exactly one check — no hole between filled buckets.
+        expect(atNow1.every((b) => b.checks === 1)).toBe(true);
+        // A fixed check stays in its clock slot regardless of `now`.
+        const slotOfCheck = (buckets: typeof atNow1) =>
+            buckets.find((b) => b.startAt === '2026-07-10T12:40:00.000Z')?.checks;
+        expect(slotOfCheck(atNow1)).toBe(1);
+        expect(slotOfCheck(atNow2)).toBe(1);
+    });
+
+    it('scrolls the 1h window by one slot when now crosses a 5-minute boundary', () => {
+        // A check at 13:30:05 belongs to slot [13:30,13:35). While now is in that slot it is the
+        // last bucket; after now crosses 13:35 it becomes the second-to-last — same clock slot,
+        // only the window position changed (discrete scroll, not a redistribution).
+        const check = {
+            provider_id: 'ollama-free',
+            model_id: 'm1',
+            checked_at: '2026-07-10T13:30:05.000Z',
+            public_status: 'OPERATIONAL',
+            classification: 'SUCCESS',
+            total_duration_ms: 10,
+            rtt_ms: 12,
+        };
+        const before = historyBuckets([check], '1h', new Date('2026-07-10T13:34:59.999Z'));
+        const after = historyBuckets([check], '1h', new Date('2026-07-10T13:35:00.000Z'));
+        expect(before.at(-1)?.startAt).toBe('2026-07-10T13:30:00.000Z');
+        expect(before.at(-1)?.checks).toBe(1);
+        // After crossing the boundary the check is still in slot [13:30,13:35) (now second-to-last).
+        expect(after.at(-2)?.startAt).toBe('2026-07-10T13:30:00.000Z');
+        expect(after.at(-2)?.checks).toBe(1);
+        // The new current slot [13:35,13:40) is empty → pending.
+        expect(after.at(-1)).toMatchObject({
+            startAt: '2026-07-10T13:35:00.000Z',
+            checks: 0,
+            pending: true,
+        });
     });
 
     it('marks the empty bucket containing now as pending, older empty buckets as no data', () => {
@@ -91,13 +171,13 @@ describe('Ollama status classification', () => {
         for (let i = 0; i < buckets.length - 1; i++) {
             expect(buckets[i]).toMatchObject({ checks: 0, pending: false });
         }
-        // A check landing in the last bucket clears its pending flag (run reached it).
+        // A check landing in the last bucket (current slot [13:30,13:35)) clears its pending flag.
         const withLastCheck = historyBuckets(
             [
                 {
                     provider_id: 'ollama-free',
                     model_id: 'm1',
-                    checked_at: '2026-07-10T13:29:30.000Z',
+                    checked_at: '2026-07-10T13:30:30.000Z',
                     public_status: 'OPERATIONAL',
                     classification: 'SUCCESS',
                     total_duration_ms: 20,
@@ -270,6 +350,14 @@ describe('Ollama status classification', () => {
                 { outcome: 'ERROR', finished_at: '2026-07-10T13:00:00.000Z' },
             ]),
         ).toBeNull();
+        // A PARTIAL run (budget exceeded, run completed without error) still counts as
+        // successful: the monitor is alive, just couldn't probe every due model in budget.
+        expect(
+            lastSuccessfulFinishedAt([
+                { outcome: 'OK', finished_at: '2026-07-10T12:30:00.000Z' },
+                { outcome: 'PARTIAL', finished_at: '2026-07-10T13:00:00.000Z' },
+            ]),
+        ).toBe('2026-07-10T13:00:00.000Z');
     });
 
     it('finds the earliest scheduled active check for each monitored tier', () => {
@@ -821,5 +909,48 @@ describe('D1 write avoidance', () => {
         // A 403 flips tier to PAID (one write) but must never insert an incident.
         expect(runs.some((sql) => /INSERT INTO incidents/.test(sql))).toBe(false);
         expect(runs.some((sql) => /UPDATE models SET tier/.test(sql))).toBe(true);
+    });
+});
+
+describe('monitor run time-box (cadence preservation)', () => {
+    const env = (overrides: Partial<Env> = {}) =>
+        ({
+            PROBE_CONCURRENCY: '1',
+            PROBE_DELAY_MIN_MS: '0',
+            PROBE_DELAY_MAX_MS: '5000',
+            ...overrides,
+        }) as unknown as Env;
+
+    it('computes a deadline that leaves the lock free before the next cron tick', () => {
+        const started = new Date('2026-07-10T13:00:00.000Z').getTime();
+        const deadline = runDeadlineMs(started, env());
+        // deadline = started + CRON_INTERVAL_MS - (PROBE_TIMEOUT_MS + maxDelay + 5s buffer)
+        const expected =
+            started + CRON_INTERVAL_MS - (PROBE_TIMEOUT_MS + probeDelayMs(env()).max + 5_000);
+        expect(deadline).toBe(expected);
+        // The deadline must sit strictly inside the 5-minute cron interval so a last in-flight
+        // batch (up to PROBE_TIMEOUT_MS + maxDelay) can still finish before the next tick.
+        expect(deadline).toBeGreaterThan(started);
+        expect(deadline + PROBE_TIMEOUT_MS + probeDelayMs(env()).max).toBeLessThan(
+            started + CRON_INTERVAL_MS,
+        );
+    });
+
+    it('leaves a feasible budget for the default free-tier configuration', () => {
+        const started = new Date('2026-07-10T13:00:00.000Z').getTime();
+        const budget = runDeadlineMs(started, env()) - started;
+        // 34 models at concurrency 1 with ~2.5s avg delay + ~1.5s probe ≈ 136s must fit comfortably.
+        const nominalRunMs = 34 * ((0 + 5_000) / 2 + 1_500);
+        expect(nominalRunMs).toBeLessThan(budget);
+        expect(budget).toBeGreaterThan(3 * 60_000); // > 3 min of usable budget
+    });
+
+    it('flags infeasibility when a single probe+delay exceeds the cron interval', () => {
+        // A huge configured delay makes one probe+delay longer than the whole tick: the deadline
+        // falls at or before the start, so the run can't process any model and is marked PARTIAL
+        // (explicit infeasibility detection instead of silently drifting cadence to ~10 min).
+        const started = new Date('2026-07-10T13:00:00.000Z').getTime();
+        const deadline = runDeadlineMs(started, env({ PROBE_DELAY_MAX_MS: '600000' }));
+        expect(deadline).toBeLessThanOrEqual(started);
     });
 });

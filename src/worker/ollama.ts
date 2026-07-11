@@ -1,7 +1,9 @@
 import { classifyHttp, isLatencyAnomalous, publicStatusFor } from './status';
 import type { ProbeResult, Provider } from './types';
 
-const timeoutMs = 45_000;
+// Probe fetch abort threshold. Exported so runMonitor's time-box margin can absorb a full
+// in-flight probe when computing the per-tick deadline (see runDeadlineMs in monitor.ts).
+export const PROBE_TIMEOUT_MS = 45_000;
 const maxResponseBytes = 64 * 1024;
 const probeMessage = 'Reply with OK.';
 
@@ -70,7 +72,7 @@ export class OllamaProvider {
     async probe(model: string, baseline?: number): Promise<ProbeResult> {
         const started = performance.now();
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
         try {
             const response = await fetch(this.url('/chat'), {
                 method: 'POST',
