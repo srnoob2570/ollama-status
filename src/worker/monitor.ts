@@ -17,7 +17,7 @@ const MAX_MODELS_PER_RUN = 40;
 // Probes run in parallel batches so one slow or timing-out model can't stagger the rest of
 // the run across minutes. Kept low to avoid bursting Ollama into per-model 429s (which a
 // larger batch triggered on the heaviest models) while still finishing runs in seconds.
-const PROBE_CONCURRENCY = 3;
+const PROBE_CONCURRENCY = 1;
 
 function keyFor(env: Env, ref: Provider['secret_ref']) {
     return env[ref] ?? '';
