@@ -216,6 +216,16 @@ async function firstChatToken(
                     ? successResult(started, firstTokenAt, baseline, response.status)
                     : emptyResponse(started);
         }
+    } catch (error) {
+        // If inference already started (a first token was received), the server generated it and
+        // the GPU time is accounted on Ollama's side — a read error later in the stream (connection
+        // drop on slow/large models that finishes after the first token) does not undo that. Classify
+        // it as SUCCESS rather than NETWORK_ERROR, since the model did respond. A probe timer abort
+        // (45s) or a run hard-stop still propagates so it classifies as TIMEOUT or abandons the run.
+        if (firstTokenAt !== null && !(error instanceof DOMException && error.name === 'AbortError')) {
+            return successResult(started, firstTokenAt, baseline, response.status);
+        }
+        throw error;
     } finally {
         reader.releaseLock();
     }

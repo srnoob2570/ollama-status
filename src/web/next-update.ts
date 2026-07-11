@@ -13,13 +13,17 @@ export function nextUpdateLabel(
     if (updating) return 'Updating…';
     if (!nextCheckAt) return 'No checks scheduled';
 
-    const scheduledAt = roundUpToMonitorInterval(nextCheckAt);
-    if (scheduledAt === null) return 'No checks scheduled';
+    // The monitor runs on cron ticks (every MONITOR_INTERVAL_MS). The backend admits any model
+    // whose next_check_at falls within the schedule grace (~ one cron interval), so a model just
+    // checked is re-checked at the NEXT cron tick — not at next_check_at rounded up to the
+    // following multiple, which used to add up to a whole extra interval to the countdown. Only
+    // long backoffs (AUTHENTICATION 60m, a Retry-After) exceed the grace and are honored literally.
     const nextCronBoundary = Math.ceil(currentTime / MONITOR_INTERVAL_MS) * MONITOR_INTERVAL_MS;
-    const remainingSeconds = Math.max(
-        0,
-        Math.ceil((Math.max(scheduledAt, nextCronBoundary) - currentTime) / 1_000),
-    );
+    const scheduledAtMs = Date.parse(nextCheckAt);
+    const dueWithinGrace =
+        Number.isFinite(scheduledAtMs) && scheduledAtMs <= nextCronBoundary + MONITOR_INTERVAL_MS;
+    const target = dueWithinGrace ? nextCronBoundary : Math.max(scheduledAtMs, nextCronBoundary);
+    const remainingSeconds = Math.max(0, Math.ceil((target - currentTime) / 1_000));
     if (remainingSeconds === 0) return 'Starting now';
 
     const minutes = Math.floor(remainingSeconds / 60);

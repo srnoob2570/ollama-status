@@ -402,17 +402,23 @@ describe('Ollama status classification', () => {
         });
     });
 
-    it('rounds checks to the next fifteen-minute scheduler boundary and pauses countdowns while updating', () => {
+    it('counts down to the next cron tick so the countdown stays within one 15-minute interval', () => {
+        // A model checked at 12:01:01 (jitter) is re-checked at the next cron tick 12:15 — not at
+        // 12:01:01 + 15m rounded up to 12:30. The countdown must stay within ~15 min, not climb
+        // toward ~30 as the old roundUp-to-next-multiple did.
         expect(roundUpToMonitorInterval('2026-07-10T12:01:01.000Z')).toBe(
             Date.parse('2026-07-10T12:15:00.000Z'),
         );
-        expect(
-            nextUpdateLabel(
-                '2026-07-10T12:01:01.000Z',
-                false,
-                Date.parse('2026-07-10T12:00:00.000Z'),
-            ),
-        ).toBe('in 15m 0s');
+        const label = nextUpdateLabel(
+            '2026-07-10T12:01:01.000Z',
+            false,
+            Date.parse('2026-07-10T12:02:00.000Z'),
+        );
+        const match = label.match(/^in (\d+)m (\d+)s$/);
+        expect(match).not.toBeNull();
+        const totalSeconds = Number(match![1]) * 60 + Number(match![2]);
+        expect(totalSeconds).toBeGreaterThan(0);
+        expect(totalSeconds).toBeLessThanOrEqual(15 * 60);
         expect(
             nextUpdateLabel(
                 '2026-07-10T12:01:01.000Z',
@@ -423,6 +429,17 @@ describe('Ollama status classification', () => {
         expect(nextUpdateLabel(null, false, Date.parse('2026-07-10T12:00:00.000Z'))).toBe(
             'No checks scheduled',
         );
+    });
+
+    it('honors a long backoff beyond the next cron tick instead of collapsing it to the tick', () => {
+        // AUTHENTICATION backs off 60 min; the countdown must reflect that, not the next 15-min tick.
+        const now = Date.parse('2026-07-10T12:02:00.000Z');
+        const nextCheckAt = new Date(now + 60 * 60_000).toISOString();
+        const label = nextUpdateLabel(nextCheckAt, false, now);
+        const match = label.match(/^in (\d+)m (\d+)s$/);
+        expect(match).not.toBeNull();
+        const totalSeconds = Number(match![1]) * 60 + Number(match![2]);
+        expect(totalSeconds).toBeGreaterThan(15 * 60);
     });
 
     it('keeps account failures distinct from model failures', () => {
@@ -730,6 +747,68 @@ describe('Ollama status classification', () => {
                 'test-key',
             );
             expect((await provider.probe('cloud')).classification).toBe('PROTOCOL_ERROR');
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('classifies a read error after the first token as success since inference already started', async () => {
+        // Slow/large models can drop the connection mid-stream after emitting the first token.
+        // Inference already started and the GPU time is accounted server-side, so the probe must
+        // report SUCCESS (the model did respond), not NETWORK_ERROR. Only an abort (probe timer
+        // or run hard-stop) still propagates as TIMEOUT/abandoned.
+        const originalFetch = globalThis.fetch;
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(
+                    new TextEncoder().encode(
+                        `${JSON.stringify({ message: { content: 'OK' }, done: false })}\n`,
+                    ),
+                );
+                // Error on a later tick so the first read delivers the token before the drop.
+                setTimeout(() => controller.error(new TypeError('connection reset')), 0);
+            },
+        });
+        globalThis.fetch = async () => new Response(stream, { status: 200 });
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            const result = await provider.probe('cloud');
+            expect(result.classification).toBe('SUCCESS');
+            expect(result.publicStatus).toBe('OPERATIONAL');
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('still classifies a read error before the first token as a network error', async () => {
+        // If the connection drops before any token proves inference started, there is no GPU time
+        // to account and the model did not respond — keep that as NETWORK_ERROR.
+        const originalFetch = globalThis.fetch;
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.error(new TypeError('connection reset'));
+            },
+        });
+        globalThis.fetch = async () => new Response(stream, { status: 200 });
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            expect((await provider.probe('cloud')).classification).toBe('NETWORK_ERROR');
         } finally {
             globalThis.fetch = originalFetch;
         }
