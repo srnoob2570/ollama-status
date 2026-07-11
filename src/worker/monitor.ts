@@ -1,7 +1,13 @@
 import { OllamaHttpError, OllamaProvider, PROBE_TIMEOUT_MS } from './ollama';
 import { entitlementFromFreeProbe, shouldProbePaid } from './entitlement';
 import { maxResponseTokens } from './probe-config';
-import { CRON_INTERVAL_MS, eligibilityCutoff, nextCheckAt, trimmedMean } from './status';
+import {
+    CRON_INTERVAL_MS,
+    eligibilityCutoff,
+    nextCheckAt,
+    nominalCheckIntervalMinutes,
+    trimmedMean,
+} from './status';
 import type { Classification, Env, Model, ProbeResult, Provider } from './types';
 import { id, now } from './types';
 
@@ -274,13 +280,14 @@ async function storeProbe(
     provider: Provider,
     model: Model,
     result: ProbeResult,
+    executionId: string,
+    scheduledAtMs: number,
 ): Promise<void> {
     const timestamp = now();
-    const tier = nextCheckTier(provider, model, result);
-    await env.DB.batch([
-        env.DB.prepare(
-            'INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,load_duration_ms,error_code) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-        ).bind(
+    await env.DB.prepare(
+        'INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,load_duration_ms,error_code,execution_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+    )
+        .bind(
             id('chk'),
             provider.id,
             model.id,
@@ -292,20 +299,10 @@ async function storeProbe(
             result.rttMs,
             result.loadDurationMs ?? null,
             result.errorCode ?? null,
-        ),
-        env.DB.prepare('UPDATE models SET next_check_at=?,updated_at=? WHERE id=?').bind(
-            nextCheckAt(
-                result.publicStatus,
-                result.publicStatus === 'OUTAGE',
-                result.retryAfterSeconds,
-                tier,
-                env,
-            ),
-            timestamp,
-            model.id,
-        ),
-    ]);
-    await materializeStatus(env, provider, model, result, timestamp);
+            executionId,
+        )
+        .run();
+    await materializeStatus(env, provider, model, result, timestamp, scheduledAtMs);
 }
 
 export async function materializeStatus(
@@ -314,6 +311,7 @@ export async function materializeStatus(
     model: Model,
     result: ProbeResult,
     timestamp: string,
+    scheduledAtMs: number = Date.parse(timestamp),
 ): Promise<void> {
     const prior = await env.DB.prepare(
         'SELECT * FROM provider_model_status WHERE provider_id=? AND model_id=?',
@@ -372,6 +370,8 @@ export async function materializeStatus(
                 result.retryAfterSeconds,
                 nextCheckTier(provider, model, result),
                 env,
+                scheduledAtMs,
+                Date.parse(timestamp),
             ),
             timestamp,
         )
@@ -497,6 +497,8 @@ async function probeModel(
     env: Env,
     provider: Provider,
     model: Model,
+    executionId: string,
+    scheduledAtMs: number,
     signal?: AbortSignal,
 ): Promise<ProbeResult> {
     // Configurable delay spreads probes over time so free API keys (1 concurrent model)
@@ -521,35 +523,12 @@ async function probeModel(
         )
             .bind(model.id)
             .run();
-    await storeProbe(env, provider, model, result);
+    await storeProbe(env, provider, model, result, executionId, scheduledAtMs);
     return result;
 }
 
 function failedProbe(result: ProbeResult): number {
     return isFailure(result.classification) ? 1 : 0;
-}
-
-async function recordModelProgress(
-    env: Env,
-    runId: string,
-    model: Model,
-    progress: { free: number; paid: number; paidSkipped: number; failed: number },
-): Promise<void> {
-    await env.DB.prepare(
-        `UPDATE monitor_runs SET completed_model_count=completed_model_count+1,
-    free_probe_count=free_probe_count+?, paid_probe_count=paid_probe_count+?,
-    paid_skipped_count=paid_skipped_count+?, failed_probe_count=failed_probe_count+?, current_model=?
-    WHERE id=?`,
-    )
-        .bind(
-            progress.free,
-            progress.paid,
-            progress.paidSkipped,
-            progress.failed,
-            model.remote_name,
-            runId,
-        )
-        .run();
 }
 
 async function probeByEntitlement(
@@ -558,35 +537,107 @@ async function probeByEntitlement(
     paidProvider: Provider | undefined,
     model: Model,
     runId: string,
+    executionId: string,
+    scheduledAtMs: number,
     signal?: AbortSignal,
 ): Promise<void> {
-    // Per-model live progress is recorded once at the end by recordModelProgress, which already
-    // sets current_model. The run-level phase is already 'CHECKING' from runMonitor, so a second
-    // per-model write here only refreshed current_model a few seconds earlier at the cost of one
-    // write per model per cycle.
-    const freeResult = await probeModel(env, freeProvider, model, signal);
-    const entitlement = entitlementFromFreeProbe(freeResult.classification);
-    const paidAvailable = Boolean(paidProvider && hasKey(env, paidProvider));
-    let paid = 0,
-        paidSkipped = 0,
-        failed = failedProbe(freeResult);
+    // Claim the execution before any provider I/O. Every terminal write below is conditional on
+    // this RUNNING state so orphan recovery cannot be overwritten by a late probe.
+    const running = await env.DB.prepare(
+        "UPDATE model_check_executions SET state='RUNNING',started_at=?,detail=NULL WHERE id=? AND state='SCHEDULED'",
+    )
+        .bind(now(), executionId)
+        .run();
+    if (running.meta.changes !== 1) throw new Error('execution_not_scheduled');
+    try {
+        const freeResult = await probeModel(
+            env,
+            freeProvider,
+            model,
+            executionId,
+            scheduledAtMs,
+            signal,
+        );
+        const entitlement = entitlementFromFreeProbe(freeResult.classification);
+        const paidAvailable = Boolean(paidProvider && hasKey(env, paidProvider));
+        let paid = 0,
+            paidSkipped = 0,
+            failed = failedProbe(freeResult),
+            effectiveProvider = freeProvider,
+            effectiveResult = freeResult;
 
-    if (shouldProbePaid(freeResult.classification, paidAvailable) && paidProvider) {
-        const paidResult = await probeModel(env, paidProvider, model, signal);
-        paid = 1;
-        failed += failedProbe(paidResult);
-    } else if (entitlement === 'PAID') {
-        paidSkipped = 1;
+        if (shouldProbePaid(freeResult.classification, paidAvailable) && paidProvider) {
+            const paidResult = await probeModel(
+                env,
+                paidProvider,
+                model,
+                executionId,
+                scheduledAtMs,
+                signal,
+            );
+            paid = 1;
+            failed += failedProbe(paidResult);
+            effectiveProvider = paidProvider;
+            effectiveResult = paidResult;
+        } else if (entitlement === 'PAID') {
+            paidSkipped = 1;
+        }
+
+        const completedAt = now();
+        const terminal = await env.DB.batch([
+            env.DB.prepare(
+                `UPDATE models SET next_check_at=?,updated_at=? WHERE id=?
+                 AND EXISTS (SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING')`,
+            ).bind(
+                nextCheckAt(
+                    effectiveResult.publicStatus,
+                    effectiveResult.publicStatus === 'OUTAGE',
+                    effectiveResult.retryAfterSeconds,
+                    nextCheckTier(effectiveProvider, model, effectiveResult),
+                    env,
+                    scheduledAtMs,
+                    Date.parse(completedAt),
+                ),
+                completedAt,
+                model.id,
+                executionId,
+            ),
+            env.DB.prepare(
+                `UPDATE monitor_runs SET completed_model_count=completed_model_count+1,
+                 free_probe_count=free_probe_count+1, paid_probe_count=paid_probe_count+?,
+                 paid_skipped_count=paid_skipped_count+?, failed_probe_count=failed_probe_count+?, current_model=?
+                 WHERE id=? AND EXISTS (
+                     SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING'
+                 )`,
+            ).bind(paid, paidSkipped, failed, model.remote_name, runId, executionId),
+            env.DB.prepare(
+                "UPDATE model_check_executions SET state='COMPLETED',completed_at=?,detail=NULL WHERE id=? AND state='RUNNING'",
+            ).bind(completedAt, executionId),
+        ]);
+        if (terminal[2].meta.changes !== 1) throw new Error('execution_transition_conflict');
+    } catch (error) {
+        const state = signal?.aborted ? 'ABANDONED' : 'FAILED';
+        const detail = error instanceof Error ? error.message.slice(0, 200) : 'probe_failed';
+        await env.DB.prepare(
+            "UPDATE model_check_executions SET state=?,completed_at=?,detail=? WHERE id=? AND state='RUNNING'",
+        )
+            .bind(state, now(), detail, executionId)
+            .run();
+        throw error;
     }
-    await recordModelProgress(env, runId, model, { free: 1, paid, paidSkipped, failed });
 }
 
-export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void> {
+export async function runMonitor(
+    env: Env,
+    ctx: ExecutionContext,
+    scheduledTimeMs: number = Date.now(),
+): Promise<void> {
     const owner = crypto.randomUUID();
     if (!(await acquireLock(env, 'monitor', owner))) return;
     const runId = id('run'),
         started = now(),
-        startedMs = Date.now();
+        startedMs = Date.now(),
+        scheduledAt = new Date(scheduledTimeMs).toISOString();
     let runCreated = false;
     // Hard stop: a run that overstays RUN_HARD_STOP_MS is forcibly aborted so a stalled fetch (probe
     // stream, /tags, /show, or the GitHub confirmation dispatch) can't hold the run and the lock
@@ -597,14 +648,21 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
     const hardStop = setTimeout(() => runController.abort(), RUN_HARD_STOP_MS);
     try {
         // A lock owner must always have a visible run, including initialization failures.
-        await env.DB.prepare(
-            "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
+        await env.DB.batch([
+            env.DB.prepare(
+                `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail='interrupted'
+                 WHERE state IN ('SCHEDULED','RUNNING') AND run_id IN (SELECT id FROM monitor_runs WHERE finished_at IS NULL)`,
+            ).bind(started),
+            env.DB.prepare(
+                "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
+            ).bind(started),
+        ]);
+        const insertedRun = await env.DB.prepare(
+            "INSERT OR IGNORE INTO monitor_runs(id,started_at,scheduled_at,phase) VALUES (?,?,?,'CATALOG')",
         )
-            .bind(started)
+            .bind(runId, started, scheduledAt)
             .run();
-        await env.DB.prepare("INSERT INTO monitor_runs(id,started_at,phase) VALUES (?,?,'CATALOG')")
-            .bind(runId, started)
-            .run();
+        if (insertedRun.meta.changes !== 1) return;
         runCreated = true;
         await ensureProviders(env);
         const activeProviders = await providers(env);
@@ -616,8 +674,29 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         const due = await env.DB.prepare(
             `SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT ${MAX_MODELS_PER_RUN}`,
         )
-            .bind(eligibilityCutoff(Date.now()))
+            .bind(eligibilityCutoff(scheduledTimeMs))
             .all<Model>();
+        const executions = due.results.map((model) => ({
+            id: id('exec'),
+            model,
+            intervalMinutes: nominalCheckIntervalMinutes(model.tier ?? 'UNKNOWN', env),
+        }));
+        if (executions.length)
+            await env.DB.batch(
+                executions.map((execution) =>
+                    env.DB.prepare(
+                        `INSERT INTO model_check_executions(id,run_id,model_id,tier,interval_minutes,scheduled_at,state)
+                         VALUES (?,?,?,?,?,?,'SCHEDULED')`,
+                    ).bind(
+                        execution.id,
+                        runId,
+                        execution.model.id,
+                        execution.model.tier ?? 'UNKNOWN',
+                        execution.intervalMinutes,
+                        scheduledAt,
+                    ),
+                ),
+            );
         await env.DB.prepare(
             "UPDATE monitor_runs SET phase='CHECKING',catalog_model_count=?,scheduled_model_count=? WHERE id=?",
         )
@@ -630,8 +709,11 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         // next_check_at). Without this, a slow/long run holds the lock past the next tick and
         // that tick is silently skipped, doubling the effective cadence to ~10 min.
         const deadlineMs = runDeadlineMs(startedMs, env);
-        let budgetExceeded = false;
-        for (let i = 0; i < due.results.length; i += concurrency) {
+        let budgetExceeded = false,
+            rejectedExecutions = 0;
+        for (let i = 0; i < executions.length; i += concurrency) {
+            if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
+                throw new Error('run_hard_stop');
             if (Date.now() >= deadlineMs) {
                 budgetExceeded = true;
                 break;
@@ -640,26 +722,30 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
             // (a D1 write), stop starting new batches once the run has overstayed its budget. The
             // AbortController cancels in-flight fetches; this guard prevents the loop from
             // renewing the lock past the hard stop once such an await eventually resolves.
-            if (Date.now() >= startedMs + RUN_HARD_STOP_MS) break;
             if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
             // allSettled so a single probe/storeProbe failure (e.g. a transient D1 error) aborts
             // only that model, not the whole run. The hard stop is enforced after the batch.
             const results = await Promise.allSettled(
-                due.results
+                executions
                     .slice(i, i + concurrency)
-                    .map((model) =>
+                    .map((execution) =>
                         probeByEntitlement(
                             env,
                             freeProvider,
                             paidProvider,
-                            model,
+                            execution.model,
                             runId,
+                            execution.id,
+                            scheduledTimeMs,
                             runController.signal,
                         ),
                     ),
             );
             for (const r of results)
-                if (r.status === 'rejected') console.warn(`monitor probe rejected: ${r.reason}`);
+                if (r.status === 'rejected') {
+                    rejectedExecutions += 1;
+                    console.warn(`monitor probe rejected: ${r.reason}`);
+                }
             if (runController.signal.aborted) throw new Error('run_hard_stop');
         }
         if (budgetExceeded) {
@@ -668,16 +754,24 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
             console.warn(
                 `monitor run ${runId} budget_exceeded: ${due.results.length} due, deadline reached`,
             );
+            await env.DB.prepare(
+                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+                 WHERE run_id=? AND state='SCHEDULED'`,
+            )
+                .bind(now(), runId)
+                .run();
         }
+        const partial = budgetExceeded || rejectedExecutions > 0;
+        const detail = [
+            budgetExceeded ? `budget_exceeded:${due.results.length}` : null,
+            rejectedExecutions ? `execution_failures:${rejectedExecutions}` : null,
+        ]
+            .filter((value): value is string => value !== null)
+            .join(';');
         await env.DB.prepare(
             "UPDATE monitor_runs SET finished_at=?,outcome=?,phase='COMPLETED',detail=?,current_model=NULL WHERE id=?",
         )
-            .bind(
-                now(),
-                budgetExceeded ? 'PARTIAL' : 'OK',
-                budgetExceeded ? `budget_exceeded:${due.results.length}` : null,
-                runId,
-            )
+            .bind(now(), partial ? 'PARTIAL' : 'OK', detail || null, runId)
             .run();
     } catch (error) {
         // A hard stop means the run overstayed its budget and was aborted mid-flight; close it as
@@ -692,11 +786,15 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
               ? 'catalog_unavailable'
               : 'monitor_failed';
         if (runCreated)
-            await env.DB.prepare(
-                `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
-            )
-                .bind(now(), detail, runId)
-                .run();
+            await env.DB.batch([
+                env.DB.prepare(
+                    `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail=?
+                     WHERE run_id=? AND state IN ('SCHEDULED','RUNNING')`,
+                ).bind(now(), detail, runId),
+                env.DB.prepare(
+                    `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
+                ).bind(now(), detail, runId),
+            ]);
     } finally {
         clearTimeout(hardStop);
         try {
@@ -707,10 +805,10 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
     }
 }
 
-async function cleanup(env: Env): Promise<void> {
+export async function cleanup(env: Env, timestampMs: number = Date.now()): Promise<void> {
     // The rollup targets the previous (closed) hour, whose checks have all landed, so re-running
     // it within the same hour is idempotent. Only write it once per hour instead of every cycle.
-    const hour = new Date(Date.now() - 60 * 60_000).toISOString().slice(0, 13);
+    const hour = new Date(timestampMs - 60 * 60_000).toISOString().slice(0, 13);
     if (hour !== lastRolledHour) {
         await env.DB.prepare(
             `INSERT OR REPLACE INTO hourly_model_rollups(model_id,hour_at,sample_count,success_count,avg_latency_ms,p50_latency_ms,p95_latency_ms)
@@ -720,17 +818,23 @@ async function cleanup(env: Env): Promise<void> {
             .bind(
                 `${hour}:00:00.000Z`,
                 `${hour}:00:00.000Z`,
-                new Date().toISOString().slice(0, 13) + ':00:00.000Z',
+                new Date(timestampMs).toISOString().slice(0, 13) + ':00:00.000Z',
             )
             .run();
         lastRolledHour = hour;
     }
-    // Retention deletes are idempotent; run them once per UTC day instead of every 15-minute cycle.
-    const today = new Date().toISOString().slice(0, 10);
+    // Retention deletes are idempotent; run them once per UTC day instead of every cron cycle.
+    const today = new Date(timestampMs).toISOString().slice(0, 10);
     if (today !== lastCleanupDay) {
-        const threshold = new Date(Date.now() - 90 * 24 * 60 * 60_000).toISOString();
+        const threshold = new Date(timestampMs - 90 * 24 * 60 * 60_000).toISOString();
         await env.DB.prepare('DELETE FROM checks WHERE checked_at < ?').bind(threshold).run();
-        const rollupThreshold = new Date(Date.now() - 730 * 24 * 60 * 60_000).toISOString();
+        await env.DB.prepare(
+            `DELETE FROM model_check_executions WHERE scheduled_at < ?
+             AND NOT EXISTS (SELECT 1 FROM checks WHERE checks.execution_id=model_check_executions.id)`,
+        )
+            .bind(threshold)
+            .run();
+        const rollupThreshold = new Date(timestampMs - 730 * 24 * 60 * 60_000).toISOString();
         await env.DB.prepare('DELETE FROM hourly_model_rollups WHERE hour_at < ?')
             .bind(rollupThreshold)
             .run();

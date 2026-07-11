@@ -7,10 +7,13 @@ export interface CheckIntervalConfig {
 
 export const FREE_CHECK_INTERVAL_MINUTES_DEFAULT = 5;
 export const PAID_CHECK_INTERVAL_MINUTES_DEFAULT = 10;
+export const ALLOWED_CHECK_INTERVAL_MINUTES = [5, 10, 15, 20, 30, 60] as const;
 
 function configuredIntervalMinutes(value: string | undefined, defaultValue: number): number {
     const parsed = Number(value);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : defaultValue;
+    return ALLOWED_CHECK_INTERVAL_MINUTES.some((allowed) => allowed === parsed)
+        ? parsed
+        : defaultValue;
 }
 
 export function publicStatusFor(classification: Classification): PublicStatus {
@@ -112,6 +115,8 @@ export function nextCheckAt(
     retryAfterSeconds?: number,
     tier: 'FREE' | 'PAID' | 'UNKNOWN' = 'FREE',
     config: CheckIntervalConfig = {},
+    scheduledAtMs: number = Date.now(),
+    completedAtMs: number = scheduledAtMs,
 ): string {
     const minutes = checkIntervalMinutes(
         status,
@@ -120,7 +125,11 @@ export function nextCheckAt(
         tier,
         config,
     );
-    return new Date(Date.now() + minutes * 60_000).toISOString();
+    const exceptionalCooldown = ['AUTHENTICATION', 'RATE_LIMITED', 'DEGRADED', 'OUTAGE'].includes(
+        status,
+    );
+    const anchorMs = exceptionalCooldown ? Math.max(scheduledAtMs, completedAtMs) : scheduledAtMs;
+    return new Date(anchorMs + minutes * 60_000).toISOString();
 }
 
 // The monitor only ever runs on a cron tick (every 5 minutes; see wrangler crons).

@@ -26,6 +26,7 @@ import {
 } from '../src/worker/api';
 import {
     acquireLock,
+    cleanup,
     materializeStatus,
     materializedStatus,
     nextCheckTier,
@@ -573,15 +574,56 @@ describe('Ollama status classification', () => {
         expect(nominalCheckIntervalMinutes('FREE')).toBe(5);
         expect(nominalCheckIntervalMinutes('UNKNOWN')).toBe(5);
         expect(nominalCheckIntervalMinutes('PAID')).toBe(10);
-        expect(nominalCheckIntervalMinutes('FREE', { FREE_CHECK_INTERVAL_MINUTES: '7' })).toBe(7);
-        expect(nominalCheckIntervalMinutes('PAID', { PAID_CHECK_INTERVAL_MINUTES: '12' })).toBe(12);
+        for (const interval of ['5', '10', '15', '20', '30', '60']) {
+            expect(
+                nominalCheckIntervalMinutes('FREE', {
+                    FREE_CHECK_INTERVAL_MINUTES: interval,
+                }),
+            ).toBe(Number(interval));
+            expect(
+                nominalCheckIntervalMinutes('PAID', {
+                    PAID_CHECK_INTERVAL_MINUTES: interval,
+                }),
+            ).toBe(Number(interval));
+        }
+        expect(nominalCheckIntervalMinutes('FREE', { FREE_CHECK_INTERVAL_MINUTES: '7' })).toBe(5);
+        expect(nominalCheckIntervalMinutes('PAID', { PAID_CHECK_INTERVAL_MINUTES: '12' })).toBe(10);
         expect(nominalCheckIntervalMinutes('FREE', { FREE_CHECK_INTERVAL_MINUTES: '0' })).toBe(5);
+        expect(nominalCheckIntervalMinutes('FREE', { FREE_CHECK_INTERVAL_MINUTES: '-5' })).toBe(5);
         expect(nominalCheckIntervalMinutes('PAID', { PAID_CHECK_INTERVAL_MINUTES: 'nope' })).toBe(
             10,
         );
         expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'FREE')).toBe(5);
         expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'PAID')).toBe(10);
         expect(checkIntervalMinutes('DEGRADED', false, undefined, 'PAID')).toBe(15);
+    });
+
+    it('anchors the next check to the scheduled tick instead of probe completion time', () => {
+        const scheduledAt = Date.parse('2026-07-10T13:00:00.000Z');
+        expect(nextCheckAt('OPERATIONAL', false, undefined, 'FREE', {}, scheduledAt)).toBe(
+            '2026-07-10T13:05:00.000Z',
+        );
+        expect(nextCheckAt('OPERATIONAL', false, undefined, 'PAID', {}, scheduledAt)).toBe(
+            '2026-07-10T13:10:00.000Z',
+        );
+    });
+
+    it('anchors exceptional cooldowns to completion while healthy cadence stays tick-anchored', () => {
+        const scheduledAt = Date.parse('2026-07-10T13:00:00.000Z');
+        const completedAt = Date.parse('2026-07-10T13:07:00.000Z');
+        expect(
+            nextCheckAt('OPERATIONAL', false, undefined, 'FREE', {}, scheduledAt, completedAt),
+        ).toBe('2026-07-10T13:05:00.000Z');
+        expect(
+            nextCheckAt('AUTHENTICATION', false, undefined, 'FREE', {}, scheduledAt, completedAt),
+        ).toBe('2026-07-10T14:07:00.000Z');
+        expect(nextCheckAt('RATE_LIMITED', false, 7200, 'FREE', {}, scheduledAt, completedAt)).toBe(
+            '2026-07-10T15:07:00.000Z',
+        );
+        for (const status of ['DEGRADED', 'OUTAGE'] as const)
+            expect(
+                nextCheckAt(status, false, undefined, 'FREE', {}, scheduledAt, completedAt),
+            ).toBe('2026-07-10T13:22:00.000Z');
     });
 
     it('keeps the paid cadence after a paid-provider probe', () => {
@@ -1079,6 +1121,43 @@ describe('D1 write avoidance', () => {
     });
 });
 
+describe('monitor retention cleanup', () => {
+    it('deletes expired checks before executions and retains referenced executions', async () => {
+        const writes: Array<{ sql: string; bindings: unknown[] }> = [];
+        const env = {
+            DB: {
+                prepare(sql: string) {
+                    let bindings: unknown[] = [];
+                    return {
+                        bind(...values: unknown[]) {
+                            bindings = values;
+                            return this;
+                        },
+                        async run() {
+                            writes.push({ sql, bindings });
+                            return { meta: { changes: 1 } };
+                        },
+                    };
+                },
+            },
+        } as unknown as Env;
+
+        const reference = Date.parse('2035-02-03T12:00:00.000Z');
+        await cleanup(env, reference);
+
+        const checksDelete = writes.findIndex((entry) => /DELETE FROM checks/.test(entry.sql));
+        const executionsDelete = writes.findIndex((entry) =>
+            /DELETE FROM model_check_executions/.test(entry.sql),
+        );
+        expect(checksDelete).toBeGreaterThanOrEqual(0);
+        expect(executionsDelete).toBeGreaterThan(checksDelete);
+        expect(writes[executionsDelete].sql).toContain('NOT EXISTS');
+        const expectedThreshold = new Date(reference - 90 * 24 * 60 * 60_000).toISOString();
+        expect(writes[checksDelete].bindings).toEqual([expectedThreshold]);
+        expect(writes[executionsDelete].bindings).toEqual([expectedThreshold]);
+    });
+});
+
 describe('monitor run time-box (cadence preservation)', () => {
     const env = (overrides: Partial<Env> = {}) =>
         ({
@@ -1204,13 +1283,18 @@ describe('monitor run recovery', () => {
         }
     });
 
-    it('recovers on the next cycle: marks an orphaned prior run abandoned and starts a clean one', async () => {
+    it('recovers on the next cycle and records the execution lifecycle', async () => {
         // Simulate a prior run that never finished (a stuck/evicted run) plus a catalog of one due
         // model. runMonitor must: (1) sweep the orphaned run to ABANDONED, (2) insert a new run,
         // (3) probe the model and complete the new run OK — recovering automatically without a
         // manual restart and without duplicating runs.
         const originalFetch = globalThis.fetch;
         const statements: string[] = [];
+        const boundStatements: Array<{ sql: string; bindings: unknown[] }> = [];
+        const batches: string[][] = [];
+        const insertedScheduledTimes = new Set<string>();
+        let failRenewal = false;
+        let failCheckInsert = false;
         const orphan = {
             id: 'run_old',
             started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
@@ -1230,15 +1314,31 @@ describe('monitor run recovery', () => {
         const env = {
             OLLAMA_BASE_URL: 'https://example.test/api',
             OLLAMA_API_KEY_FREE: 'k',
+            OLLAMA_API_KEY_PAID: 'paid-k',
             PROBE_CONCURRENCY: '1',
             PROBE_DELAY_MIN_MS: '0',
             PROBE_DELAY_MAX_MS: '0',
             DB: {
                 prepare(sql: string) {
+                    let currentBindings: unknown[] = [];
                     const prepared = {
+                        statementSql: sql,
                         run: async () => {
                             statements.push(sql);
-                            return { meta: { changes: 1 } };
+                            if (failCheckInsert && /INSERT INTO checks/.test(sql))
+                                throw new Error('check_insert_failed');
+                            if (/INSERT OR IGNORE INTO monitor_runs/.test(sql)) {
+                                const scheduledAt = String(currentBindings[2]);
+                                if (insertedScheduledTimes.has(scheduledAt))
+                                    return { meta: { changes: 0 } };
+                                insertedScheduledTimes.add(scheduledAt);
+                            }
+                            return {
+                                meta: {
+                                    changes:
+                                        failRenewal && /UPDATE scheduler_locks/.test(sql) ? 0 : 1,
+                                },
+                            };
                         },
                         all: async () => {
                             statements.push(sql);
@@ -1264,6 +1364,12 @@ describe('monitor run recovery', () => {
                                             base_url: 'https://example.test/api',
                                             secret_ref: 'OLLAMA_API_KEY_FREE',
                                         },
+                                        {
+                                            id: 'ollama-paid',
+                                            name: 'Paid',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_PAID',
+                                        },
                                     ],
                                 };
                             if (/FROM provider_model_status/.test(sql)) return { results: [] };
@@ -1284,14 +1390,19 @@ describe('monitor run recovery', () => {
                             if (/FROM incidents WHERE id=/.test(sql)) return null;
                             return null;
                         },
-                        bind(..._b: unknown[]) {
+                        bind(...bindings: unknown[]) {
+                            currentBindings = bindings;
+                            boundStatements.push({ sql, bindings });
                             return prepared; // bound and unbound access resolve to the same routes
                         },
                     };
                     return prepared;
                 },
-                batch(arr: { run: () => Promise<unknown> }[]) {
-                    return Promise.all(arr.map((s) => s.run()));
+                async batch(arr: { run: () => Promise<unknown>; statementSql: string }[]) {
+                    batches.push(arr.map((statement) => statement.statementSql));
+                    const results: unknown[] = [];
+                    for (const statement of arr) results.push(await statement.run());
+                    return results;
                 },
             },
         } as unknown as Env;
@@ -1300,7 +1411,7 @@ describe('monitor run recovery', () => {
                 void p.catch(() => {});
             },
         } as unknown as Parameters<typeof runMonitor>[1];
-        globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const monitorFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = typeof input === 'string' ? input : input.toString();
             if (url.endsWith('/tags'))
                 // Catalog listing with one model.
@@ -1308,13 +1419,17 @@ describe('monitor run recovery', () => {
                     status: 200,
                 });
             if (url.endsWith('/show')) return new Response('{}', { status: 200 });
+            if ((init?.headers as Record<string, string> | undefined)?.Authorization === 'Bearer k')
+                return new Response('model requires a subscription', { status: 403 });
             // /chat stream: first content chunk proves inference started.
             return new Response('{"model":"m","message":{"content":"OK"},"done":true}\n', {
                 status: 200,
             });
         }) as typeof fetch;
+        globalThis.fetch = monitorFetch;
+        const scheduledTime = Date.parse('2026-07-10T13:00:00.000Z');
         try {
-            await runMonitor(env, ctx);
+            await runMonitor(env, ctx, scheduledTime);
         } finally {
             globalThis.fetch = originalFetch;
         }
@@ -1322,9 +1437,132 @@ describe('monitor run recovery', () => {
         expect(
             statements.some((s) => /finished_at=\?,outcome='ERROR',phase='ABANDONED'/.test(s)),
         ).toBe(true);
+        expect(
+            statements.some(
+                (s) =>
+                    /UPDATE model_check_executions SET state='ABANDONED'/.test(s) &&
+                    /SELECT id FROM monitor_runs WHERE finished_at IS NULL/.test(s),
+            ),
+        ).toBe(true);
         // (2) A new run is inserted.
-        expect(statements.some((s) => /INSERT INTO monitor_runs/.test(s))).toBe(true);
+        expect(statements.some((s) => /INSERT OR IGNORE INTO monitor_runs/.test(s))).toBe(true);
         // (3) The new run completes OK (not PARTIAL, not ERROR) after probing the due model.
         expect(statements.some((s) => /outcome=\?,phase='COMPLETED'/.test(s))).toBe(true);
+
+        const runInsert = boundStatements.find((entry) =>
+            /INSERT OR IGNORE INTO monitor_runs/.test(entry.sql),
+        );
+        expect(runInsert?.bindings[2]).toBe('2026-07-10T13:00:00.000Z');
+        const executionInsert = boundStatements.find((entry) =>
+            /INSERT INTO model_check_executions/.test(entry.sql),
+        );
+        expect(executionInsert?.bindings.slice(2)).toEqual([
+            'ollama:m',
+            'UNKNOWN',
+            5,
+            '2026-07-10T13:00:00.000Z',
+        ]);
+        const executionId = executionInsert?.bindings[0];
+        const dueQuery = boundStatements.find((entry) =>
+            /FROM models WHERE provider_id='ollama-free'/.test(entry.sql),
+        );
+        expect(dueQuery?.bindings[0]).toBe(eligibilityCutoff(scheduledTime));
+        const checkInserts = boundStatements.filter((entry) =>
+            /INSERT INTO checks/.test(entry.sql),
+        );
+        expect(checkInserts).toHaveLength(2);
+        expect(checkInserts.every((entry) => entry.bindings.at(-1) === executionId)).toBe(true);
+        const modelScheduleUpdates = boundStatements.filter((entry) =>
+            /^UPDATE models SET next_check_at/.test(entry.sql),
+        );
+        expect(modelScheduleUpdates).toHaveLength(1);
+        expect(modelScheduleUpdates[0].bindings[0]).toBe('2026-07-10T13:10:00.000Z');
+        const providerSchedules = boundStatements.filter((entry) =>
+            /INSERT INTO provider_model_status/.test(entry.sql),
+        );
+        expect(providerSchedules).toHaveLength(2);
+        expect(
+            providerSchedules.every((entry) => entry.bindings[10] === '2026-07-10T13:10:00.000Z'),
+        ).toBe(true);
+        expect(statements.some((sql) => /state='RUNNING'/.test(sql))).toBe(true);
+        expect(statements.some((sql) => /state='COMPLETED'/.test(sql))).toBe(true);
+        expect(
+            batches.some(
+                (batch) =>
+                    batch.length === 3 &&
+                    /UPDATE models SET next_check_at/.test(batch[0]) &&
+                    /UPDATE monitor_runs SET completed_model_count/.test(batch[1]) &&
+                    /state='COMPLETED'/.test(batch[2]),
+            ),
+        ).toBe(true);
+
+        // Retrying the same cron event is idempotent: the unique scheduled_at run is ignored
+        // before any execution or probe can be created.
+        statements.length = 0;
+        boundStatements.length = 0;
+        globalThis.fetch = monitorFetch;
+        await runMonitor(env, ctx, scheduledTime);
+        expect(statements.some((sql) => /INSERT OR IGNORE INTO monitor_runs/.test(sql))).toBe(true);
+        expect(statements.some((sql) => /INSERT INTO model_check_executions/.test(sql))).toBe(
+            false,
+        );
+        expect(statements.some((sql) => /INSERT INTO checks/.test(sql))).toBe(false);
+
+        // If the run cannot start any model within its time budget, its pre-created execution is
+        // terminally deferred and the model remains due for the next tick.
+        statements.length = 0;
+        boundStatements.length = 0;
+        env.PROBE_DELAY_MAX_MS = '960000';
+        globalThis.fetch = monitorFetch;
+        try {
+            await runMonitor(env, ctx, scheduledTime + CRON_INTERVAL_MS);
+            expect(statements).toContainEqual(expect.stringMatching(/state='DEFERRED'/));
+            expect(statements.some((sql) => /INSERT INTO checks/.test(sql))).toBe(false);
+            expect(
+                boundStatements.some(
+                    (entry) =>
+                        /outcome=\?,phase='COMPLETED'/.test(entry.sql) &&
+                        entry.bindings[1] === 'PARTIAL',
+                ),
+            ).toBe(true);
+
+            // Losing the scheduler lock abandons every execution that was created but not started.
+            statements.length = 0;
+            boundStatements.length = 0;
+            env.PROBE_DELAY_MAX_MS = '0';
+            failRenewal = true;
+            await runMonitor(env, ctx, scheduledTime + 2 * CRON_INTERVAL_MS);
+            expect(
+                statements.some((sql) =>
+                    /WHERE run_id=\? AND state IN \('SCHEDULED','RUNNING'\)/.test(sql),
+                ),
+            ).toBe(true);
+            expect(statements.some((sql) => /phase='FAILED'/.test(sql))).toBe(true);
+
+            // A model-local persistence failure is isolated to that execution and does not leave it
+            // indefinitely RUNNING.
+            statements.length = 0;
+            boundStatements.length = 0;
+            failRenewal = false;
+            failCheckInsert = true;
+            await runMonitor(env, ctx, scheduledTime + 3 * CRON_INTERVAL_MS);
+            expect(
+                boundStatements.some(
+                    (entry) =>
+                        /SET state=\?,completed_at=\?,detail=\?/.test(entry.sql) &&
+                        entry.bindings[0] === 'FAILED',
+                ),
+            ).toBe(true);
+            expect(
+                boundStatements.some(
+                    (entry) =>
+                        /outcome=\?,phase='COMPLETED'/.test(entry.sql) &&
+                        entry.bindings[1] === 'PARTIAL' &&
+                        entry.bindings[2] === 'execution_failures:1',
+                ),
+            ).toBe(true);
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
     });
 });

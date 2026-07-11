@@ -9,10 +9,10 @@ export default {
         return env.ASSETS.fetch(request);
     },
     async scheduled(
-        _controller: ScheduledController,
+        controller: ScheduledController,
         env: Env,
         ctx: ExecutionContext,
     ): Promise<void> {
-        await runMonitor(env, ctx);
+        await runMonitor(env, ctx, controller.scheduledTime);
     },
 } satisfies ExportedHandler<Env>;
