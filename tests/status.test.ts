@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     checkIntervalMinutes,
     classifyHttp,
+    CRON_INTERVAL_MS,
     eligibilityCutoff,
     isLatencyAnomalous,
     nextCheckAt,
@@ -382,13 +383,13 @@ describe('Ollama status classification', () => {
         ).toBeGreaterThanOrEqual(119 * 60_000);
     });
 
-    it('admits checks due within the next half-interval so a late run does not drift the cadence', () => {
+    it('admits any check that comes due before the next cron tick so a late run does not drift the cadence', () => {
         const reference = Date.parse('2026-07-10T12:00:00.000Z');
-        const cutoff = Date.parse(eligibilityCutoff(reference)) - reference;
-        const freeInterval = nominalCheckIntervalMinutes('FREE') * 60_000;
-        expect(cutoff).toBeGreaterThan(0);
-        expect(cutoff).toBeLessThan(freeInterval);
-        expect(cutoff).toBe(freeInterval / 2);
+        const grace = Date.parse(eligibilityCutoff(reference)) - reference;
+        // Wide enough to absorb a full run's within-run processing drift...
+        expect(grace).toBeGreaterThan(0);
+        // ...but STRICTLY below one cron interval, or the 15-minute paid cadence would be pulled down to 10.
+        expect(grace).toBeLessThan(CRON_INTERVAL_MS);
     });
 
     it('checks free models every five minutes and paid models every fifteen', () => {

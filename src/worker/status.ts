@@ -88,11 +88,16 @@ export function nextCheckAt(
     return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
-// A model whose next_check_at lands just after a cron tick would otherwise wait a
-// whole extra cycle before becoming due, drifting the free cadence from ~5 toward
-// ~10 minutes. Admitting anything due within the next half-interval keeps models on
-// schedule without pulling their real interval below half of nominal.
-export const SCHEDULE_GRACE_MS = (nominalCheckIntervalMinutes('FREE') * 60_000) / 2;
+// The monitor only ever runs on a cron tick (every 5 minutes; see wrangler crons).
+// A model whose next_check_at lands even a second after a tick would otherwise wait a
+// whole extra cycle, drifting the free cadence from ~5 toward ~10 minutes. Admitting
+// anything that comes due before the next tick pins every tier to its exact nominal
+// multiple of the cron period (free → 5m, paid → 15m). The margin must stay STRICTLY
+// below one cron interval: at or above it, the 15-minute paid cadence would be pulled
+// down to 10. The 1s shy of a full interval keeps the widest drift tolerance under
+// that ceiling.
+export const CRON_INTERVAL_MS = 5 * 60_000;
+export const SCHEDULE_GRACE_MS = CRON_INTERVAL_MS - 1_000;
 
 export function eligibilityCutoff(nowMs: number): string {
     return new Date(nowMs + SCHEDULE_GRACE_MS).toISOString();
