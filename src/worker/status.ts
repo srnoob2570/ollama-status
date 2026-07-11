@@ -70,7 +70,10 @@ export function checkIntervalMinutes(
     return status === 'AUTHENTICATION'
         ? 60
         : status === 'RATE_LIMITED'
-          ? Math.max(60, Math.ceil((retryAfterSeconds ?? 0) / 60))
+          ? // A 429 here is usually self-inflicted burst throttling, not an exhausted quota,
+            // so honor any Retry-After but otherwise recover on the next cycle (floored to the
+            // 5-minute cron cadence) instead of locking the model out for a full hour.
+            Math.max(5, Math.ceil((retryAfterSeconds ?? 300) / 60))
           : status === 'DEGRADED' || (status === 'OUTAGE' && hadRecentIncident)
             ? 5
             : status === 'OUTAGE'

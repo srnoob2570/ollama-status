@@ -378,6 +378,18 @@ describe('Ollama status classification', () => {
         ).toBeGreaterThanOrEqual(119 * 60_000);
     });
 
+    it('recovers a self-inflicted rate limit on the next cycle instead of a full hour', () => {
+        const now = Date.now();
+        // No Retry-After header → short default (~5 min), not the old 60-minute lockout.
+        const noHeader = new Date(nextCheckAt('RATE_LIMITED', false)).getTime() - now;
+        expect(noHeader).toBeLessThanOrEqual(6 * 60_000);
+        expect(noHeader).toBeGreaterThanOrEqual(4 * 60_000);
+        // A shorter Retry-After is still floored to the 5-minute cron cadence.
+        expect(
+            new Date(nextCheckAt('RATE_LIMITED', false, 30)).getTime() - now,
+        ).toBeGreaterThanOrEqual(4 * 60_000);
+    });
+
     it('admits any check that comes due before the next cron tick so a late run does not drift the cadence', () => {
         const reference = Date.parse('2026-07-10T12:00:00.000Z');
         const grace = Date.parse(eligibilityCutoff(reference)) - reference;
