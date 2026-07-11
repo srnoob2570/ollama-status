@@ -14,6 +14,8 @@
     "lint": "eslint .",
     "deploy:staging": "npm run build && wrangler deploy --env staging",
     "deploy:production": "npm run build && wrangler deploy --env production",
+    "migrate:staging": "wrangler d1 migrations apply ollama-status-staging --env staging --remote",
+    "migrate:production": "wrangler d1 migrations apply ollama-status --env production --remote",
     "format": "npx prettier --write ./src/"
   },
   "dependencies": {
