@@ -15,8 +15,9 @@ const providerSeeds = [
 // room to grow; raise PROBE_CONCURRENCY too if the catalog ever outgrows this.
 const MAX_MODELS_PER_RUN = 40;
 // Probes run in parallel batches so one slow or timing-out model can't stagger the rest of
-// the run across minutes. Six stays within a Worker's outbound connection ceiling.
-const PROBE_CONCURRENCY = 6;
+// the run across minutes. Kept low to avoid bursting Ollama into per-model 429s (which a
+// larger batch triggered on the heaviest models) while still finishing runs in seconds.
+const PROBE_CONCURRENCY = 3;
 
 function keyFor(env: Env, ref: Provider['secret_ref']) {
     return env[ref] ?? '';
@@ -209,7 +210,12 @@ async function storeProbe(
             result.errorCode ?? null,
         ),
         env.DB.prepare('UPDATE models SET next_check_at=?,updated_at=? WHERE id=?').bind(
-            nextCheckAt(result.publicStatus, result.publicStatus === 'OUTAGE', undefined, tier),
+            nextCheckAt(
+                result.publicStatus,
+                result.publicStatus === 'OUTAGE',
+                result.retryAfterSeconds,
+                tier,
+            ),
             timestamp,
             model.id,
         ),
@@ -278,7 +284,7 @@ async function materializeStatus(
             nextCheckAt(
                 result.publicStatus,
                 result.publicStatus === 'OUTAGE',
-                undefined,
+                result.retryAfterSeconds,
                 nextCheckTier(provider, model, result),
             ),
             timestamp,

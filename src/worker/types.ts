@@ -67,6 +67,7 @@ export interface ProbeResult {
     rttMs: number;
     loadDurationMs?: number;
     errorCode?: string;
+    retryAfterSeconds?: number;
 }
 export interface IncidentEvent {
     incidentId: string;

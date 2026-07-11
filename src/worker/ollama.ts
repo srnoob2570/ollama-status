@@ -93,12 +93,14 @@ export class OllamaProvider {
                     /requires a subscription|upgrade for access/i.test(error)
                         ? 'SUBSCRIPTION_REQUIRED'
                         : classifyHttp(response.status);
+                const retryAfter = Number.parseInt(response.headers.get('retry-after') ?? '', 10);
                 return {
                     classification,
                     publicStatus: publicStatusFor(classification),
                     httpStatus: response.status,
                     rttMs: performance.now() - started,
                     errorCode: `http_${response.status}`,
+                    retryAfterSeconds: Number.isFinite(retryAfter) ? retryAfter : undefined,
                 };
             }
             return await firstChatToken(response, started, baseline);
