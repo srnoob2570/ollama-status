@@ -299,6 +299,7 @@ async function storeProbe(
                 result.publicStatus === 'OUTAGE',
                 result.retryAfterSeconds,
                 tier,
+                env,
             ),
             timestamp,
             model.id,
@@ -370,6 +371,7 @@ export async function materializeStatus(
                 result.publicStatus === 'OUTAGE',
                 result.retryAfterSeconds,
                 nextCheckTier(provider, model, result),
+                env,
             ),
             timestamp,
         )

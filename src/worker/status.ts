@@ -1,5 +1,18 @@
 import type { Classification, PublicStatus } from './types';
 
+export interface CheckIntervalConfig {
+    FREE_CHECK_INTERVAL_MINUTES?: string;
+    PAID_CHECK_INTERVAL_MINUTES?: string;
+}
+
+export const FREE_CHECK_INTERVAL_MINUTES_DEFAULT = 5;
+export const PAID_CHECK_INTERVAL_MINUTES_DEFAULT = 10;
+
+function configuredIntervalMinutes(value: string | undefined, defaultValue: number): number {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
 export function publicStatusFor(classification: Classification): PublicStatus {
     switch (classification) {
         case 'SUCCESS':
@@ -57,11 +70,19 @@ export function isLatencyAnomalous(latencyMs: number, baseline?: number): boolea
     );
 }
 
-export function nominalCheckIntervalMinutes(tier: 'FREE' | 'PAID' | 'UNKNOWN'): number {
-    // Cadence aligned to the 15-minute cron tick (wrangler crons */15). Both tiers check every
-    // tick; the tier argument is kept for callers and future divergence.
-    void tier;
-    return 15;
+export function nominalCheckIntervalMinutes(
+    tier: 'FREE' | 'PAID' | 'UNKNOWN',
+    config: CheckIntervalConfig = {},
+): number {
+    return tier === 'PAID'
+        ? configuredIntervalMinutes(
+              config.PAID_CHECK_INTERVAL_MINUTES,
+              PAID_CHECK_INTERVAL_MINUTES_DEFAULT,
+          )
+        : configuredIntervalMinutes(
+              config.FREE_CHECK_INTERVAL_MINUTES,
+              FREE_CHECK_INTERVAL_MINUTES_DEFAULT,
+          );
 }
 
 export function checkIntervalMinutes(
@@ -69,6 +90,7 @@ export function checkIntervalMinutes(
     hadRecentIncident: boolean,
     retryAfterSeconds?: number,
     tier: 'FREE' | 'PAID' | 'UNKNOWN' = 'FREE',
+    config: CheckIntervalConfig = {},
 ): number {
     return status === 'AUTHENTICATION'
         ? 60
@@ -81,7 +103,7 @@ export function checkIntervalMinutes(
             ? 15
             : status === 'OUTAGE'
               ? 15
-              : nominalCheckIntervalMinutes(tier);
+              : nominalCheckIntervalMinutes(tier, config);
 }
 
 export function nextCheckAt(
@@ -89,19 +111,26 @@ export function nextCheckAt(
     hadRecentIncident: boolean,
     retryAfterSeconds?: number,
     tier: 'FREE' | 'PAID' | 'UNKNOWN' = 'FREE',
+    config: CheckIntervalConfig = {},
 ): string {
-    const minutes = checkIntervalMinutes(status, hadRecentIncident, retryAfterSeconds, tier);
+    const minutes = checkIntervalMinutes(
+        status,
+        hadRecentIncident,
+        retryAfterSeconds,
+        tier,
+        config,
+    );
     return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
-// The monitor only ever runs on a cron tick (every 15 minutes; see wrangler crons).
+// The monitor only ever runs on a cron tick (every 5 minutes; see wrangler crons).
 // A model whose next_check_at lands even a second after a tick would otherwise wait a
-// whole extra cycle, drifting the cadence from ~15 toward ~30 minutes. Admitting
+// whole extra cycle, drifting the cadence from ~5 toward ~10 minutes. Admitting
 // anything that comes due before the next tick pins every tier to its exact nominal
-// multiple of the cron period (15m). The margin must stay STRICTLY below one cron
+// multiple of the cron period (5m). The margin must stay STRICTLY below one cron
 // interval: at or above it, the cadence would be pulled down toward a shorter period.
 // The 1s shy of a full interval keeps the widest drift tolerance under that ceiling.
-export const CRON_INTERVAL_MS = 15 * 60_000;
+export const CRON_INTERVAL_MS = 5 * 60_000;
 export const SCHEDULE_GRACE_MS = CRON_INTERVAL_MS - 1_000;
 
 export function eligibilityCutoff(nowMs: number): string {

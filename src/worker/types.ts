@@ -30,6 +30,8 @@ export interface Env {
     ASSETS: Fetcher;
     OLLAMA_BASE_URL: string;
     OLLAMA_MAX_TOKENS?: string;
+    FREE_CHECK_INTERVAL_MINUTES?: string;
+    PAID_CHECK_INTERVAL_MINUTES?: string;
     // Throttle controls so free API keys (1 concurrent model) don't burst into 429s.
     // Paid keys can raise PROBE_CONCURRENCY (~3-10) to finish runs faster.
     PROBE_CONCURRENCY?: string;

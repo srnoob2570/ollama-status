@@ -565,16 +565,22 @@ describe('Ollama status classification', () => {
         const grace = Date.parse(eligibilityCutoff(reference)) - reference;
         // Wide enough to absorb a full run's within-run processing drift...
         expect(grace).toBeGreaterThan(0);
-        // ...but STRICTLY below one cron interval, or the 15-minute paid cadence would be pulled down to 10.
+        // ...but STRICTLY below one cron interval, or the paid cadence would be pulled down.
         expect(grace).toBeLessThan(CRON_INTERVAL_MS);
     });
 
-    it('checks every model every fifteen minutes regardless of tier', () => {
-        expect(nominalCheckIntervalMinutes('FREE')).toBe(15);
-        expect(nominalCheckIntervalMinutes('UNKNOWN')).toBe(15);
-        expect(nominalCheckIntervalMinutes('PAID')).toBe(15);
-        expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'FREE')).toBe(15);
-        expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'PAID')).toBe(15);
+    it('uses configurable free and paid intervals, falling back to their defaults', () => {
+        expect(nominalCheckIntervalMinutes('FREE')).toBe(5);
+        expect(nominalCheckIntervalMinutes('UNKNOWN')).toBe(5);
+        expect(nominalCheckIntervalMinutes('PAID')).toBe(10);
+        expect(nominalCheckIntervalMinutes('FREE', { FREE_CHECK_INTERVAL_MINUTES: '7' })).toBe(7);
+        expect(nominalCheckIntervalMinutes('PAID', { PAID_CHECK_INTERVAL_MINUTES: '12' })).toBe(12);
+        expect(nominalCheckIntervalMinutes('FREE', { FREE_CHECK_INTERVAL_MINUTES: '0' })).toBe(5);
+        expect(nominalCheckIntervalMinutes('PAID', { PAID_CHECK_INTERVAL_MINUTES: 'nope' })).toBe(
+            10,
+        );
+        expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'FREE')).toBe(5);
+        expect(checkIntervalMinutes('OPERATIONAL', false, undefined, 'PAID')).toBe(10);
         expect(checkIntervalMinutes('DEGRADED', false, undefined, 'PAID')).toBe(15);
     });
 
@@ -606,7 +612,7 @@ describe('Ollama status classification', () => {
                 undefined,
                 nextCheckTier(paidProvider, unclassifiedModel, successfulProbe),
             ),
-        ).toBe(15);
+        ).toBe(10);
     });
 
     it('uses the free probe as the only entitlement decision', () => {
