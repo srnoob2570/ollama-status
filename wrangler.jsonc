@@ -16,7 +16,7 @@
     "staging": {
       "name": "ollama-status-staging", "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": true, "not_found_handling": "single-page-application" },
       "triggers": { "crons": ["*/5 * * * *"] },
-      "d1_databases": [{ "binding": "DB", "database_name": "ollama-status-staging", "database_id": "REPLACE_WITH_STAGING_D1_ID" }],
+      "d1_databases": [{ "binding": "DB", "database_name": "ollama-status-staging", "database_id": "b8e3a94e-7cc2-404b-b76a-e6bef5181b77" }],
       "queues": { "producers": [{ "binding": "INCIDENT_EVENTS", "queue": "ollama-status-incidents-staging" }], "consumers": [{ "queue": "ollama-status-incidents-staging", "max_batch_size": 10, "max_retries": 3, "max_concurrency": 1 }] },
       "vars": { "ENVIRONMENT": "staging", "OLLAMA_BASE_URL": "https://ollama.com/api", "OLLAMA_MAX_TOKENS": "8", "ACCESS_TEAM_DOMAIN": "", "ACCESS_AUD": "", "EXCLUDED_MODELS": "" }
     },
