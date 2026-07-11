@@ -20,12 +20,7 @@ import {
     nextUpdatesForModels,
     worstStatus,
 } from '../src/worker/api';
-import {
-    materializedStatus,
-    nextCheckTier,
-    renewLock,
-    shouldRetryProbe,
-} from '../src/worker/monitor';
+import { materializedStatus, nextCheckTier, renewLock } from '../src/worker/monitor';
 import type { Env } from '../src/worker/types';
 import { nextUpdateLabel, roundUpToMonitorInterval } from '../src/web/next-update';
 
@@ -644,11 +639,5 @@ describe('Ollama status classification', () => {
         } finally {
             globalThis.fetch = originalFetch;
         }
-    });
-
-    it('retries empty responses through the normal transient-failure path', () => {
-        expect(shouldRetryProbe('EMPTY_RESPONSE')).toBe(true);
-        expect(shouldRetryProbe('PROTOCOL_ERROR')).toBe(false);
-        expect(shouldRetryProbe('SUCCESS')).toBe(false);
     });
 });

@@ -10,6 +10,14 @@ const providerSeeds = [
     { id: 'ollama-paid', name: 'Ollama Cloud Paid', secret: 'OLLAMA_API_KEY_PAID' },
 ] as const;
 
+// The whole active catalog (34 models today) must fit in one run, or models get starved
+// past their cadence and drift to "checked N minutes ago". Kept above catalog size with
+// room to grow; raise PROBE_CONCURRENCY too if the catalog ever outgrows this.
+const MAX_MODELS_PER_RUN = 40;
+// Probes run in parallel batches so one slow or timing-out model can't stagger the rest of
+// the run across minutes. Six stays within a Worker's outbound connection ceiling.
+const PROBE_CONCURRENCY = 6;
+
 function keyFor(env: Env, ref: Provider['secret_ref']) {
     return env[ref] ?? '';
 }
@@ -25,15 +33,6 @@ function excluded(env: Env, model: string) {
 }
 function isFailure(c: Classification) {
     return !['SUCCESS', 'HIGH_LATENCY', 'SUBSCRIPTION_REQUIRED'].includes(c);
-}
-export function shouldRetryProbe(classification: Classification): boolean {
-    return [
-        'TIMEOUT',
-        'NETWORK_ERROR',
-        'MODEL_UNREACHABLE',
-        'OVERLOADED',
-        'EMPTY_RESPONSE',
-    ].includes(classification);
 }
 export function nextCheckTier(
     provider: Provider,
@@ -408,11 +407,13 @@ async function probeModel(env: Env, provider: Provider, model: Model): Promise<P
         keyFor(env, provider.secret_ref),
         maxResponseTokens(env.OLLAMA_MAX_TOKENS),
     );
-    let result = await client.probe(model.remote_name, await baseline(env, provider.id, model.id));
-    if (shouldRetryProbe(result.classification)) {
-        await new Promise((resolve) => setTimeout(resolve, 20_000));
-        result = await client.probe(model.remote_name, await baseline(env, provider.id, model.id));
-    }
+    // A transient failure is left to reschedule on its own cadence (~5 min) instead of
+    // blocking the run with an inline retry that staggers every model behind it; a single
+    // failed check never materializes an incident on its own, so nothing is lost.
+    const result = await client.probe(
+        model.remote_name,
+        await baseline(env, provider.id, model.id),
+    );
     if (provider.id === 'ollama-free' && result.classification === 'MODEL_NOT_FOUND')
         await env.DB.prepare(
             "UPDATE models SET excluded=1,exclusion_reason='unavailable after catalog' WHERE id=?",
@@ -502,7 +503,7 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         const catalogModelCount = await syncCatalog(env, freeProvider);
         if (catalogModelCount === null) throw new Error('global_catalog_unavailable');
         const due = await env.DB.prepare(
-            "SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT 24",
+            `SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT ${MAX_MODELS_PER_RUN}`,
         )
             .bind(eligibilityCutoff(Date.now()))
             .all<Model>();
@@ -511,11 +512,11 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
         )
             .bind(catalogModelCount, due.results.length, runId)
             .run();
-        for (let i = 0; i < due.results.length; i += 2) {
+        for (let i = 0; i < due.results.length; i += PROBE_CONCURRENCY) {
             if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
             await Promise.all(
                 due.results
-                    .slice(i, i + 2)
+                    .slice(i, i + PROBE_CONCURRENCY)
                     .map((model) =>
                         probeByEntitlement(env, freeProvider, paidProvider, model, runId),
                     ),
