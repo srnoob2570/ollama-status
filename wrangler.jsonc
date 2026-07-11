@@ -81,7 +81,7 @@
                 "OLLAMA_BASE_URL": "https://ollama.com/api",
                 "OLLAMA_MAX_TOKENS": "2",
                 "FREE_CHECK_INTERVAL_MINUTES": "5",
-                "PAID_CHECK_INTERVAL_MINUTES": "10",
+                "PAID_CHECK_INTERVAL_MINUTES": "5",
                 "PROBE_CONCURRENCY": "6",
                 "PROBE_DELAY_MIN_MS": "0",
                 "PROBE_DELAY_MAX_MS": "5000",
