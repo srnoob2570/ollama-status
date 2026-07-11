@@ -10,6 +10,14 @@ const json = (body: unknown, status = 200) =>
     });
 const invalid = (message: string) => json({ error: message }, 400);
 
+// `caches.default` is the Workers implicit cache, but the lib's CacheStorage type omits the
+// `default` property, so cast it lazily. Used to serve public read endpoints from cache (60s
+// TTL) and keep the dashboard's 30s polling off D1 ~98% of the time. Evaluated at call time so
+// the module loads in test environments where `caches` is not a global.
+function defaultCache(): Cache {
+    return (caches as unknown as { default: Cache }).default;
+}
+
 // Fixed 5-minute buckets for the 1h range, decoupled from the per-tier check cadence so
 // staggered/async checks land wherever they land without creating false "no data" gaps.
 const HISTORY_1H_BUCKET_MINUTES = 5;
@@ -234,6 +242,23 @@ export async function api(
         return confirmation(request, env);
     if (path.startsWith('/api/admin/')) return admin(request, env, ctx, path);
     if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+    // Public GET endpoints change only when the monitor writes (every ~5 min), so a 60s Cache API
+    // TTL serves the dashboard's 30s polling from cache ~98% of the time. Data is at most ~1 min
+    // stale while the next check is up to 5 min away, so this never hides a state change that the
+    // dashboard would otherwise already see as fresh.
+    const cacheKey = new Request(request.url, { method: 'GET' });
+    const cacheStore = defaultCache();
+    const cached = await cacheStore.match(cacheKey);
+    if (cached) return cached;
+    const response = await publicGetResponse(request, env, path);
+    if (response.status === 200) {
+        response.headers.set('cache-control', 'public, max-age=60');
+        ctx.waitUntil(cacheStore.put(cacheKey, response.clone()));
+    }
+    return response;
+}
+
+async function publicGetResponse(request: Request, env: Env, path: string): Promise<Response> {
     if (path === '/api/v1/status')
         return publicStatus(env, new URL(request.url).searchParams.get('range'));
     if (path === '/api/v1/incidents') return incidents(env);

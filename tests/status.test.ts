@@ -21,13 +21,15 @@ import {
     worstStatus,
 } from '../src/worker/api';
 import {
+    materializeStatus,
     materializedStatus,
     nextCheckTier,
     probeConcurrency,
     probeDelayMs,
     renewLock,
 } from '../src/worker/monitor';
-import type { Env } from '../src/worker/types';
+import { now } from '../src/worker/types';
+import type { Env, Model, ProbeResult, Provider } from '../src/worker/types';
 import { nextUpdateLabel, roundUpToMonitorInterval } from '../src/web/next-update';
 
 describe('Ollama status classification', () => {
@@ -731,5 +733,93 @@ describe('probe throttle configuration', () => {
             min: 0,
             max: 5000,
         });
+    });
+});
+
+describe('D1 write avoidance', () => {
+    // Minimal D1 mock that routes each statement by SQL pattern and records every write (run)
+    // so write-skip optimizations can be asserted directly. Reads use first()/all(); the code
+    // only calls one of first/all/run per statement, so a single bound object suffices.
+    const mockEnv = (routes: { match: RegExp; first?: () => unknown; all?: () => unknown }[]) => {
+        const runs: string[] = [];
+        const env = {
+            DB: {
+                prepare(sql: string) {
+                    return {
+                        bind(..._args: unknown[]) {
+                            const route = routes.find((r) => r.match.test(sql));
+                            return {
+                                first: async () => route?.first?.() ?? null,
+                                all: async () => route?.all?.() ?? { results: [] },
+                                run: async () => {
+                                    runs.push(sql);
+                                    return { meta: { changes: 1 } };
+                                },
+                            };
+                        },
+                    };
+                },
+            },
+        } as unknown as Env;
+        return { env, runs };
+    };
+
+    it('skips rewriting models.tier when it already matches the probe classification', async () => {
+        const { env, runs } = mockEnv([
+            { match: /SELECT \* FROM provider_model_status/, first: () => null },
+            { match: /SELECT classification FROM checks/, all: () => ({ results: [] }) },
+        ]);
+        const provider = { id: 'ollama-free' } as Provider;
+        const result = {
+            classification: 'SUCCESS',
+            publicStatus: 'OPERATIONAL',
+            totalDurationMs: 120,
+            rttMs: 50,
+        } as ProbeResult;
+        // tier already FREE → the UPDATE must be skipped (no write).
+        await materializeStatus(
+            env,
+            provider,
+            { id: 'm1', remote_name: 'm1', tier: 'FREE' } as unknown as Model,
+            result,
+            now(),
+        );
+        expect(runs.some((sql) => /UPDATE models SET tier/.test(sql))).toBe(false);
+
+        // tier differs from the probe-derived tier → the UPDATE must fire once.
+        runs.length = 0;
+        await materializeStatus(
+            env,
+            provider,
+            { id: 'm2', remote_name: 'm2', tier: 'UNKNOWN' } as unknown as Model,
+            result,
+            now(),
+        );
+        const tierWrites = runs.filter((sql) => /UPDATE models SET tier/.test(sql));
+        expect(tierWrites).toHaveLength(1);
+    });
+
+    it('keeps a 403 (SUBSCRIPTION_REQUIRED) as PLAN_REQUIRED without opening an incident', async () => {
+        const { env, runs } = mockEnv([
+            { match: /SELECT \* FROM provider_model_status/, first: () => null },
+            { match: /SELECT classification FROM checks/, all: () => ({ results: [] }) },
+        ]);
+        const provider = { id: 'ollama-free' } as Provider;
+        const result = {
+            classification: 'SUBSCRIPTION_REQUIRED',
+            publicStatus: 'PLAN_REQUIRED',
+            totalDurationMs: null,
+            rttMs: 40,
+        } as unknown as ProbeResult;
+        await materializeStatus(
+            env,
+            provider,
+            { id: 'm3', remote_name: 'm3', tier: 'UNKNOWN' } as unknown as Model,
+            result,
+            now(),
+        );
+        // A 403 flips tier to PAID (one write) but must never insert an incident.
+        expect(runs.some((sql) => /INSERT INTO incidents/.test(sql))).toBe(false);
+        expect(runs.some((sql) => /UPDATE models SET tier/.test(sql))).toBe(true);
     });
 });

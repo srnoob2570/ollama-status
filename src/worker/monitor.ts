@@ -20,6 +20,13 @@ const PROBE_DELAY_MIN_MS_DEFAULT = 0;
 const PROBE_DELAY_MAX_MS_DEFAULT = 5_000;
 const LOCK_LEASE_MS = 6 * 60_000;
 
+// Process-local guards that skip idempotent D1 writes repeated every cron tick. They reset if
+// the Worker isolate is evicted, in which case the guarded write runs once more (still
+// idempotent). Trades negligible staleness for a large write-budget reduction on the free plan.
+let providersSeeded = false;
+let lastRolledHour: string | null = null;
+let lastCleanupDay: string | null = null;
+
 // Probes run in parallel batches so one slow or timing-out model can't stagger the rest of
 // the run across minutes. Concurrency is configurable via PROBE_CONCURRENCY: free API keys
 // allow only 1 in-flight model, so the default stays at 1 to avoid per-model 429s; paid keys
@@ -80,6 +87,7 @@ export function nextCheckTier(
 }
 
 export async function ensureProviders(env: Env): Promise<void> {
+    if (providersSeeded) return;
     const timestamp = now();
     for (const seed of providerSeeds)
         await env.DB.prepare(
@@ -87,6 +95,7 @@ export async function ensureProviders(env: Env): Promise<void> {
         )
             .bind(seed.id, seed.name, env.OLLAMA_BASE_URL, seed.secret, timestamp)
             .run();
+    providersSeeded = true;
 }
 
 export async function acquireLock(env: Env, name: string, owner: string): Promise<boolean> {
@@ -141,31 +150,38 @@ async function syncCatalog(env: Env, provider: Provider): Promise<number | null>
         for (const remote of catalog.models) {
             // Reuse the former free-account ID during the one-time schema transition.
             // It is now the global model identity and preserves all compatible history.
+            const remoteDigest = remote.digest ?? null;
             const existing = await env.DB.prepare(
-                'SELECT id,last_show_at,digest FROM models WHERE provider_id=? AND remote_name=?',
+                'SELECT id,last_show_at,digest,active FROM models WHERE provider_id=? AND remote_name=?',
             )
                 .bind('ollama-free', remote.name)
-                .first<Model>();
+                .first<{ id: string; last_show_at: string | null; digest: string | null; active: number }>();
             const modelId = existing?.id ?? `ollama:${remote.name}`;
-            await env.DB.prepare(
-                `INSERT INTO models(id,provider_id,remote_name,active,excluded,digest,next_check_at,created_at,updated_at)
+            // Skip the upsert when nothing material changed: re-running it would only rewrite
+            // updated_at and reactivate an already-active row with the same digest, burning one
+            // write per model per cycle for no effect. A new model, a digest change, or an
+            // admin-deactivated row (active=0) still re-upserts to (re)insert/refresh as before.
+            if (!existing || existing.digest !== remoteDigest || existing.active !== 1) {
+                await env.DB.prepare(
+                    `INSERT INTO models(id,provider_id,remote_name,active,excluded,digest,next_check_at,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET digest=excluded.digest, active=1, updated_at=excluded.updated_at`,
-            )
-                .bind(
-                    modelId,
-                    provider.id,
-                    remote.name,
-                    1,
-                    excluded(env, remote.name) ? 1 : 0,
-                    remote.digest ?? null,
-                    timestamp,
-                    timestamp,
-                    timestamp,
                 )
-                .run();
+                    .bind(
+                        modelId,
+                        provider.id,
+                        remote.name,
+                        1,
+                        excluded(env, remote.name) ? 1 : 0,
+                        remoteDigest,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    )
+                    .run();
+            }
             if (
                 !existing?.last_show_at ||
-                existing.digest !== remote.digest ||
+                existing.digest !== remoteDigest ||
                 Date.now() - new Date(existing.last_show_at).getTime() >= 24 * 60 * 60_000
             ) {
                 try {
@@ -253,7 +269,7 @@ async function storeProbe(
     await materializeStatus(env, provider, model, result, timestamp);
 }
 
-async function materializeStatus(
+export async function materializeStatus(
     env: Env,
     provider: Provider,
     model: Model,
@@ -327,7 +343,9 @@ async function materializeStatus(
                 : ['SUCCESS', 'HIGH_LATENCY'].includes(result.classification)
                   ? 'FREE'
                   : null;
-        if (tier)
+        // Only persist tier when it actually changes; a stable FREE/PAID model would otherwise
+        // rewrite the same row every probe (one write per model per cycle for no effect).
+        if (tier && model.tier !== tier)
             await env.DB.prepare('UPDATE models SET tier=?,updated_at=? WHERE id=?')
                 .bind(tier, timestamp, model.id)
                 .run();
@@ -495,9 +513,10 @@ async function probeByEntitlement(
     model: Model,
     runId: string,
 ): Promise<void> {
-    await env.DB.prepare("UPDATE monitor_runs SET phase='CHECKING',current_model=? WHERE id=?")
-        .bind(model.remote_name, runId)
-        .run();
+    // Per-model live progress is recorded once at the end by recordModelProgress, which already
+    // sets current_model. The run-level phase is already 'CHECKING' from runMonitor, so a second
+    // per-model write here only refreshed current_model a few seconds earlier at the cost of one
+    // write per model per cycle.
     const freeResult = await probeModel(env, freeProvider, model);
     const entitlement = entitlementFromFreeProbe(freeResult.classification);
     const paidAvailable = Boolean(paidProvider && hasKey(env, paidProvider));
@@ -586,22 +605,32 @@ export async function runMonitor(env: Env, ctx: ExecutionContext): Promise<void>
 }
 
 async function cleanup(env: Env): Promise<void> {
+    // The rollup targets the previous (closed) hour, whose checks have all landed, so re-running
+    // it within the same hour is idempotent. Only write it once per hour instead of every cycle.
     const hour = new Date(Date.now() - 60 * 60_000).toISOString().slice(0, 13);
-    await env.DB.prepare(
-        `INSERT OR REPLACE INTO hourly_model_rollups(model_id,hour_at,sample_count,success_count,avg_latency_ms,p50_latency_ms,p95_latency_ms)
+    if (hour !== lastRolledHour) {
+        await env.DB.prepare(
+            `INSERT OR REPLACE INTO hourly_model_rollups(model_id,hour_at,sample_count,success_count,avg_latency_ms,p50_latency_ms,p95_latency_ms)
     SELECT model_id, ?, COUNT(*), SUM(CASE WHEN classification='SUCCESS' THEN 1 ELSE 0 END), AVG(total_duration_ms), NULL, NULL
     FROM checks WHERE checked_at >= ? AND checked_at < ? GROUP BY model_id`,
-    )
-        .bind(
-            `${hour}:00:00.000Z`,
-            `${hour}:00:00.000Z`,
-            new Date().toISOString().slice(0, 13) + ':00:00.000Z',
         )
-        .run();
-    const threshold = new Date(Date.now() - 90 * 24 * 60 * 60_000).toISOString();
-    await env.DB.prepare('DELETE FROM checks WHERE checked_at < ?').bind(threshold).run();
-    const rollupThreshold = new Date(Date.now() - 730 * 24 * 60 * 60_000).toISOString();
-    await env.DB.prepare('DELETE FROM hourly_model_rollups WHERE hour_at < ?')
-        .bind(rollupThreshold)
-        .run();
+            .bind(
+                `${hour}:00:00.000Z`,
+                `${hour}:00:00.000Z`,
+                new Date().toISOString().slice(0, 13) + ':00:00.000Z',
+            )
+            .run();
+        lastRolledHour = hour;
+    }
+    // Retention deletes are idempotent; run them once per UTC day instead of every 5-minute cycle.
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== lastCleanupDay) {
+        const threshold = new Date(Date.now() - 90 * 24 * 60 * 60_000).toISOString();
+        await env.DB.prepare('DELETE FROM checks WHERE checked_at < ?').bind(threshold).run();
+        const rollupThreshold = new Date(Date.now() - 730 * 24 * 60 * 60_000).toISOString();
+        await env.DB.prepare('DELETE FROM hourly_model_rollups WHERE hour_at < ?')
+            .bind(rollupThreshold)
+            .run();
+        lastCleanupDay = today;
+    }
 }
