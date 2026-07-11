@@ -15,19 +15,11 @@ type HistoryBucket = {
     latencySamples: number;
     segments?: HistorySegment[];
 };
-type Metrics = {
-    p50LatencyMs: number | null;
-    p95LatencyMs: number | null;
-    samples: number;
-    latencySource: 'TOTAL_DURATION' | 'RTT' | null;
-};
 type Model = {
     id: string;
     remote_name: string;
     tier: 'FREE' | 'PAID' | 'UNKNOWN';
     effectiveStatus: string;
-    lastCheckAt: string | null;
-    metrics: Metrics;
     history: HistoryBucket[];
 };
 type MonitorRun = {
@@ -326,11 +318,8 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
             />
             <div className="model-copy">
                 <strong className="model-name">{model.remote_name}</strong>
-                <span className="access">
-                    {label} · {checkedAgo(model.lastCheckAt)}
-                </span>
+                <span className="access">{label}</span>
             </div>
-            <p className="latency">{metricLabel(model.metrics)}</p>
             <History model={model} range={range} />
         </article>
     );
@@ -417,8 +406,7 @@ function History({ model, range }: { model: Model; range: HistoryRange }) {
                 const data = describeBucket(bucket, range);
                 const show = (event: { currentTarget: HTMLElement }) =>
                     setActive({ key, rect: event.currentTarget.getBoundingClientRect(), data });
-                const hide = () =>
-                    setActive((current) => (current?.key === key ? null : current));
+                const hide = () => setActive((current) => (current?.key === key ? null : current));
                 return (
                     <span
                         className={`history-bar ${data.segments.length ? '' : data.headlineTone}`}
@@ -532,21 +520,6 @@ function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription
         </div>,
         document.body,
     );
-}
-
-function checkedAgo(value: string | null): string {
-    if (!value) return 'not checked yet';
-    const minutes = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60_000));
-    if (minutes < 1) return 'checked just now';
-    if (minutes < 60) return `checked ${minutes} min ago`;
-    const hours = Math.round(minutes / 60);
-    if (hours < 24) return `checked ${hours}h ago`;
-    return `checked ${Math.round(hours / 24)}d ago`;
-}
-
-function metricLabel(metrics: Metrics): string {
-    if (!metrics.samples) return 'p50 — · p95 —';
-    return `p50 ${Math.round(metrics.p50LatencyMs ?? 0)} ms · p95 ${Math.round(metrics.p95LatencyMs ?? 0)} ms`;
 }
 
 function bucketLabel(value: string, range: HistoryRange): string {

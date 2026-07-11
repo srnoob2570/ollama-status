@@ -98,7 +98,7 @@ time,
     padding: 16px 4px;
     gap: 12px;
     display: grid;
-    grid-template-columns: auto minmax(150px, 1fr) 180px 390px;
+    grid-template-columns: auto minmax(150px, 1fr) 390px;
 }
 .model:last-child {
     border-bottom: 0;
@@ -112,15 +112,10 @@ time,
     font-weight: 650;
     overflow-wrap: anywhere;
 }
-.access,
-.latency {
+.access {
     color: #91a2bc;
     font-size: 0.82rem;
     margin: 0;
-}
-.latency {
-    white-space: nowrap;
-    text-align: right;
 }
 .dot {
     width: 9px;
@@ -338,10 +333,6 @@ time,
     .model {
         grid-template-columns: auto minmax(0, 1fr);
         gap: 10px;
-    }
-    .latency {
-        grid-column: 2;
-        text-align: left;
     }
     .history {
         grid-column: 1/-1;
