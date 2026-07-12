@@ -4,6 +4,10 @@ import type { ProbeResult, Provider } from './types.ts';
 // Probe fetch abort threshold. Exported so runMonitor's time-box margin can absorb a full
 // in-flight probe when computing the per-tick deadline (see runDeadlineMs in monitor.ts).
 export const PROBE_TIMEOUT_MS = 45_000;
+// Catalog metadata calls (/tags, /show) previously ran bounded only by the run-level hard stop
+// (5 min): one stalled fetch held the whole run open and the UI reported "monitor stuck" until
+// the next scheduler cycle. Generous for metadata endpoints that normally answer in <2s.
+const CATALOG_TIMEOUT_MS = 20_000;
 const maxResponseBytes = 64 * 1024;
 const probeMessage = 'Reply with OK.';
 
@@ -65,27 +69,48 @@ export class OllamaProvider {
         return `${this.provider.base_url.replace(/\/$/, '')}${path}`;
     }
 
-    async tags(
-        signal?: AbortSignal,
-    ): Promise<{ models: Array<{ name: string; digest?: string }> }> {
-        const response = await fetch(this.url('/tags'), { headers: this.headers(), signal });
-        if (!response.ok) throw new OllamaHttpError(response.status);
-        const body = (await response.json()) as {
-            models?: Array<{ name: string; digest?: string }>;
-        };
-        if (!Array.isArray(body.models)) throw new Error('catalog_protocol');
-        return { models: body.models };
+    // Merges the caller's run-level signal with this call's own timer, mirroring probe(): either
+    // one aborting cancels the in-flight fetch and any pending body read.
+    private catalogSignal(parentSignal?: AbortSignal): { signal: AbortSignal; timer: ReturnType<typeof setTimeout> } {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CATALOG_TIMEOUT_MS);
+        const signal = parentSignal
+            ? AbortSignal.any([controller.signal, parentSignal])
+            : controller.signal;
+        return { signal, timer };
     }
 
-    async show(model: string, signal?: AbortSignal): Promise<unknown> {
-        const response = await fetch(this.url('/show'), {
-            method: 'POST',
-            headers: this.headers(),
-            body: JSON.stringify({ model }),
-            signal,
-        });
-        if (!response.ok) throw new OllamaHttpError(response.status);
-        return response.json();
+    async tags(
+        parentSignal?: AbortSignal,
+    ): Promise<{ models: Array<{ name: string; digest?: string }> }> {
+        const { signal, timer } = this.catalogSignal(parentSignal);
+        try {
+            const response = await fetch(this.url('/tags'), { headers: this.headers(), signal });
+            if (!response.ok) throw new OllamaHttpError(response.status);
+            const body = (await response.json()) as {
+                models?: Array<{ name: string; digest?: string }>;
+            };
+            if (!Array.isArray(body.models)) throw new Error('catalog_protocol');
+            return { models: body.models };
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async show(model: string, parentSignal?: AbortSignal): Promise<unknown> {
+        const { signal, timer } = this.catalogSignal(parentSignal);
+        try {
+            const response = await fetch(this.url('/show'), {
+                method: 'POST',
+                headers: this.headers(),
+                body: JSON.stringify({ model }),
+                signal,
+            });
+            if (!response.ok) throw new OllamaHttpError(response.status);
+            return await response.json();
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     async probe(
