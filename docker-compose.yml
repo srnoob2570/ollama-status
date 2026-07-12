@@ -7,6 +7,7 @@ services:
       - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
     restart: "no"
     networks:
+      - default
       - coolify
 
   cloudflared:
@@ -45,6 +46,7 @@ services:
       start_period: 10s
     restart: unless-stopped
     networks:
+      - default
       - coolify
 
   runner:
@@ -84,7 +86,9 @@ services:
       start_period: 10s
     restart: unless-stopped
     networks:
+      - default
       - coolify
+
 networks:
   coolify:
     external: true
