@@ -26,6 +26,7 @@ type Model = {
     tier: 'FREE' | 'PAID' | 'UNKNOWN';
     intervalMinutes: number;
     effectiveStatus: string;
+    effectiveClassification: string;
     history: HistoryBucket[];
 };
 type MonitorRun = {
@@ -87,6 +88,25 @@ const statusSeverity: Record<string, number> = {
     OPERATIONAL: 3,
     UNKNOWN: 4,
 };
+const availabilityReasons: Record<string, string> = {
+    HIGH_LATENCY: 'The model responded, but more slowly than the monitor threshold.',
+    TIMEOUT: 'The monitoring request timed out before the model responded.',
+    NETWORK_ERROR: 'The monitor could not reach the provider.',
+    AUTH_ERROR: 'The monitoring credentials were rejected by the provider.',
+    RATE_LIMITED: 'The provider is temporarily limiting monitoring requests.',
+    MODEL_NOT_FOUND: 'The model is no longer available in the provider catalog.',
+    MODEL_UNREACHABLE: 'The provider returned a server error while reaching the model.',
+    OVERLOADED: 'The provider is currently overloaded.',
+    EMPTY_RESPONSE: 'The model did not return a usable response.',
+    PROTOCOL_ERROR: 'The provider returned an unexpected response to the monitor.',
+    INVALID_REQUEST: 'The provider rejected the monitoring request.',
+    SUBSCRIPTION_REQUIRED: 'This model requires a paid subscription.',
+    UNKNOWN: 'The monitor has not received a diagnostic result for this model yet.',
+};
+
+function availabilityReason(status: string, classification: string): string | null {
+    return status === 'OPERATIONAL' ? null : availabilityReasons[classification] ?? null;
+}
 
 export function App() {
     const [range, setRange] = useState<HistoryRange>('1h');
@@ -155,6 +175,12 @@ export function App() {
                     <p className="eyebrow">OLLAMA CLOUD</p>
                     <h1>Service status</h1>
                     <p className="subtle">{cadenceLegend(status.checkIntervals)}</p>
+                    <p className="project-disclaimer">
+                        This is an independent, community-operated monitor. It is not an official
+                        Ollama service and is not affiliated with, endorsed by, or operated by
+                        Ollama. Availability is measured by automated checks and may differ from
+                        your own account or region.
+                    </p>
                 </div>
                 <div className="monitor-meta">
                     <LastDataUpdate value={status.lastUpdatedAt} />
@@ -343,6 +369,7 @@ function ModelCategory({
 
 function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
     const label = labels[model.effectiveStatus] ?? 'Unknown';
+    const reason = availabilityReason(model.effectiveStatus, model.effectiveClassification);
     return (
         <article className="model">
             <span
@@ -352,7 +379,9 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
             <div className="model-copy">
                 <strong className="model-name">{model.remote_name}</strong>
                 <div className="model-tags">
-                    <span className="access">{label}</span>
+                    <span className="access" title={reason ?? undefined}>
+                        {label}
+                    </span>
                 </div>
             </div>
             <History model={model} range={range} />

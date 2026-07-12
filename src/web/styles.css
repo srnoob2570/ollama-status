@@ -45,6 +45,13 @@ time,
     color: #91a2bc;
     font-size: 0.9rem;
 }
+.project-disclaimer {
+    max-width: 620px;
+    margin: 14px 0 0;
+    color: #a4b2c8;
+    font-size: 0.82rem;
+    line-height: 1.55;
+}
 .summary {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
@@ -319,9 +326,10 @@ time,
     border-color: #684c2b;
 }
 .range-control {
-    position: sticky;
-    top: 12px;
-    z-index: 2;
+    position: fixed;
+    right: max(24px, calc((100vw - 980px) / 2 + 24px));
+    bottom: 24px;
+    z-index: 10;
     display: flex;
     width: max-content;
     padding: 4px;
@@ -367,7 +375,8 @@ time,
         height: 28px;
     }
     .range-control {
-        top: 8px;
+        right: 16px;
+        bottom: 16px;
     }
 }
 @media (max-width: 600px) {
