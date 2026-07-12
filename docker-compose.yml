@@ -6,6 +6,8 @@ services:
     environment:
       - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
     restart: "no"
+    networks:
+      - coolify
 
   cloudflared:
     image: cloudflare/cloudflared:latest
