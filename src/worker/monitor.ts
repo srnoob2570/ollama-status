@@ -1,15 +1,15 @@
-import { OllamaHttpError, OllamaProvider, PROBE_TIMEOUT_MS } from './ollama';
-import { entitlementFromFreeProbe, shouldProbePaid } from './entitlement';
-import { maxResponseTokens } from './probe-config';
+import { OllamaHttpError, OllamaProvider, PROBE_TIMEOUT_MS } from './ollama.ts';
+import { entitlementFromFreeProbe, shouldProbePaid } from './entitlement.ts';
+import { maxResponseTokens } from './probe-config.ts';
 import {
     CRON_INTERVAL_MS,
     eligibilityCutoff,
     nextCheckAt,
     nominalCheckIntervalMinutes,
     trimmedMean,
-} from './status';
-import type { Classification, Env, Model, ProbeResult, Provider } from './types';
-import { id, now } from './types';
+} from './status.ts';
+import type { Classification, Env, Model, ProbeResult, Provider } from './types.ts';
+import { id, now } from './types.ts';
 
 const providerSeeds = [
     { id: 'ollama-free', name: 'Ollama Cloud Free', secret: 'OLLAMA_API_KEY_FREE' },

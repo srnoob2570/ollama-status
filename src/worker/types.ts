@@ -25,8 +25,20 @@ export type PublicStatus =
     | 'PLAN_REQUIRED'
     | 'UNKNOWN';
 
+export interface D1StatementLike {
+    bind(...values: unknown[]): D1StatementLike;
+    run(): Promise<{ meta: { changes: number } }>;
+    all<T = unknown>(): Promise<{ results: T[] }>;
+    first<T = unknown>(): Promise<T | null>;
+}
+
+export interface D1DatabaseLike {
+    prepare(query: string): D1StatementLike;
+    batch(statements: D1StatementLike[]): Promise<{ meta: { changes: number } }[]>;
+}
+
 export interface Env {
-    DB: D1Database;
+    DB: D1DatabaseLike;
     ASSETS: Fetcher;
     OLLAMA_BASE_URL: string;
     OLLAMA_MAX_TOKENS?: string;

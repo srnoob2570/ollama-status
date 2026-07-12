@@ -1,6 +1,6 @@
-import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status';
-import type { Env } from './types';
-import { now } from './types';
+import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status.ts';
+import type { Env } from './types.ts';
+import { now } from './types.ts';
 
 const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
@@ -427,6 +427,14 @@ export async function api(
 }
 
 async function publicGetResponse(request: Request, env: Env, path: string): Promise<Response> {
+    if (path === '/api/health') {
+        try {
+            await env.DB.prepare('SELECT 1').first();
+            return json({ ok: true, time: now() });
+        } catch {
+            return json({ ok: false }, 503);
+        }
+    }
     if (path === '/api/v1/status')
         return publicStatus(env, new URL(request.url).searchParams.get('range'));
     if (path === '/api/v1/incidents') return incidents(env);

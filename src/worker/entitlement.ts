@@ -1,4 +1,4 @@
-import type { Classification } from './types';
+import type { Classification } from './types.ts';
 
 export type Entitlement = 'FREE' | 'PAID' | 'UNKNOWN';
 

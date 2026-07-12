@@ -1,4 +1,4 @@
-import type { Classification, PublicStatus } from './types';
+import type { Classification, PublicStatus } from './types.ts';
 
 export interface CheckIntervalConfig {
     FREE_CHECK_INTERVAL_MINUTES?: string;

@@ -1,5 +1,5 @@
-import { classifyHttp, isLatencyAnomalous, publicStatusFor } from './status';
-import type { ProbeResult, Provider } from './types';
+import { classifyHttp, isLatencyAnomalous, publicStatusFor } from './status.ts';
+import type { ProbeResult, Provider } from './types.ts';
 
 // Probe fetch abort threshold. Exported so runMonitor's time-box margin can absorb a full
 // in-flight probe when computing the per-tick deadline (see runDeadlineMs in monitor.ts).
@@ -36,11 +36,15 @@ function isChatChunk(value: unknown): value is ChatChunk {
 }
 
 export class OllamaProvider {
-    constructor(
-        private readonly provider: Provider,
-        private readonly apiKey: string,
-        private readonly maxResponseTokens = 8,
-    ) {}
+    private readonly provider: Provider;
+    private readonly apiKey: string;
+    private readonly maxResponseTokens: number;
+
+    constructor(provider: Provider, apiKey: string, maxResponseTokens = 8) {
+        this.provider = provider;
+        this.apiKey = apiKey;
+        this.maxResponseTokens = maxResponseTokens;
+    }
 
     private headers() {
         return { Authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' };
@@ -247,7 +251,10 @@ function protocolError(started: number, errorCode: string): ProbeResult {
 }
 
 export class OllamaHttpError extends Error {
-    constructor(readonly status: number) {
+    readonly status: number;
+
+    constructor(status: number) {
         super(`http_${status}`);
+        this.status = status;
     }
 }
