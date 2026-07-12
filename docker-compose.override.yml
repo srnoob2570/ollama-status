@@ -1,5 +1,3 @@
-# Se carga automáticamente junto a docker-compose.yml en desarrollo local.
-# No usar este archivo en Coolify: allí DATABASE_URL debe apuntar al PostgreSQL gestionado.
 services:
   postgres:
     image: postgres:16-alpine
