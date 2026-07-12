@@ -1,4 +1,5 @@
 import { api } from './api';
+import { drainManualMonitorJobs } from './monitor-jobs';
 import { runMonitor } from './monitor';
 import type { Env } from './types';
 
@@ -13,6 +14,7 @@ export default {
         env: Env,
         ctx: ExecutionContext,
     ): Promise<void> {
-        await runMonitor(env, ctx, controller.scheduledTime);
+        const job = await drainManualMonitorJobs(env, ctx);
+        if (!job) await runMonitor(env, ctx, controller.scheduledTime);
     },
 } satisfies ExportedHandler<Env>;

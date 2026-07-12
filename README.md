@@ -66,6 +66,25 @@ OLLAMA_API_KEY=replace-with-disposable-key npm run quota:test -- --dry-run
 
 Optional variables are `OLLAMA_BASE_URL` (default `https://ollama.com/api`), `OLLAMA_QUOTA_MODEL` (default `gemma4:31b`), `OLLAMA_QUOTA_REQUESTS` (15–30; default `20`), and `OLLAMA_QUOTA_MAX_TOKENS` (1–4096; default `256`). The script continues after failures, including `429`, without retries so its final JSON summary shows all attempted consumption. Review the Ollama usage dashboard manually after it finishes; usage can appear with a delay.
 
+## Run the monitor remotely
+
+`npm run monitor:run` submits one authenticated monitor job to an existing Cloudflare or Node/Coolify deployment. It uses the ordinary monitor flow, including its lock, catalog recovery, cleanup, and normal `next_check_at` cadence: it does not force probes for models that are not yet due.
+
+Set these variables in the shell that invokes the command. The script deliberately does not load `.dev.vars` or any env file.
+
+| Variable | Description |
+| --- | --- |
+| `OLLAMA_STATUS_URL` | Public deployment base URL, for example `https://status.example.com`. A trailing slash is accepted. |
+| `CONFIRMATION_HMAC_SECRET` | Same secret used for external confirmation callbacks; it signs the timestamped request body with HMAC-SHA256. |
+
+```sh
+OLLAMA_STATUS_URL=https://status.example.com \
+CONFIRMATION_HMAC_SECRET=replace-with-the-configured-secret \
+npm run monitor:run
+```
+
+The command prints the endpoint JSON response and exits successfully for `202 { jobId, state: "QUEUED" }`. Only one manual job may be active; a concurrent request receives the active job ID. The runner records the final result in normal monitor history and logs. Invalid/expired timestamps return `400`, invalid signatures `401`, an absent shared secret `503`, and oversized requests `413`.
+
 ## Deploy safely
 
 Replace all `REPLACE_WITH_*_D1_ID` values in `wrangler.jsonc` and configure the custom-domain routes in Cloudflare. Apply migrations before each Worker deployment:
@@ -84,15 +103,34 @@ Run `npm run spike` in staging before enabling any request variant with `raw`; t
 
 ## Node.js + Docker (Coolify)
 
-Cloudflare is the primary target, but the same code also runs as a plain Node.js process, so it can be deployed on a VPS with Coolify, plain Docker Compose, or any container platform. This target replaces D1 with `node:sqlite`, the Workers Cache API with an in-process `Map`, and Cron Triggers with `node-cron` — the monitor and API logic in `src/worker/` are unchanged and shared between both targets.
+Cloudflare is the primary target, but the same code also runs on Node.js for Coolify. This target replaces D1 with managed PostgreSQL, the Workers Cache API with an in-process `Map`, and Cron Triggers with a private runner — the monitor and API logic in `src/worker/` are shared between both targets.
 
 ### Local setup
 
+Set `DATABASE_URL` plus the required runner secrets, then start the Compose stack. PostgreSQL is deliberately external to this file (a Coolify managed resource in production).
+
 ```sh
+DATABASE_URL=postgres://user:password@host:5432/ollama_status \
+OLLAMA_API_KEY_FREE=... OLLAMA_API_KEY_PAID=... \
+CONFIRMATION_HMAC_SECRET=... \
 docker compose up --build
 ```
 
-This reuses the same `.dev.vars` file as `wrangler dev` (via `env_file` in `docker-compose.yml`) for the Ollama API keys. On first start it runs `scripts/migrate-node.mjs`, applying the same SQL files from `migrations/` against a SQLite database stored in the `sqlite-data` volume (`/app/data/ollama-status.sqlite`); later starts skip migrations already applied. The dashboard is then available at `http://localhost:3000/`.
+`migrate` applies the PostgreSQL-only migrations before `web` and `runner` start. `web` serves the SPA, public API, health check, confirmations, and manual-job enqueueing. `runner` has no published port, keeps the `*/5 * * * *` UTC cadence, and polls the manual queue every five seconds.
+
+### Deployment through Cloudflare Tunnel
+
+1. In Cloudflare Zero Trust, create a remotely managed tunnel and configure its public hostname with the service URL `http://web:3000`.
+2. Save the tunnel token in the deployment host's `.dev.vars` file as `TUNNEL_TOKEN=...`. Keep this file out of Git.
+3. Deploy the stack:
+
+   ```sh
+   docker compose --env-file .dev.vars up --build -d
+   ```
+
+4. Validate the service at `https://ollama-status-staging.bitario.dev/api/health`, then open `https://ollama-status-staging.bitario.dev` to check the dashboard.
+
+`cloudflared` is part of the main Compose stack and waits for `web` to be healthy. No container port is exposed on the host; the tunnel reaches `web` through the internal Compose network at `http://web:3000`.
 
 To iterate without Docker:
 
@@ -106,22 +144,20 @@ npm run dev:node
 
 Same names as the Cloudflare `vars`/secrets tables above — set them as plain environment variables (or in `.dev.vars` for local Docker use, or through the Coolify UI in production). Additionally:
 
-| Variable  | Default                          | Description                                                    |
-| --------- | --------------------------------- | --------------------------------------------------------------- |
-| `PORT`    | `3000`                            | HTTP port the Node server listens on.                          |
-| `DB_PATH` | `./data/ollama-status.sqlite`     | Path to the SQLite database file (set to `/app/data/ollama-status.sqlite` in `docker-compose.yml` to match the persisted volume). |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATABASE_URL` | _(required)_ | PostgreSQL connection URL provided by Coolify; use its full internal hostname when the stack joins the predefined network. |
+| `PORT` | `3000` | HTTP port of the public `web` service. |
+| `TUNNEL_TOKEN` | _(required)_ | Token for the remotely managed Cloudflare Tunnel used by the `cloudflared` service. |
 
-The SQLite database used by this target is independent from Cloudflare D1 — there is no data sync between a Cloudflare deployment and a Node/Docker deployment of the same app.
+The PostgreSQL database used by this target is independent from Cloudflare D1 — there is no data sync between a Cloudflare deployment and a Node/Coolify deployment of the same app.
 
 If the cron cadence (`*/5 * * * *`) is ever changed, update it in all three places that must stay in sync: `wrangler.jsonc` (Cron Trigger), `src/node/server.ts` (`node-cron` schedule), and `CRON_INTERVAL_MS` in `src/worker/status.ts`.
 
-An `ExperimentalWarning: SQLite is an experimental feature` line in the logs is expected and benign — it comes from Node's built-in `node:sqlite` module.
-
 ### Deploying to Coolify
 
-1. Point Coolify at this repository; it will detect the `Dockerfile`.
-2. Attach a persistent volume mounted at `/app/data` (holds the SQLite database).
-3. Set the environment variables from the table above (and the Ollama API keys) through the Coolify UI — do not bake secrets into the image.
-4. Expose port `3000`.
-
-This path has not been verified against a live Coolify instance from this environment; it has been verified locally with `docker build`, `docker compose up`, and a full monitor cycle against the containerized server.
+1. Create PostgreSQL as a managed Coolify database, then enable **Connect to Predefined Network** for this Compose stack. Set `DATABASE_URL` from Coolify's full internal hostname; do not commit it.
+2. Create a **Docker Compose** application using this repository. Coolify detects the interpolated variables: `DATABASE_URL` is required by all three services; Ollama keys and GitHub confirmation credentials are required only by `runner`; `web` receives neither Ollama nor GitHub credentials.
+3. Configure the Cloudflare Tunnel public hostname to point to `http://web:3000`, and set `TUNNEL_TOKEN` in the application's environment. Do not assign Coolify domains or host ports to any service.
+4. Configure the database's S3 backup in Coolify for daily 02:00 UTC backups with 30-day retention. Keep S3 credentials only in Coolify. Restore one backup into a temporary instance before declaring the deployment complete.
+5. Deploy an empty PostgreSQL resource, let `migrate` complete, verify `/api/health`, submit `npm run monitor:run`, and observe a periodic runner cycle.

@@ -1,31 +1,81 @@
 services:
-  ollama-status:
+  migrate:
     build: .
-    ports:
-      - "3000:3000"
+    command: ["node", "scripts/migrate-node.mjs"]
+    x-coolify-exclude_from_hc: true
     environment:
-      PORT: "3000"
-      DB_PATH: /app/data/ollama-status.sqlite
-      OLLAMA_BASE_URL: https://ollama.com/api
-      OLLAMA_MAX_TOKENS: "8"
-      FREE_CHECK_INTERVAL_MINUTES: "5"
-      PAID_CHECK_INTERVAL_MINUTES: "10"
-      FREE_PROBE_CONCURRENCY: "1"
-      PAID_PROBE_CONCURRENCY: "6"
-      PROBE_DELAY_MIN_MS: "0"
-      PROBE_DELAY_MAX_MS: "5000"
-      EXCLUDED_MODELS: ""
-      CONFIRMATION_CALLBACK_URL: ""
-    env_file:
-      - .dev.vars
-    volumes:
-      - sqlite-data:/app/data
+      - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
+    restart: "no"
+
+  web:
+    build: .
+    command: ["node", "src/node/server.ts"]
+    environment:
+      - PORT=${PORT:-3000}
+      - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
+      - CONFIRMATION_HMAC_SECRET=${CONFIRMATION_HMAC_SECRET:?Set the monitor request signing secret}
+      - FREE_CHECK_INTERVAL_MINUTES=${FREE_CHECK_INTERVAL_MINUTES:-5}
+      - PAID_CHECK_INTERVAL_MINUTES=${PAID_CHECK_INTERVAL_MINUTES:-10}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
     restart: unless-stopped
-volumes:
-  sqlite-data:
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?Set the Cloudflare Tunnel token}
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+
+  runner:
+    build: .
+    command: ["node", "src/node/runner.ts"]
+    environment:
+      - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-https://ollama.com/api}
+      - OLLAMA_API_KEY_FREE=${OLLAMA_API_KEY_FREE:?Set the free Ollama API key}
+      - OLLAMA_API_KEY_PAID=${OLLAMA_API_KEY_PAID:?Set the paid Ollama API key}
+      - OLLAMA_MAX_TOKENS=${OLLAMA_MAX_TOKENS:-8}
+      - FREE_CHECK_INTERVAL_MINUTES=${FREE_CHECK_INTERVAL_MINUTES:-5}
+      - PAID_CHECK_INTERVAL_MINUTES=${PAID_CHECK_INTERVAL_MINUTES:-10}
+      - FREE_PROBE_CONCURRENCY=${FREE_PROBE_CONCURRENCY:-1}
+      - PAID_PROBE_CONCURRENCY=${PAID_PROBE_CONCURRENCY:-6}
+      - PROBE_DELAY_MIN_MS=${PROBE_DELAY_MIN_MS:-0}
+      - PROBE_DELAY_MAX_MS=${PROBE_DELAY_MAX_MS:-5000}
+      - EXCLUDED_MODELS=${EXCLUDED_MODELS:-}
+      - CONFIRMATION_CALLBACK_URL=${CONFIRMATION_CALLBACK_URL:-}
+      - GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}
+      - GITHUB_ACTIONS_TOKEN=${GITHUB_ACTIONS_TOKEN:-}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
