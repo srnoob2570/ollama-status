@@ -269,9 +269,12 @@ async function syncCatalog(
         const code =
             error instanceof OllamaHttpError
                 ? `HTTP_${error.status}`
-                : error instanceof TypeError
-                  ? 'NETWORK'
-                  : 'CATALOG_ERROR';
+                : error instanceof DOMException && error.name === 'AbortError'
+                  ? 'CATALOG_TIMEOUT'
+                  : error instanceof TypeError
+                    ? 'NETWORK'
+                    : 'CATALOG_ERROR';
+        console.warn(`catalog sync failed (${code}): ${error}`);
         await env.DB.prepare(
             'UPDATE providers SET catalog_status=?,catalog_checked_at=? WHERE id=?',
         )
