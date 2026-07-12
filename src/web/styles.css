@@ -231,6 +231,21 @@ time,
     gap: 7px;
     font-weight: 600;
 }
+.tt-reason {
+    display: grid;
+    gap: 3px;
+    padding-top: 8px;
+    border-top: 1px solid #1b2c45;
+    color: #c3cede;
+    line-height: 1.4;
+}
+.tt-reason-label {
+    color: #91a2bc;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
 .tt-metrics {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -326,12 +341,9 @@ time,
     border-color: #684c2b;
 }
 .range-control {
-    position: fixed;
-    right: max(24px, calc((100vw - 980px) / 2 + 24px));
-    bottom: 24px;
-    z-index: 10;
     display: flex;
     width: max-content;
+    margin: 28px 0 0 auto;
     padding: 4px;
     gap: 4px;
     box-shadow: 0 8px 20px #02081299;
@@ -373,10 +385,6 @@ time,
         grid-column: 1/-1;
         width: 100%;
         height: 28px;
-    }
-    .range-control {
-        right: 16px;
-        bottom: 16px;
     }
 }
 @media (max-width: 600px) {

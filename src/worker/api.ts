@@ -53,7 +53,7 @@ export type HistoryExecution = {
     completed_at: string | null;
     state: HistoryExecutionState;
 };
-export type HistorySegment = { status: string; checks: number };
+export type HistorySegment = { status: string; classification?: string; checks: number };
 export type HistoryBucket = {
     startAt: string;
     status: string;
@@ -136,7 +136,7 @@ export function historyBuckets(
         startAt: new Date(config.start.getTime() + index * config.bucketDurationMs).toISOString(),
         status: 'UNKNOWN',
         checks: 0,
-        segmentCounts: new Map<string, number>(),
+        segmentCounts: new Map<string, { status: string; classification: string; checks: number }>(),
         totalDurations: [] as number[],
         rtts: [] as number[],
         pending: false,
@@ -153,10 +153,15 @@ export function historyBuckets(
             : check.public_status;
         bucket.checks += 1;
         bucket.pending = false;
-        bucket.segmentCounts.set(
-            check.public_status,
-            (bucket.segmentCounts.get(check.public_status) ?? 0) + 1,
-        );
+        const segmentKey = `${check.public_status}:${check.classification}`;
+        const segment = bucket.segmentCounts.get(segmentKey);
+        if (segment) segment.checks += 1;
+        else
+            bucket.segmentCounts.set(segmentKey, {
+                status: check.public_status,
+                classification: check.classification,
+                checks: 1,
+            });
         if (typeof check.total_duration_ms === 'number')
             bucket.totalDurations.push(check.total_duration_ms);
         if (typeof check.rtt_ms === 'number') bucket.rtts.push(check.rtt_ms);
@@ -166,8 +171,7 @@ export function historyBuckets(
         const averageLatencyMs = timings.length
             ? timings.reduce((sum, value) => sum + value, 0) / timings.length
             : null;
-        const segments = [...segmentCounts]
-            .map(([status, checks]) => ({ status, checks }))
+        const segments = [...segmentCounts.values()]
             .sort(
                 (left, right) =>
                     (statusWeight[right.status] ?? statusWeight.UNKNOWN) -
@@ -200,7 +204,9 @@ function completedExecutionBucket(
         executionState,
         status: check.public_status,
         checks: 1,
-        segments: [{ status: check.public_status, checks: 1 }],
+        segments: [
+            { status: check.public_status, classification: check.classification, checks: 1 },
+        ],
         averageLatencyMs: latency,
         latencySamples: latency === null ? 0 : 1,
         pending: false,

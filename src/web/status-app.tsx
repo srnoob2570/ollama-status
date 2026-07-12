@@ -6,6 +6,7 @@ import { nextUpdateLabel } from './next-update';
 type HistoryRange = '1h' | '24h' | '7d' | '30d';
 type HistorySegment = {
     status: string;
+    classification?: string;
     checks: number;
 };
 type HistoryBucket = {
@@ -105,7 +106,11 @@ const availabilityReasons: Record<string, string> = {
 };
 
 function availabilityReason(status: string, classification: string): string | null {
-    return status === 'OPERATIONAL' ? null : availabilityReasons[classification] ?? null;
+    if (status === 'OPERATIONAL') return null;
+    return (
+        availabilityReasons[classification] ??
+        'The monitor recorded this model as unavailable, but no further diagnostic was returned.'
+    );
 }
 
 export function App() {
@@ -187,7 +192,6 @@ export function App() {
                     <StatusSignals status={status} />
                 </div>
             </header>
-            <RangeSelector range={range} onChange={setRange} />
             {status.stale && (
                 <section className="notice error">
                     MONITOR STALE — no scheduler run has started in the last 20 minutes.
@@ -234,6 +238,7 @@ export function App() {
                 models={status.models.filter((model) => model.tier === 'UNKNOWN')}
                 range={status.range}
             />
+            <RangeSelector range={range} onChange={setRange} />
         </main>
     );
 }
@@ -393,6 +398,7 @@ type BucketSegmentView = {
     status: string;
     label: string;
     tone: string;
+    classification?: string;
     checks: number;
     proportion: number;
 };
@@ -402,6 +408,7 @@ type BucketDescription = {
     headlineLabel: string;
     headlineTone: string;
     headlinePrefix: string | null;
+    reason: string | null;
     checks: number;
     averageLatencyMs: number | null;
     segments: BucketSegmentView[];
@@ -431,6 +438,7 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
         status: segment.status,
         label: labels[segment.status] ?? 'Unknown',
         tone: statusTone[segment.status] ?? 'unknown',
+        classification: segment.classification,
         checks: segment.checks,
         proportion: segmentTotal ? Math.round((segment.checks / segmentTotal) * 100) : 0,
     }));
@@ -453,6 +461,13 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
         : bucket.pending
           ? 'pending'
           : 'unknown';
+    const reason = hasData
+        ? availabilityReason(
+              bucket.status,
+              ranked.find((segment) => segment.status === bucket.status)?.classification ??
+                  'UNKNOWN',
+          )
+        : null;
     const checksText = bucket.checks === 1 ? '1 check' : `${bucket.checks} checks`;
     const averageText =
         bucket.averageLatencyMs === null
@@ -461,8 +476,8 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
     const headline = headlinePrefix ? `worst status ${headlineLabel}` : headlineLabel;
     const ariaLabel = hasData
         ? isExecution
-            ? `${time} scheduled · ${checkedTime ?? 'unknown result time'} · ${headline} · ${averageText}`
-            : `${time} · ${headline} · ${checksText} · ${averageText}`
+            ? `${time} scheduled · ${checkedTime ?? 'unknown result time'} · ${headline}${reason ? ` · ${reason}` : ''} · ${averageText}`
+            : `${time} · ${headline}${reason ? ` · ${reason}` : ''} · ${checksText} · ${averageText}`
         : bucket.pending
           ? `${time} · pending next check`
           : isExecution
@@ -474,6 +489,7 @@ function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescr
         headlineLabel,
         headlineTone,
         headlinePrefix,
+        reason,
         checks: bucket.checks,
         averageLatencyMs: bucket.averageLatencyMs,
         segments,
@@ -571,6 +587,12 @@ function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription
                         : data.headlineLabel}
                 </span>
             </div>
+            {data.reason && (
+                <div className="tt-reason">
+                    <span className="tt-reason-label">Why</span>
+                    <span>{data.reason}</span>
+                </div>
+            )}
             {data.isExecution && (
                 <div className="tt-metrics">
                     <span className="tt-metric-label">Scheduled</span>

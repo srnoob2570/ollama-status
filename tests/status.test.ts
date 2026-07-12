@@ -118,6 +118,7 @@ describe('Ollama status classification', () => {
             checkedAt: '2026-07-10T13:32:55.000Z',
             executionState: 'COMPLETED',
             status: 'DEGRADED',
+            segments: [{ status: 'DEGRADED', classification: 'HIGH_LATENCY', checks: 1 }],
             checks: 1,
             averageLatencyMs: 175_000,
         });
