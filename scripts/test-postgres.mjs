@@ -3,8 +3,8 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { Pool } from 'pg';
 import { PostgresD1Adapter } from '../src/node/postgres-d1-adapter.ts';
+import { createPostgresPool } from '../src/node/postgres-pool.ts';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error('TEST_DATABASE_URL is required (use a dedicated disposable database)');
@@ -15,7 +15,7 @@ await execFile(process.execPath, ['scripts/migrate-node.mjs'], {
     stdio: 'inherit',
 });
 
-const pool = new Pool({ connectionString: databaseUrl });
+const pool = createPostgresPool(databaseUrl);
 const db = new PostgresD1Adapter(pool);
 const lockName = `postgres-parity-${randomUUID()}`;
 try {

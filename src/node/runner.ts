@@ -1,13 +1,13 @@
 import { serve } from 'srvx';
 import cron from 'node-cron';
-import { Pool } from 'pg';
 import { drainManualMonitorJobs } from '../worker/monitor-jobs.ts';
 import { runMonitor } from '../worker/monitor.ts';
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
+import { createPostgresPool } from './postgres-pool.ts';
 import { buildRunnerEnv } from './env.ts';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL not configured');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = createPostgresPool(process.env.DATABASE_URL);
 const env = buildRunnerEnv(new PostgresD1Adapter(pool));
 const ctx = {
     waitUntil(promise: Promise<unknown>) {

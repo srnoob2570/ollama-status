@@ -2,9 +2,9 @@ import { serve } from 'srvx';
 import { serveStatic } from 'srvx/static';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Pool } from 'pg';
 import { api } from '../worker/api.ts';
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
+import { createPostgresPool } from './postgres-pool.ts';
 import { MemoryCache } from './memory-cache.ts';
 import { buildWebEnv } from './env.ts';
 
@@ -14,7 +14,7 @@ const DIST_DIR = join(import.meta.dirname, '../../dist');
     default: new MemoryCache(),
 } as unknown as CacheStorage;
 
-const pool = new Pool({ connectionString: requiredDatabaseUrl() });
+const pool = createPostgresPool(requiredDatabaseUrl());
 const env = buildWebEnv(new PostgresD1Adapter(pool));
 
 function requiredDatabaseUrl(): string {
