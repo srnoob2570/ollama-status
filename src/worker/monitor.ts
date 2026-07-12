@@ -705,6 +705,300 @@ async function probePaid(
     }
 }
 
+// A lock owner must always have a visible run, including initialization failures. Abandons any
+// prior run left open (crash/eviction) and inserts this run's row. Returns whether this
+// invocation created the row (false means a racing/duplicate cron tick lost the insert).
+async function openRun(
+    env: Env,
+    runId: string,
+    started: string,
+    scheduledAt: string,
+): Promise<boolean> {
+    await env.DB.batch([
+        env.DB.prepare(
+            `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail='interrupted'
+             WHERE state IN ('SCHEDULED','RUNNING') AND run_id IN (SELECT id FROM monitor_runs WHERE finished_at IS NULL)`,
+        ).bind(started),
+        env.DB.prepare(
+            "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
+        ).bind(started),
+    ]);
+    const insertedRun = await env.DB.prepare(
+        "INSERT OR IGNORE INTO monitor_runs(id,started_at,scheduled_at,phase) VALUES (?,?,?,'CATALOG')",
+    )
+        .bind(runId, started, scheduledAt)
+        .run();
+    return insertedRun.meta.changes === 1;
+}
+
+async function resolveProviders(
+    env: Env,
+): Promise<{ freeProvider: Provider | undefined; paidProvider: Provider | undefined }> {
+    await ensureProviders(env);
+    const activeProviders = await providers(env);
+    return {
+        freeProvider: activeProviders.find((provider) => provider.id === 'ollama-free'),
+        paidProvider: activeProviders.find((provider) => provider.id === 'ollama-paid'),
+    };
+}
+
+// Selects due models and schedules their executions. `catalogModelCount` is null when this
+// cycle's catalog sync failed; scheduling still runs against the existing `models` table so
+// already-known due models get probed instead of losing the whole cycle.
+async function scheduleDueExecutions(
+    env: Env,
+    runId: string,
+    scheduledTimeMs: number,
+    scheduledAt: string,
+    catalogModelCount: number | null,
+) {
+    const due = await env.DB.prepare(
+        `SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT ${MAX_MODELS_PER_RUN}`,
+    )
+        .bind(eligibilityCutoff(scheduledTimeMs))
+        .all<Model>();
+    const executions = due.results.map((model) => ({
+        id: id('exec'),
+        model,
+        intervalMinutes: nominalCheckIntervalMinutes(model.tier ?? 'UNKNOWN', env),
+    }));
+    if (executions.length)
+        await env.DB.batch(
+            executions.map((execution) =>
+                env.DB.prepare(
+                    `INSERT INTO model_check_executions(id,run_id,model_id,tier,interval_minutes,scheduled_at,state)
+                     VALUES (?,?,?,?,?,?,'SCHEDULED')`,
+                ).bind(
+                    execution.id,
+                    runId,
+                    execution.model.id,
+                    execution.model.tier ?? 'UNKNOWN',
+                    execution.intervalMinutes,
+                    scheduledAt,
+                ),
+            ),
+        );
+    await env.DB.prepare(
+        "UPDATE monitor_runs SET phase='CHECKING',catalog_model_count=?,scheduled_model_count=? WHERE id=?",
+    )
+        // catalog_model_count is NOT NULL; 0 is a placeholder when this cycle's sync failed —
+        // the run's `detail='catalog_unavailable'` is the real diagnostic signal, not this number.
+        .bind(catalogModelCount ?? 0, due.results.length, runId)
+        .run();
+    return { due, executions };
+}
+
+// Drains the independent Free/Paid probe pools until both queues empty or the soft deadline is
+// hit. Free and Paid workers run concurrently: a Free result can feed the Paid queue while the
+// Free pool immediately moves to the next model.
+async function drainProbeQueues(
+    env: Env,
+    runId: string,
+    freeProvider: Provider,
+    paidProvider: Provider | undefined,
+    executions: ScheduledExecution[],
+    dueCount: number,
+    startedMs: number,
+    scheduledTimeMs: number,
+    owner: string,
+    runController: AbortController,
+): Promise<{ budgetExceeded: boolean; rejectedExecutions: number }> {
+    const freeConcurrency = freeProbeConcurrency(env);
+    const paidConcurrency = paidProbeConcurrency(env);
+    const freeQueue: ScheduledExecution[] = executions;
+    const paidQueue: PaidProbeTask[] = [];
+    const deadlineMs = runDeadlineMs(startedMs, env);
+    let budgetExceeded = false,
+        rejectedExecutions = 0;
+    let activeFree = 0,
+        activePaid = 0;
+    type WorkerResult =
+        | { pool: 'free'; task?: PaidProbeTask }
+        | { pool: 'paid' }
+        | { pool: 'error'; error: unknown };
+    const active = new Set<Promise<WorkerResult>>();
+    const settled: WorkerResult[] = [];
+    const track = (
+        pool: 'free' | 'paid',
+        work: Promise<PaidProbeTask | undefined> | Promise<void>,
+    ) => {
+        if (pool === 'free') activeFree += 1;
+        else activePaid += 1;
+        let tracked: Promise<WorkerResult>;
+        tracked = work
+            .then((task) =>
+                pool === 'free'
+                    ? { pool, task: task as PaidProbeTask | undefined }
+                    : { pool },
+            )
+            .catch((error: unknown) => ({ pool: 'error' as const, error }))
+            .then((result) => {
+                settled.push(result);
+                return result;
+            })
+            .finally(() => {
+                active.delete(tracked);
+                if (pool === 'free') activeFree -= 1;
+                else activePaid -= 1;
+            });
+        active.add(tracked);
+    };
+    const consumeSettled = () => {
+        for (const result of settled.splice(0)) {
+            if (result.pool === 'free' && result.task) paidQueue.push(result.task);
+            if (result.pool === 'error') {
+                rejectedExecutions += 1;
+                console.warn(`monitor probe rejected: ${result.error}`);
+            }
+        }
+    };
+    const deferPending = async () => {
+        const deferredAt = now();
+        await env.DB.prepare(
+            `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+             WHERE run_id=? AND state='SCHEDULED'`,
+        )
+            .bind(deferredAt, runId)
+            .run();
+        // A Paid task has already completed its Free classification and is RUNNING only
+        // because it waits for a Paid worker. Do not include active Free/Paid probes here:
+        // they are allowed to finish and preserve their normal terminal writes.
+        const waitingPaidIds = paidQueue.map((task) => task.id);
+        if (waitingPaidIds.length)
+            await env.DB.prepare(
+                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+                 WHERE run_id=? AND state='RUNNING' AND id IN (${waitingPaidIds.map(() => '?').join(',')})`,
+            )
+                .bind(deferredAt, runId, ...waitingPaidIds)
+                .run();
+    };
+    const waitForWorker = async () => {
+        if (active.size) await Promise.race(active);
+        consumeSettled();
+    };
+    while (freeQueue.length || paidQueue.length || active.size) {
+        if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
+            throw new Error('run_hard_stop');
+        if (Date.now() >= deadlineMs) {
+            budgetExceeded = true;
+            break;
+        }
+        consumeSettled();
+        const canStartFree = freeQueue.length > 0 && activeFree < freeConcurrency;
+        const canStartPaid = paidQueue.length > 0 && activePaid < paidConcurrency;
+        if (!canStartFree && !canStartPaid) {
+            await waitForWorker();
+            continue;
+        }
+        // Renew before launching work, not while merely waiting for active probes. A lost
+        // lease still abandons every non-terminal execution in the catch path below.
+        if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
+        while (freeQueue.length && activeFree < freeConcurrency && Date.now() < deadlineMs) {
+            const execution = freeQueue.shift();
+            if (!execution) break;
+            track(
+                'free',
+                probeFree(
+                    env,
+                    freeProvider,
+                    paidProvider,
+                    execution,
+                    runId,
+                    scheduledTimeMs,
+                    runController.signal,
+                ),
+            );
+        }
+        while (paidQueue.length && activePaid < paidConcurrency && Date.now() < deadlineMs) {
+            const task = paidQueue.shift();
+            if (!task || !paidProvider) break;
+            track(
+                'paid',
+                probePaid(
+                    env,
+                    freeProvider,
+                    paidProvider,
+                    task,
+                    runId,
+                    scheduledTimeMs,
+                    runController.signal,
+                ),
+            );
+        }
+    }
+    if (budgetExceeded) {
+        // Surface the infeasibility explicitly instead of silently drifting cadence: the
+        // run completed without error but couldn't probe every due model within the budget.
+        console.warn(`monitor run ${runId} budget_exceeded: ${dueCount} due, deadline reached`);
+        // Let already-started Free/Paid probes write their normal results. Their Free
+        // completions may add more Paid tasks, which are collected before the final defer.
+        while (active.size) await waitForWorker();
+        // The hard-stop timer can fire while the soft-deadline drain waits for an active
+        // probe. Do not close that run as COMPLETED/PARTIAL: route it through the catch
+        // below so every non-terminal execution and the run itself become ABANDONED.
+        if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
+            throw new Error('run_hard_stop');
+        await deferPending();
+    }
+    return { budgetExceeded, rejectedExecutions };
+}
+
+async function closeRun(
+    env: Env,
+    runId: string,
+    flags: {
+        catalogUnavailable: boolean;
+        budgetExceeded: boolean;
+        rejectedExecutions: number;
+        dueCount: number;
+    },
+): Promise<void> {
+    const { catalogUnavailable, budgetExceeded, rejectedExecutions, dueCount } = flags;
+    const partial = catalogUnavailable || budgetExceeded || rejectedExecutions > 0;
+    const detail = [
+        catalogUnavailable ? 'catalog_unavailable' : null,
+        budgetExceeded ? `budget_exceeded:${dueCount}` : null,
+        rejectedExecutions ? `execution_failures:${rejectedExecutions}` : null,
+    ]
+        .filter((value): value is string => value !== null)
+        .join(';');
+    await env.DB.prepare(
+        "UPDATE monitor_runs SET finished_at=?,outcome=?,phase='COMPLETED',detail=?,current_model=NULL WHERE id=?",
+    )
+        .bind(now(), partial ? 'PARTIAL' : 'OK', detail || null, runId)
+        .run();
+}
+
+// A hard stop means the run overstayed its budget and was aborted mid-flight; close it as
+// abandoned (not failed) so the UI can distinguish a stuck/interrupted run from a real
+// monitor error, and so the next tick reclaims the lock cleanly. Keep `detail` diagnostic.
+async function abandonRun(
+    env: Env,
+    runId: string,
+    runCreated: boolean,
+    runController: AbortController,
+    error: unknown,
+): Promise<void> {
+    const hardStopHit =
+        runController.signal.aborted ||
+        (error instanceof Error && error.message === 'run_hard_stop');
+    const detail = hardStopHit
+        ? 'hard_stop'
+        : error instanceof Error && error.message === 'global_catalog_unavailable'
+          ? 'catalog_unavailable'
+          : 'monitor_failed';
+    if (runCreated)
+        await env.DB.batch([
+            env.DB.prepare(
+                `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail=?
+                 WHERE run_id=? AND state IN ('SCHEDULED','RUNNING')`,
+            ).bind(now(), detail, runId),
+            env.DB.prepare(
+                `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
+            ).bind(now(), detail, runId),
+        ]);
+}
+
 export async function runMonitor(
     env: Env,
     ctx: ExecutionContext,
@@ -725,238 +1019,42 @@ export async function runMonitor(
     const runController = new AbortController();
     const hardStop = setTimeout(() => runController.abort(), RUN_HARD_STOP_MS);
     try {
-        // A lock owner must always have a visible run, including initialization failures.
-        await env.DB.batch([
-            env.DB.prepare(
-                `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail='interrupted'
-                 WHERE state IN ('SCHEDULED','RUNNING') AND run_id IN (SELECT id FROM monitor_runs WHERE finished_at IS NULL)`,
-            ).bind(started),
-            env.DB.prepare(
-                "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
-            ).bind(started),
-        ]);
-        const insertedRun = await env.DB.prepare(
-            "INSERT OR IGNORE INTO monitor_runs(id,started_at,scheduled_at,phase) VALUES (?,?,?,'CATALOG')",
-        )
-            .bind(runId, started, scheduledAt)
-            .run();
-        if (insertedRun.meta.changes !== 1) return;
+        if (!(await openRun(env, runId, started, scheduledAt))) return;
         runCreated = true;
-        await ensureProviders(env);
-        const activeProviders = await providers(env);
-        const freeProvider = activeProviders.find((provider) => provider.id === 'ollama-free');
-        const paidProvider = activeProviders.find((provider) => provider.id === 'ollama-paid');
+        const { freeProvider, paidProvider } = await resolveProviders(env);
         if (!freeProvider) throw new Error('global_catalog_unavailable');
+        // A transient catalog fetch failure must not abort the whole cycle: already-known due
+        // models still get probed on their normal cadence, only discovery of new models is
+        // skipped this tick. `syncCatalog` already records the failure on `providers.catalog_status`.
         const catalogModelCount = await syncCatalog(env, freeProvider, runController.signal);
-        if (catalogModelCount === null) throw new Error('global_catalog_unavailable');
-        const due = await env.DB.prepare(
-            `SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT ${MAX_MODELS_PER_RUN}`,
-        )
-            .bind(eligibilityCutoff(scheduledTimeMs))
-            .all<Model>();
-        const executions = due.results.map((model) => ({
-            id: id('exec'),
-            model,
-            intervalMinutes: nominalCheckIntervalMinutes(model.tier ?? 'UNKNOWN', env),
-        }));
-        if (executions.length)
-            await env.DB.batch(
-                executions.map((execution) =>
-                    env.DB.prepare(
-                        `INSERT INTO model_check_executions(id,run_id,model_id,tier,interval_minutes,scheduled_at,state)
-                         VALUES (?,?,?,?,?,?,'SCHEDULED')`,
-                    ).bind(
-                        execution.id,
-                        runId,
-                        execution.model.id,
-                        execution.model.tier ?? 'UNKNOWN',
-                        execution.intervalMinutes,
-                        scheduledAt,
-                    ),
-                ),
-            );
-        await env.DB.prepare(
-            "UPDATE monitor_runs SET phase='CHECKING',catalog_model_count=?,scheduled_model_count=? WHERE id=?",
-        )
-            .bind(catalogModelCount, due.results.length, runId)
-            .run();
-        const freeConcurrency = freeProbeConcurrency(env);
-        const paidConcurrency = paidProbeConcurrency(env);
-        const freeQueue: ScheduledExecution[] = executions;
-        const paidQueue: PaidProbeTask[] = [];
-        // Time-box the run so it finishes within one cron interval. Free and Paid workers are
-        // independent: a Free result can feed the Paid queue while the Free pool immediately
-        // moves to the next model. Once the soft deadline is reached, neither pool starts new
-        // I/O; active probes finish normally and only queued Paid work is deferred.
-        const deadlineMs = runDeadlineMs(startedMs, env);
-        let budgetExceeded = false,
-            rejectedExecutions = 0;
-        let activeFree = 0,
-            activePaid = 0;
-        type WorkerResult =
-            | { pool: 'free'; task?: PaidProbeTask }
-            | { pool: 'paid' }
-            | { pool: 'error'; error: unknown };
-        const active = new Set<Promise<WorkerResult>>();
-        const settled: WorkerResult[] = [];
-        const track = (
-            pool: 'free' | 'paid',
-            work: Promise<PaidProbeTask | undefined> | Promise<void>,
-        ) => {
-            if (pool === 'free') activeFree += 1;
-            else activePaid += 1;
-            let tracked: Promise<WorkerResult>;
-            tracked = work
-                .then((task) =>
-                    pool === 'free'
-                        ? { pool, task: task as PaidProbeTask | undefined }
-                        : { pool },
-                )
-                .catch((error: unknown) => ({ pool: 'error' as const, error }))
-                .then((result) => {
-                    settled.push(result);
-                    return result;
-                })
-                .finally(() => {
-                    active.delete(tracked);
-                    if (pool === 'free') activeFree -= 1;
-                    else activePaid -= 1;
-                });
-            active.add(tracked);
-        };
-        const consumeSettled = () => {
-            for (const result of settled.splice(0)) {
-                if (result.pool === 'free' && result.task) paidQueue.push(result.task);
-                if (result.pool === 'error') {
-                    rejectedExecutions += 1;
-                    console.warn(`monitor probe rejected: ${result.error}`);
-                }
-            }
-        };
-        const deferPending = async () => {
-            const deferredAt = now();
-            await env.DB.prepare(
-                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
-                 WHERE run_id=? AND state='SCHEDULED'`,
-            )
-                .bind(deferredAt, runId)
-                .run();
-            // A Paid task has already completed its Free classification and is RUNNING only
-            // because it waits for a Paid worker. Do not include active Free/Paid probes here:
-            // they are allowed to finish and preserve their normal terminal writes.
-            const waitingPaidIds = paidQueue.map((task) => task.id);
-            if (waitingPaidIds.length)
-                await env.DB.prepare(
-                    `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
-                     WHERE run_id=? AND state='RUNNING' AND id IN (${waitingPaidIds.map(() => '?').join(',')})`,
-                )
-                    .bind(deferredAt, runId, ...waitingPaidIds)
-                    .run();
-        };
-        const waitForWorker = async () => {
-            if (active.size) await Promise.race(active);
-            consumeSettled();
-        };
-        while (freeQueue.length || paidQueue.length || active.size) {
-            if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
-                throw new Error('run_hard_stop');
-            if (Date.now() >= deadlineMs) {
-                budgetExceeded = true;
-                break;
-            }
-            consumeSettled();
-            const canStartFree = freeQueue.length > 0 && activeFree < freeConcurrency;
-            const canStartPaid = paidQueue.length > 0 && activePaid < paidConcurrency;
-            if (!canStartFree && !canStartPaid) {
-                await waitForWorker();
-                continue;
-            }
-            // Renew before launching work, not while merely waiting for active probes. A lost
-            // lease still abandons every non-terminal execution in the catch path below.
-            if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
-            while (freeQueue.length && activeFree < freeConcurrency && Date.now() < deadlineMs) {
-                const execution = freeQueue.shift();
-                if (!execution) break;
-                track(
-                    'free',
-                    probeFree(
-                        env,
-                        freeProvider,
-                        paidProvider,
-                        execution,
-                        runId,
-                        scheduledTimeMs,
-                        runController.signal,
-                    ),
-                );
-            }
-            while (paidQueue.length && activePaid < paidConcurrency && Date.now() < deadlineMs) {
-                const task = paidQueue.shift();
-                if (!task || !paidProvider) break;
-                track(
-                    'paid',
-                    probePaid(
-                        env,
-                        freeProvider,
-                        paidProvider,
-                        task,
-                        runId,
-                        scheduledTimeMs,
-                        runController.signal,
-                    ),
-                );
-            }
-        }
-        if (budgetExceeded) {
-            // Surface the infeasibility explicitly instead of silently drifting cadence: the
-            // run completed without error but couldn't probe every due model within the budget.
-            console.warn(
-                `monitor run ${runId} budget_exceeded: ${due.results.length} due, deadline reached`,
-            );
-            // Let already-started Free/Paid probes write their normal results. Their Free
-            // completions may add more Paid tasks, which are collected before the final defer.
-            while (active.size) await waitForWorker();
-            // The hard-stop timer can fire while the soft-deadline drain waits for an active
-            // probe. Do not close that run as COMPLETED/PARTIAL: route it through the catch
-            // below so every non-terminal execution and the run itself become ABANDONED.
-            if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
-                throw new Error('run_hard_stop');
-            await deferPending();
-        }
-        const partial = budgetExceeded || rejectedExecutions > 0;
-        const detail = [
-            budgetExceeded ? `budget_exceeded:${due.results.length}` : null,
-            rejectedExecutions ? `execution_failures:${rejectedExecutions}` : null,
-        ]
-            .filter((value): value is string => value !== null)
-            .join(';');
-        await env.DB.prepare(
-            "UPDATE monitor_runs SET finished_at=?,outcome=?,phase='COMPLETED',detail=?,current_model=NULL WHERE id=?",
-        )
-            .bind(now(), partial ? 'PARTIAL' : 'OK', detail || null, runId)
-            .run();
+        const catalogUnavailable = catalogModelCount === null;
+        const { due, executions } = await scheduleDueExecutions(
+            env,
+            runId,
+            scheduledTimeMs,
+            scheduledAt,
+            catalogModelCount,
+        );
+        const { budgetExceeded, rejectedExecutions } = await drainProbeQueues(
+            env,
+            runId,
+            freeProvider,
+            paidProvider,
+            executions,
+            due.results.length,
+            startedMs,
+            scheduledTimeMs,
+            owner,
+            runController,
+        );
+        await closeRun(env, runId, {
+            catalogUnavailable,
+            budgetExceeded,
+            rejectedExecutions,
+            dueCount: due.results.length,
+        });
     } catch (error) {
-        // A hard stop means the run overstayed its budget and was aborted mid-flight; close it as
-        // abandoned (not failed) so the UI can distinguish a stuck/interrupted run from a real
-        // monitor error, and so the next tick reclaims the lock cleanly. Keep `detail` diagnostic.
-        const hardStopHit =
-            runController.signal.aborted ||
-            (error instanceof Error && error.message === 'run_hard_stop');
-        const detail = hardStopHit
-            ? 'hard_stop'
-            : error instanceof Error && error.message === 'global_catalog_unavailable'
-              ? 'catalog_unavailable'
-              : 'monitor_failed';
-        if (runCreated)
-            await env.DB.batch([
-                env.DB.prepare(
-                    `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail=?
-                     WHERE run_id=? AND state IN ('SCHEDULED','RUNNING')`,
-                ).bind(now(), detail, runId),
-                env.DB.prepare(
-                    `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
-                ).bind(now(), detail, runId),
-            ]);
+        await abandonRun(env, runId, runCreated, runController, error);
     } finally {
         clearTimeout(hardStop);
         try {

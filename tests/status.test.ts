@@ -1810,4 +1810,121 @@ describe('monitor run recovery', () => {
             globalThis.fetch = originalFetch;
         }
     });
+
+    it('continues probing already-due models when catalog sync fails, closing PARTIAL with catalog_unavailable', async () => {
+        // A transient catalog fetch failure (/tags erroring) must not abort the whole cycle: a
+        // model that is already known and due for its normal cadence should still get probed.
+        const originalFetch = globalThis.fetch;
+        const statements: string[] = [];
+        const boundStatements: Array<{ sql: string; bindings: unknown[] }> = [];
+        const env = {
+            OLLAMA_BASE_URL: 'https://example.test/api',
+            OLLAMA_API_KEY_FREE: 'k',
+            OLLAMA_API_KEY_PAID: 'paid-k',
+            FREE_PROBE_CONCURRENCY: '1',
+            PAID_PROBE_CONCURRENCY: '6',
+            PROBE_DELAY_MIN_MS: '0',
+            PROBE_DELAY_MAX_MS: '0',
+            DB: {
+                prepare(sql: string) {
+                    const prepared = {
+                        statementSql: sql,
+                        run: async () => {
+                            statements.push(sql);
+                            return { meta: { changes: 1 } };
+                        },
+                        all: async () => {
+                            statements.push(sql);
+                            if (/FROM models WHERE provider_id='ollama-free'/.test(sql))
+                                return {
+                                    results: [
+                                        {
+                                            id: 'ollama:m',
+                                            provider_id: 'ollama-free',
+                                            remote_name: 'm',
+                                            digest: 'd',
+                                            last_show_at: null,
+                                            tier: 'FREE',
+                                        },
+                                    ],
+                                };
+                            if (/FROM providers WHERE active=1/.test(sql))
+                                return {
+                                    results: [
+                                        {
+                                            id: 'ollama-free',
+                                            name: 'Free',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_FREE',
+                                        },
+                                        {
+                                            id: 'ollama-paid',
+                                            name: 'Paid',
+                                            base_url: 'https://example.test/api',
+                                            secret_ref: 'OLLAMA_API_KEY_PAID',
+                                        },
+                                    ],
+                                };
+                            if (/FROM provider_model_status/.test(sql)) return { results: [] };
+                            if (/FROM incidents WHERE id=/.test(sql)) return { results: [] };
+                            if (/classification FROM checks/.test(sql)) return { results: [] };
+                            if (/total_duration_ms FROM checks/.test(sql)) return { results: [] };
+                            return { results: [] }; // monitor_runs fallback: no orphaned run
+                        },
+                        first: async () => {
+                            statements.push(sql);
+                            return null;
+                        },
+                        bind(...bindings: unknown[]) {
+                            boundStatements.push({ sql, bindings });
+                            return prepared; // bound and unbound access resolve to the same routes
+                        },
+                    };
+                    return prepared;
+                },
+                async batch(arr: { run: () => Promise<unknown>; statementSql: string }[]) {
+                    const results: unknown[] = [];
+                    for (const statement of arr) results.push(await statement.run());
+                    return results;
+                },
+            },
+        } as unknown as Env;
+        const ctx = {
+            waitUntil(p: Promise<unknown>) {
+                void p.catch(() => {});
+            },
+        } as unknown as Parameters<typeof runMonitor>[1];
+        const monitorFetch = (async (input: RequestInfo | URL) => {
+            const url = typeof input === 'string' ? input : input.toString();
+            if (url.endsWith('/tags')) return new Response('service unavailable', { status: 503 });
+            // /chat stream: first content chunk proves inference started.
+            return new Response('{"model":"m","message":{"content":"OK"},"done":true}\n', {
+                status: 200,
+            });
+        }) as typeof fetch;
+        globalThis.fetch = monitorFetch;
+        const scheduledTime = Date.parse('2026-07-10T13:00:00.000Z');
+        try {
+            await runMonitor(env, ctx, scheduledTime);
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+        // The catalog failure is recorded on the provider, but does not prevent the already-due
+        // model from being scheduled and probed this cycle.
+        expect(statements.some((s) => /UPDATE providers SET catalog_status=/.test(s))).toBe(true);
+        expect(statements.some((s) => /INSERT INTO model_check_executions/.test(s))).toBe(true);
+        expect(statements.some((s) => /INSERT INTO checks/.test(s))).toBe(true);
+        expect(statements.some((s) => /state='COMPLETED'/.test(s))).toBe(true);
+
+        const runClose = boundStatements.find((entry) =>
+            /outcome=\?,phase='COMPLETED'/.test(entry.sql),
+        );
+        expect(runClose?.bindings[1]).toBe('PARTIAL');
+        expect(String(runClose?.bindings[2])).toContain('catalog_unavailable');
+
+        const scheduleUpdate = boundStatements.find((entry) =>
+            /phase='CHECKING',catalog_model_count=/.test(entry.sql),
+        );
+        expect(scheduleUpdate?.bindings[0]).toBe(0);
+    });
 });
