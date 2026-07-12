@@ -1,4 +1,7 @@
-const DEFAULT_MAX_RESPONSE_TOKENS = 8;
+// Some reasoning-capable models spend tokens on hidden "thinking" before emitting any visible
+// content/thinking fragment, even with `think: false`. A too-small budget can exhaust itself
+// before any token is observed, misclassifying a healthy model as EMPTY_RESPONSE.
+const DEFAULT_MAX_RESPONSE_TOKENS = 32;
 const MAX_SAFE_RESPONSE_TOKENS = 4_096;
 
 export function maxResponseTokens(value: string | undefined): number {

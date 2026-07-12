@@ -123,6 +123,55 @@ describe('Ollama status classification', () => {
         });
     });
 
+    it('selects the paid check over the free one even when the execution was scheduled before the model\'s tier was known', () => {
+        // A model's very first classification cycle schedules its execution while tier is still
+        // UNKNOWN, then probes both Free (SUBSCRIPTION_REQUIRED) and Paid (SUCCESS) within that
+        // same execution. The bucket must reflect the paid result, not fall back to "Subscription
+        // required" just because the execution's frozen `tier` column predates the classification.
+        const reference = new Date('2026-07-10T13:34:00.000Z');
+        const executions = [
+            {
+                id: 'exec-first-cycle',
+                model_id: 'm1',
+                tier: 'UNKNOWN',
+                interval_minutes: 5,
+                scheduled_at: '2026-07-10T13:30:00.000Z',
+                started_at: '2026-07-10T13:30:03.000Z',
+                completed_at: '2026-07-10T13:31:15.000Z',
+                state: 'COMPLETED' as const,
+            },
+        ];
+        const checks = [
+            {
+                provider_id: 'ollama-free',
+                model_id: 'm1',
+                checked_at: '2026-07-10T13:31:10.000Z',
+                public_status: 'PLAN_REQUIRED',
+                classification: 'SUBSCRIPTION_REQUIRED',
+                total_duration_ms: null,
+                rtt_ms: 300,
+                execution_id: 'exec-first-cycle',
+            },
+            {
+                provider_id: 'ollama-paid',
+                model_id: 'm1',
+                checked_at: '2026-07-10T13:31:14.000Z',
+                public_status: 'OPERATIONAL',
+                classification: 'SUCCESS',
+                total_duration_ms: 700,
+                rtt_ms: 700,
+                execution_id: 'exec-first-cycle',
+            },
+        ];
+
+        const buckets = executionHistoryBuckets(executions, checks, reference);
+        expect(buckets).toHaveLength(1);
+        expect(buckets[0]).toMatchObject({
+            status: 'OPERATIONAL',
+            checkedAt: '2026-07-10T13:31:14.000Z',
+        });
+    });
+
     it('keeps 1h strictly within the inclusive 60-minute window and preserves real states', () => {
         const reference = new Date('2026-07-10T13:34:00.000Z');
         const makeExecution = (id: string, scheduledAt: string, state: 'RUNNING' | 'FAILED') => ({
@@ -713,10 +762,10 @@ describe('Ollama status classification', () => {
     });
 
     it('uses a bounded configured response-token limit', () => {
-        expect(maxResponseTokens(undefined)).toBe(8);
-        expect(maxResponseTokens('32')).toBe(32);
-        expect(maxResponseTokens('0')).toBe(8);
-        expect(maxResponseTokens('4097')).toBe(8);
+        expect(maxResponseTokens(undefined)).toBe(32);
+        expect(maxResponseTokens('64')).toBe(64);
+        expect(maxResponseTokens('0')).toBe(32);
+        expect(maxResponseTokens('4097')).toBe(32);
     });
 
     it('accepts the first content chunk of an Ollama Chat stream', async () => {
@@ -943,6 +992,55 @@ describe('Ollama status classification', () => {
                 publicStatus: 'CONFIGURATION',
                 errorCode: 'missing_stream',
             });
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('classifies a mid-stream overload error as retryable instead of a hard protocol error', async () => {
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () =>
+            new Response(`${JSON.stringify({ error: 'model is overloaded, please try again' })}\n`, {
+                status: 200,
+            });
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            expect(await provider.probe('overloaded-model')).toMatchObject({
+                classification: 'OVERLOADED',
+                publicStatus: 'OUTAGE',
+                errorCode: 'stream_overloaded',
+            });
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+    });
+
+    it('treats an explicit null content/thinking field as absent rather than a malformed chunk', async () => {
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = async () =>
+            new Response(
+                `${JSON.stringify({ message: { content: null, thinking: null }, done: false })}\n${JSON.stringify({ message: { content: 'OK' }, done: false })}\n`,
+                { status: 200 },
+            );
+        try {
+            const provider = new OllamaProvider(
+                {
+                    id: 'ollama-free',
+                    name: 'Free',
+                    base_url: 'https://example.test/api',
+                    secret_ref: 'OLLAMA_API_KEY_FREE',
+                },
+                'test-key',
+            );
+            expect((await provider.probe('null-field-model')).classification).toBe('SUCCESS');
         } finally {
             globalThis.fetch = originalFetch;
         }

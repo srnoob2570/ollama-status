@@ -210,13 +210,15 @@ function effectiveExecutionCheck(
     checks: HistoryCheck[],
 ): HistoryCheck | undefined {
     const executionChecks = checks.filter((check) => check.execution_id === execution.id);
-    if (execution.tier === 'PAID')
-        return (
-            executionChecks.find((check) => check.provider_id === 'ollama-paid') ??
-            executionChecks.find((check) => check.provider_id === 'ollama-free')
-        );
+    // Prefer a Paid check whenever one exists for this execution: it only exists once the Free
+    // probe reported SUBSCRIPTION_REQUIRED and the Paid probe subsequently completed, so it is
+    // always the more current classification. Branching on `execution.tier` instead is wrong: that
+    // value is frozen at scheduling time and is still 'UNKNOWN' during a model's very first
+    // classification cycle, even though a Paid check already exists for that same execution.
     return (
-        executionChecks.find((check) => check.provider_id === 'ollama-free') ?? executionChecks[0]
+        executionChecks.find((check) => check.provider_id === 'ollama-paid') ??
+        executionChecks.find((check) => check.provider_id === 'ollama-free') ??
+        executionChecks[0]
     );
 }
 

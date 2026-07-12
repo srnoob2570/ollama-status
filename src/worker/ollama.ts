@@ -10,7 +10,7 @@ const probeMessage = 'Reply with OK.';
 type ChatChunk = {
     done?: boolean;
     error?: string;
-    message?: { content?: string; thinking?: string };
+    message?: { content?: string | null; thinking?: string | null };
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -28,8 +28,20 @@ function isChatChunk(value: unknown): value is ChatChunk {
     if (hasError && typeof value.error !== 'string') return false;
     if (hasMessage) {
         if (!isRecord(value.message)) return false;
-        if ('content' in value.message && typeof value.message.content !== 'string') return false;
-        if ('thinking' in value.message && typeof value.message.thinking !== 'string') return false;
+        // A server may serialize an empty optional field as `null` instead of omitting it;
+        // treat that the same as absent rather than rejecting the whole chunk as malformed.
+        if (
+            'content' in value.message &&
+            value.message.content !== null &&
+            typeof value.message.content !== 'string'
+        )
+            return false;
+        if (
+            'thinking' in value.message &&
+            value.message.thinking !== null &&
+            typeof value.message.thinking !== 'string'
+        )
+            return false;
     }
 
     return hasMessage || hasDone || hasError;
@@ -176,7 +188,7 @@ async function firstChatToken(
                 } catch {
                     return protocolError(started, 'invalid_stream');
                 }
-                if (chunk.error !== undefined) return protocolError(started, 'stream_error');
+                if (chunk.error !== undefined) return streamError(started, chunk.error);
                 // Some thinking-capable models emit only a thinking fragment before the
                 // configured token limit. Either field proves that inference started. Cancel the
                 // reader at the first token so the probe measures time-to-first-token and releases
@@ -187,8 +199,10 @@ async function firstChatToken(
                     (typeof chunk.message?.thinking === 'string' &&
                         chunk.message.thinking.trim().length > 0)
                 ) {
-                    await reader.cancel();
+                    // Measure time-to-first-token before cancel(), whose own teardown latency is
+                    // unrelated to the model and would otherwise inflate the reported RTT.
                     const rttMs = performance.now() - started;
+                    await reader.cancel();
                     const classification = isLatencyAnomalous(rttMs, baseline)
                         ? 'HIGH_LATENCY'
                         : 'SUCCESS';
@@ -247,6 +261,22 @@ function protocolError(started: number, errorCode: string): ProbeResult {
         publicStatus: 'CONFIGURATION',
         rttMs: performance.now() - started,
         errorCode,
+    };
+}
+
+// An `error` field mid-stream can be a transient backend condition (overloaded, out of
+// capacity) rather than a genuine protocol/configuration problem. Classify those distinctly, the
+// same way the 403 handler above distinguishes SUBSCRIPTION_REQUIRED from a generic auth error,
+// so a transient overload doesn't get the same "requires manual fix" treatment as a corrupt stream.
+function streamError(started: number, message: string): ProbeResult {
+    const classification = /overloaded|too many requests|at capacity|try again/i.test(message)
+        ? 'OVERLOADED'
+        : 'PROTOCOL_ERROR';
+    return {
+        classification,
+        publicStatus: publicStatusFor(classification),
+        rttMs: performance.now() - started,
+        errorCode: classification === 'OVERLOADED' ? 'stream_overloaded' : 'stream_error',
     };
 }
 
