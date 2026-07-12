@@ -207,7 +207,8 @@ export function App() {
                 <section className="notice warning">
                     MONITOR OVERLOADED — recent runs couldn&apos;t check every model within the
                     5-minute cadence. Lower PROBE_DELAY_MAX_MS, raise FREE_PROBE_CONCURRENCY or
-                    PAID_PROBE_CONCURRENCY (if the respective API key allows), or reduce the catalog.
+                    PAID_PROBE_CONCURRENCY (if the respective API key allows), or reduce the
+                    catalog.
                 </section>
             )}
             <section className="summary" aria-label="Catalog summary">
@@ -601,8 +602,6 @@ function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription
                     <span className="tt-metric-value">
                         {data.executionState?.toLowerCase() ?? '—'}
                     </span>
-                    <span className="tt-metric-label">Result</span>
-                    <span className="tt-metric-value">{data.checkedTime ?? '—'}</span>
                     <span className="tt-metric-label">Completed</span>
                     <span className="tt-metric-value">{data.completedTime ?? '—'}</span>
                 </div>
