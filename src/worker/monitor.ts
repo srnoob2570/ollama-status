@@ -54,6 +54,16 @@ let providersSeeded = false;
 let lastRolledHour: string | null = null;
 let lastCleanupDay: string | null = null;
 
+// Epoch ms when the last monitor attempt settled with a terminal result (COMPLETED, FAILED or
+// DUPLICATE). LOCKED returns before the recording point on purpose: an owner wedged inside its
+// probe loop keeps every other attempt LOCKED, so this value going stale is exactly the signal
+// the Node runner's health endpoint and exit watchdog use to detect a scheduler that stopped
+// making progress.
+let lastSettledMs: number | null = null;
+export function lastMonitorSettledMs(): number | null {
+    return lastSettledMs;
+}
+
 // Free and Paid probes use independent worker pools. Paid work only becomes eligible after the
 // corresponding Free probe reports SUBSCRIPTION_REQUIRED, so a higher Paid limit can overlap
 // later Free classifications without increasing pressure on the Free API key.
@@ -715,6 +725,39 @@ async function probePaid(
     }
 }
 
+// Closes every run left open by a previous owner (crash/eviction) along with its non-terminal
+// executions, so the dashboard stops reporting it as stuck. Callers must hold the monitor lock
+// so a genuinely active run is never clobbered.
+async function abandonOpenRuns(env: Env, at: string): Promise<void> {
+    await env.DB.batch([
+        env.DB.prepare(
+            `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail='interrupted'
+             WHERE state IN ('SCHEDULED','RUNNING') AND run_id IN (SELECT id FROM monitor_runs WHERE finished_at IS NULL)`,
+        ).bind(at),
+        env.DB.prepare(
+            "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
+        ).bind(at),
+    ]);
+}
+
+// Startup recovery for the Node runner: a process that died mid-run leaves its run open (the
+// dashboard's "monitor stuck") until a later cron tick reclaims the lock through openRun. Running
+// this at boot closes the orphan as soon as the container restarts instead. Returns false when
+// the lock is still leased — an active or recently-dead owner — in which case the normal cron
+// path recovers once the lease expires.
+export async function recoverOrphanedRuns(env: Env): Promise<boolean> {
+    const owner = crypto.randomUUID();
+    if (!(await acquireLock(env, 'monitor', owner))) return false;
+    try {
+        await abandonOpenRuns(env, now());
+        return true;
+    } finally {
+        await releaseLock(env, 'monitor', owner).catch((error: unknown) =>
+            console.warn(`boot recovery lock release failed: ${error}`),
+        );
+    }
+}
+
 // A lock owner must always have a visible run, including initialization failures. Abandons any
 // prior run left open (crash/eviction) and inserts this run's row. Returns whether this
 // invocation created the row (false means a racing/duplicate cron tick lost the insert).
@@ -724,15 +767,7 @@ async function openRun(
     started: string,
     scheduledAt: string,
 ): Promise<boolean> {
-    await env.DB.batch([
-        env.DB.prepare(
-            `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail='interrupted'
-             WHERE state IN ('SCHEDULED','RUNNING') AND run_id IN (SELECT id FROM monitor_runs WHERE finished_at IS NULL)`,
-        ).bind(started),
-        env.DB.prepare(
-            "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
-        ).bind(started),
-    ]);
+    await abandonOpenRuns(env, started);
     const insertedRun = await env.DB.prepare(
         `INSERT INTO monitor_runs(id,started_at,scheduled_at,phase)
          VALUES (?,?,?,'CATALOG') ON CONFLICT(id) DO NOTHING`,
@@ -1074,12 +1109,26 @@ export async function runMonitor(
                 catalogUnavailable || budgetExceeded || rejectedExecutions > 0 ? 'PARTIAL' : 'OK',
         };
     } catch (error) {
-        await abandonRun(env, runId, runCreated, runController, error);
+        console.error(`monitor run ${runId} failed: ${error}`);
+        try {
+            await abandonRun(env, runId, runCreated, runController, error);
+        } catch (abandonError) {
+            // Abandoning can fail for the same reason the run did (e.g. the DB is down). The next
+            // successful openRun re-runs the same statements; returning FAILED instead of
+            // throwing is what keeps the scheduler alive to make that attempt.
+            console.error(`abandoning failed run ${runId} also failed: ${abandonError}`);
+        }
         return { kind: 'FAILED', runId };
     } finally {
+        lastSettledMs = Date.now();
         clearTimeout(hardStop);
         try {
             await releaseLock(env, 'monitor', owner);
+        } catch (releaseError) {
+            // A throw inside finally replaces the function's return value and propagates to the
+            // caller as an unhandled rejection. The lease expires on its own, so a failed release
+            // only delays the next run by up to LOCK_LEASE_MS — never worth crashing over.
+            console.warn(`monitor lock release failed: ${releaseError}`);
         } finally {
             ctx.waitUntil(cleanup(env).catch((error) => console.warn(`cleanup failed: ${error}`)));
         }
