@@ -81,3 +81,47 @@ npm run deploy:production
 Use `wrangler secret put --env <staging|production>` for `OLLAMA_API_KEY_FREE`, `OLLAMA_API_KEY_PAID`, and confirmation secrets. Do not put secrets in `wrangler.jsonc`, D1, or browser code.
 
 Run `npm run spike` in staging before enabling any request variant with `raw`; the production probe intentionally omits it until that result is validated.
+
+## Node.js + Docker (Coolify)
+
+Cloudflare is the primary target, but the same code also runs as a plain Node.js process, so it can be deployed on a VPS with Coolify, plain Docker Compose, or any container platform. This target replaces D1 with `node:sqlite`, the Workers Cache API with an in-process `Map`, and Cron Triggers with `node-cron` — the monitor and API logic in `src/worker/` are unchanged and shared between both targets.
+
+### Local setup
+
+```sh
+docker compose up --build
+```
+
+This reuses the same `.dev.vars` file as `wrangler dev` (via `env_file` in `docker-compose.yml`) for the Ollama API keys. On first start it runs `scripts/migrate-node.mjs`, applying the same SQL files from `migrations/` against a SQLite database stored in the `sqlite-data` volume (`/app/data/ollama-status.sqlite`); later starts skip migrations already applied. The dashboard is then available at `http://localhost:3000/`.
+
+To iterate without Docker:
+
+```sh
+npm run build
+npm run migrate:node
+npm run dev:node
+```
+
+### Variables
+
+Same names as the Cloudflare `vars`/secrets tables above — set them as plain environment variables (or in `.dev.vars` for local Docker use, or through the Coolify UI in production). Additionally:
+
+| Variable  | Default                          | Description                                                    |
+| --------- | --------------------------------- | --------------------------------------------------------------- |
+| `PORT`    | `3000`                            | HTTP port the Node server listens on.                          |
+| `DB_PATH` | `./data/ollama-status.sqlite`     | Path to the SQLite database file (set to `/app/data/ollama-status.sqlite` in `docker-compose.yml` to match the persisted volume). |
+
+The SQLite database used by this target is independent from Cloudflare D1 — there is no data sync between a Cloudflare deployment and a Node/Docker deployment of the same app.
+
+If the cron cadence (`*/5 * * * *`) is ever changed, update it in all three places that must stay in sync: `wrangler.jsonc` (Cron Trigger), `src/node/server.ts` (`node-cron` schedule), and `CRON_INTERVAL_MS` in `src/worker/status.ts`.
+
+An `ExperimentalWarning: SQLite is an experimental feature` line in the logs is expected and benign — it comes from Node's built-in `node:sqlite` module.
+
+### Deploying to Coolify
+
+1. Point Coolify at this repository; it will detect the `Dockerfile`.
+2. Attach a persistent volume mounted at `/app/data` (holds the SQLite database).
+3. Set the environment variables from the table above (and the Ollama API keys) through the Coolify UI — do not bake secrets into the image.
+4. Expose port `3000`.
+
+This path has not been verified against a live Coolify instance from this environment; it has been verified locally with `docker build`, `docker compose up`, and a full monitor cycle against the containerized server.

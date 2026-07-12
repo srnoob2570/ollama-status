@@ -7,11 +7,14 @@
     "dev": "vite",
     "dev:worker": "wrangler dev",
     "build": "tsc -b && vite build",
-    "check": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.app.json",
+    "check": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "spike": "node scripts/spike.mjs",
     "quota:test": "node scripts/quota-test.mjs",
     "lint": "eslint .",
+    "dev:node": "node --env-file=.dev.vars --watch src/node/server.ts",
+    "migrate:node": "node scripts/migrate-node.mjs",
+    "docker:up": "docker compose up --build",
     "deploy:staging": "npm run build && wrangler deploy --env staging",
     "deploy:production": "npm run build && wrangler deploy --env production",
     "migrate:staging": "wrangler d1 migrations apply ollama-status-staging --env staging --remote",
@@ -20,8 +23,10 @@
   },
   "dependencies": {
     "@cloudflare/workers-types": "^5.20260710.1",
+    "node-cron": "^4.6.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "srvx": "^0.11.22"
   },
   "devDependencies": {
     "@eslint/js": "^9.31.0",
