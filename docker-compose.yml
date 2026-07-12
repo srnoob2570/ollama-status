@@ -1,0 +1,29 @@
+services:
+  ollama-status:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      DB_PATH: /app/data/ollama-status.sqlite
+      OLLAMA_BASE_URL: https://ollama.com/api
+      OLLAMA_MAX_TOKENS: "8"
+      FREE_CHECK_INTERVAL_MINUTES: "5"
+      PAID_CHECK_INTERVAL_MINUTES: "10"
+      FREE_PROBE_CONCURRENCY: "1"
+      PAID_PROBE_CONCURRENCY: "6"
+      PROBE_DELAY_MIN_MS: "0"
+      PROBE_DELAY_MAX_MS: "5000"
+    env_file:
+      - .dev.vars
+    volumes:
+      - sqlite-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+volumes:
+  sqlite-data:
