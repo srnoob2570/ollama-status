@@ -2,13 +2,11 @@ import { serve } from 'srvx';
 import { serveStatic } from 'srvx/static';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import cron from 'node-cron';
+import { Pool } from 'pg';
 import { api } from '../worker/api.ts';
-import { runMonitor } from '../worker/monitor.ts';
-import { SqliteD1Adapter } from './sqlite-d1-adapter.ts';
+import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { MemoryCache } from './memory-cache.ts';
-import { buildEnv } from './env.ts';
+import { buildWebEnv } from './env.ts';
 
 const DIST_DIR = join(import.meta.dirname, '../../dist');
 
@@ -16,9 +14,13 @@ const DIST_DIR = join(import.meta.dirname, '../../dist');
     default: new MemoryCache(),
 } as unknown as CacheStorage;
 
-const db = new DatabaseSync(process.env.DB_PATH ?? './data/ollama-status.sqlite');
-db.exec('PRAGMA journal_mode = WAL');
-const env = buildEnv(new SqliteD1Adapter(db));
+const pool = new Pool({ connectionString: requiredDatabaseUrl() });
+const env = buildWebEnv(new PostgresD1Adapter(pool));
+
+function requiredDatabaseUrl(): string {
+    if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL not configured');
+    return process.env.DATABASE_URL;
+}
 
 async function serveIndexFallback(): Promise<Response> {
     const html = await readFile(join(DIST_DIR, 'index.html'), 'utf8');
@@ -45,13 +47,5 @@ const server = serve({
     fetch: serveIndexFallback,
 });
 
-const cronCtx = {
-    waitUntil: (promise: Promise<unknown>) => {
-        void promise.catch((error: unknown) => console.error('monitor error', error));
-    },
-} as unknown as ExecutionContext;
-
-cron.schedule('*/5 * * * *', () => runMonitor(env, cronCtx, Date.now()), { timezone: 'UTC' });
-
 await server.ready();
-console.log(`ollama-status (node) listening on ${server.url}`);
+console.log(`ollama-status web listening on ${server.url}`);

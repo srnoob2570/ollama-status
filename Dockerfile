@@ -19,7 +19,8 @@ COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY migrations ./migrations
 COPY scripts/migrate-node.mjs ./scripts/migrate-node.mjs
+COPY scripts/test-postgres.mjs ./scripts/test-postgres.mjs
 COPY src/worker ./src/worker
 COPY src/node ./src/node
 EXPOSE 3000
-CMD ["sh", "-c", "node scripts/migrate-node.mjs && node src/node/server.ts"]
+CMD ["node", "src/node/server.ts"]

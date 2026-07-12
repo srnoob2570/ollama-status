@@ -1,5 +1,6 @@
 import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status.ts';
-import type { Env } from './types.ts';
+import { enqueueManualMonitorJob } from './monitor-jobs.ts';
+import type { ApiEnv } from './types.ts';
 import { now } from './types.ts';
 
 const json = (body: unknown, status = 200) =>
@@ -19,6 +20,7 @@ function defaultCache(): Cache {
 
 const HISTORY_1H_WINDOW_MS = 60 * 60_000;
 const CONFIRMATION_MAX_BYTES = 8 * 1024;
+const MONITOR_RUN_TIMESTAMP_MAX_AGE_MS = 5 * 60_000;
 
 export type HistoryRange = '1h' | '24h' | '7d' | '30d';
 export type StatusRow = {
@@ -405,12 +407,14 @@ function latencyMetrics(checks: HistoryCheck[]) {
 
 export async function api(
     request: Request,
-    env: Env,
+    env: ApiEnv,
     ctx: ExecutionContext,
     path: string,
 ): Promise<Response> {
     if (path === '/api/internal/confirmation' && request.method === 'POST')
         return confirmation(request, env);
+    if (path === '/api/internal/monitor-run' && request.method === 'POST')
+        return monitorRun(request, env);
     if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
     // Public GET endpoints change only when the monitor writes (every ~5 min), so a 60s Cache API
     // TTL serves the dashboard's 30s polling from cache ~98% of the time. Data is at most ~1 min
@@ -428,7 +432,7 @@ export async function api(
     return response;
 }
 
-async function publicGetResponse(request: Request, env: Env, path: string): Promise<Response> {
+async function publicGetResponse(request: Request, env: ApiEnv, path: string): Promise<Response> {
     if (path === '/api/health') {
         try {
             await env.DB.prepare('SELECT 1').first();
@@ -452,7 +456,7 @@ async function publicGetResponse(request: Request, env: Env, path: string): Prom
     return json({ error: 'Not found' }, 404);
 }
 
-async function confirmation(request: Request, env: Env): Promise<Response> {
+async function confirmation(request: Request, env: ApiEnv): Promise<Response> {
     if (!env.CONFIRMATION_HMAC_SECRET) return new Response('Not configured', { status: 503 });
     const contentLength = request.headers.get('content-length');
     if (contentLength && Number.parseInt(contentLength, 10) > CONFIRMATION_MAX_BYTES)
@@ -493,6 +497,38 @@ async function confirmation(request: Request, env: Env): Promise<Response> {
     return json({ accepted: true });
 }
 
+async function monitorRun(request: Request, env: ApiEnv): Promise<Response> {
+    if (!env.CONFIRMATION_HMAC_SECRET) return new Response('Not configured', { status: 503 });
+    const contentLength = request.headers.get('content-length');
+    if (contentLength && Number.parseInt(contentLength, 10) > CONFIRMATION_MAX_BYTES)
+        return new Response('Payload too large', { status: 413 });
+    const raw = await request.text();
+    if (new TextEncoder().encode(raw).byteLength > CONFIRMATION_MAX_BYTES)
+        return new Response('Payload too large', { status: 413 });
+    const signature = request.headers.get('x-monitor-signature') ?? '';
+    const expected = await hmac(raw, env.CONFIRMATION_HMAC_SECRET);
+    if (!constantTimeEqual(signature, expected))
+        return new Response('Unauthorized', { status: 401 });
+
+    let body: { timestamp?: unknown };
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return invalid('Invalid JSON');
+        body = parsed as typeof body;
+    } catch {
+        return invalid('Invalid JSON');
+    }
+    if (
+        typeof body.timestamp !== 'number' ||
+        !Number.isSafeInteger(body.timestamp) ||
+        Math.abs(Date.now() - body.timestamp * 1_000) > MONITOR_RUN_TIMESTAMP_MAX_AGE_MS
+    )
+        return invalid('Invalid or expired timestamp');
+
+    const job = await enqueueManualMonitorJob(env);
+    return json({ jobId: job.jobId, state: 'QUEUED' }, 202);
+}
+
 async function hmac(value: string, secret: string): Promise<string> {
     const key = await crypto.subtle.importKey(
         'raw',
@@ -513,7 +549,7 @@ function constantTimeEqual(a: string, b: string): boolean {
     return diff === 0;
 }
 
-async function publicStatus(env: Env, requestedRange: string | null): Promise<Response> {
+async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise<Response> {
     const timestamp = new Date();
     const configuration = rangeConfiguration(requestedRange, timestamp);
     const [providers, modelResult, statuses, checks, executions, monitor] = await Promise.all([
@@ -596,7 +632,7 @@ async function publicStatus(env: Env, requestedRange: string | null): Promise<Re
 }
 
 async function modelDetail(
-    env: Env,
+    env: ApiEnv,
     modelId: string,
     history: boolean,
     range: string | null,
@@ -623,14 +659,14 @@ async function modelDetail(
     });
 }
 
-async function incidents(env: Env): Promise<Response> {
+async function incidents(env: ApiEnv): Promise<Response> {
     const result = await env.DB.prepare(
         `SELECT i.*,m.remote_name,p.name provider_name FROM incidents i JOIN models m ON m.id=i.model_id JOIN providers p ON p.id=i.provider_id ORDER BY i.started_at DESC LIMIT 100`,
     ).all();
     return json({ incidents: result.results });
 }
 
-async function monitor(env: Env): Promise<Response> {
+async function monitor(env: ApiEnv): Promise<Response> {
     const runs = await monitorRuns(env);
     return json(runs);
 }
@@ -652,7 +688,7 @@ type MonitorRun = {
     current_model: string | null;
 };
 
-async function monitorRuns(env: Env) {
+async function monitorRuns(env: ApiEnv) {
     const [result, successfulResult] = await Promise.all([
         env.DB.prepare(
             `SELECT id,started_at,finished_at,outcome,detail,phase,catalog_model_count,scheduled_model_count,

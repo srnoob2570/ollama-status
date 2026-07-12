@@ -41,6 +41,12 @@ const RUN_HARD_STOP_MS = CRON_INTERVAL_MS;
 // its own. A slow/hung GitHub API must not hold a probe batch (and thus the run) open.
 const CONFIRMATION_TIMEOUT_MS = 15_000;
 
+export type MonitorRunResult =
+    | { kind: 'LOCKED' }
+    | { kind: 'DUPLICATE' }
+    | { kind: 'COMPLETED'; runId: string; result: 'OK' | 'PARTIAL' }
+    | { kind: 'FAILED'; runId: string };
+
 // Process-local guards that skip idempotent D1 writes repeated every cron tick. They reset if
 // the Worker isolate is evicted, in which case the guarded write runs once more (still
 // idempotent). Trades negligible staleness for a large write-budget reduction on the free plan.
@@ -133,7 +139,8 @@ export async function ensureProviders(env: Env): Promise<void> {
     const timestamp = now();
     for (const seed of providerSeeds)
         await env.DB.prepare(
-            "INSERT OR IGNORE INTO providers (id,name,kind,base_url,secret_ref,created_at) VALUES (?,?,'ollama',?,?,?)",
+            `INSERT INTO providers (id,name,kind,base_url,secret_ref,created_at)
+             VALUES (?,?,'ollama',?,?,?) ON CONFLICT(id) DO NOTHING`,
         )
             .bind(seed.id, seed.name, env.OLLAMA_BASE_URL, seed.secret, timestamp)
             .run();
@@ -724,7 +731,8 @@ async function openRun(
         ).bind(started),
     ]);
     const insertedRun = await env.DB.prepare(
-        "INSERT OR IGNORE INTO monitor_runs(id,started_at,scheduled_at,phase) VALUES (?,?,?,'CATALOG')",
+        `INSERT INTO monitor_runs(id,started_at,scheduled_at,phase)
+         VALUES (?,?,?,'CATALOG') ON CONFLICT(id) DO NOTHING`,
     )
         .bind(runId, started, scheduledAt)
         .run();
@@ -1003,9 +1011,9 @@ export async function runMonitor(
     env: Env,
     ctx: ExecutionContext,
     scheduledTimeMs: number = Date.now(),
-): Promise<void> {
+): Promise<MonitorRunResult> {
     const owner = crypto.randomUUID();
-    if (!(await acquireLock(env, 'monitor', owner))) return;
+    if (!(await acquireLock(env, 'monitor', owner))) return { kind: 'LOCKED' };
     const runId = id('run'),
         started = now(),
         startedMs = Date.now(),
@@ -1019,7 +1027,10 @@ export async function runMonitor(
     const runController = new AbortController();
     const hardStop = setTimeout(() => runController.abort(), RUN_HARD_STOP_MS);
     try {
-        if (!(await openRun(env, runId, started, scheduledAt))) return;
+        // A duplicate scheduled event lost the idempotent insert, but it did acquire the lock.
+        // Keep it distinct from a genuinely active run so the HTTP entry point only reports an
+        // active lease as a lock conflict.
+        if (!(await openRun(env, runId, started, scheduledAt))) return { kind: 'DUPLICATE' };
         runCreated = true;
         const { freeProvider, paidProvider } = await resolveProviders(env);
         if (!freeProvider) throw new Error('global_catalog_unavailable');
@@ -1053,8 +1064,15 @@ export async function runMonitor(
             rejectedExecutions,
             dueCount: due.results.length,
         });
+        return {
+            kind: 'COMPLETED',
+            runId,
+            result:
+                catalogUnavailable || budgetExceeded || rejectedExecutions > 0 ? 'PARTIAL' : 'OK',
+        };
     } catch (error) {
         await abandonRun(env, runId, runCreated, runController, error);
+        return { kind: 'FAILED', runId };
     } finally {
         clearTimeout(hardStop);
         try {
@@ -1071,9 +1089,13 @@ export async function cleanup(env: Env, timestampMs: number = Date.now()): Promi
     const hour = new Date(timestampMs - 60 * 60_000).toISOString().slice(0, 13);
     if (hour !== lastRolledHour) {
         await env.DB.prepare(
-            `INSERT OR REPLACE INTO hourly_model_rollups(model_id,hour_at,sample_count,success_count,avg_latency_ms,p50_latency_ms,p95_latency_ms)
+            `INSERT INTO hourly_model_rollups(model_id,hour_at,sample_count,success_count,avg_latency_ms,p50_latency_ms,p95_latency_ms)
     SELECT model_id, ?, COUNT(*), SUM(CASE WHEN classification='SUCCESS' THEN 1 ELSE 0 END), AVG(total_duration_ms), NULL, NULL
-    FROM checks WHERE checked_at >= ? AND checked_at < ? GROUP BY model_id`,
+    FROM checks WHERE checked_at >= ? AND checked_at < ? GROUP BY model_id
+    ON CONFLICT(model_id,hour_at) DO UPDATE SET
+      sample_count=excluded.sample_count, success_count=excluded.success_count,
+      avg_latency_ms=excluded.avg_latency_ms, p50_latency_ms=excluded.p50_latency_ms,
+      p95_latency_ms=excluded.p95_latency_ms`,
         )
             .bind(
                 `${hour}:00:00.000Z`,

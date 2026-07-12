@@ -1670,7 +1670,7 @@ describe('monitor run recovery', () => {
                             statements.push(sql);
                             if (failCheckInsert && /INSERT INTO checks/.test(sql))
                                 throw new Error('check_insert_failed');
-                            if (/INSERT OR IGNORE INTO monitor_runs/.test(sql)) {
+                            if (/INSERT INTO monitor_runs/.test(sql)) {
                                 const scheduledAt = String(currentBindings[2]);
                                 if (insertedScheduledTimes.has(scheduledAt))
                                     return { meta: { changes: 0 } };
@@ -1788,12 +1788,12 @@ describe('monitor run recovery', () => {
             ),
         ).toBe(true);
         // (2) A new run is inserted.
-        expect(statements.some((s) => /INSERT OR IGNORE INTO monitor_runs/.test(s))).toBe(true);
+        expect(statements.some((s) => /INSERT INTO monitor_runs/.test(s))).toBe(true);
         // (3) The new run completes OK (not PARTIAL, not ERROR) after probing the due model.
         expect(statements.some((s) => /outcome=\?,phase='COMPLETED'/.test(s))).toBe(true);
 
         const runInsert = boundStatements.find((entry) =>
-            /INSERT OR IGNORE INTO monitor_runs/.test(entry.sql),
+            /INSERT INTO monitor_runs/.test(entry.sql),
         );
         expect(runInsert?.bindings[2]).toBe('2026-07-10T13:00:00.000Z');
         const executionInsert = boundStatements.find((entry) =>
@@ -1845,7 +1845,7 @@ describe('monitor run recovery', () => {
         boundStatements.length = 0;
         globalThis.fetch = monitorFetch;
         await runMonitor(env, ctx, scheduledTime);
-        expect(statements.some((sql) => /INSERT OR IGNORE INTO monitor_runs/.test(sql))).toBe(true);
+        expect(statements.some((sql) => /INSERT INTO monitor_runs/.test(sql))).toBe(true);
         expect(statements.some((sql) => /INSERT INTO model_check_executions/.test(sql))).toBe(
             false,
         );

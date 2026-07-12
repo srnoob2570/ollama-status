@@ -37,13 +37,18 @@ export interface D1DatabaseLike {
     batch(statements: D1StatementLike[]): Promise<{ meta: { changes: number } }[]>;
 }
 
-export interface Env {
+export interface ApiEnv {
     DB: D1DatabaseLike;
     ASSETS: Fetcher;
-    OLLAMA_BASE_URL: string;
-    OLLAMA_MAX_TOKENS?: string;
+    CONFIRMATION_HMAC_SECRET?: string;
     FREE_CHECK_INTERVAL_MINUTES?: string;
     PAID_CHECK_INTERVAL_MINUTES?: string;
+}
+
+/** Configuration shared by the scheduler and its probe workers. */
+export interface MonitorEnv extends ApiEnv {
+    OLLAMA_BASE_URL: string;
+    OLLAMA_MAX_TOKENS?: string;
     // Independent throttle controls: Free keys remain conservative, while Paid keys can
     // use the provider's higher parallelism allowance.
     FREE_PROBE_CONCURRENCY?: string;
@@ -52,13 +57,16 @@ export interface Env {
     PROBE_DELAY_MAX_MS?: string;
     OLLAMA_API_KEY_FREE: string;
     OLLAMA_API_KEY_PAID: string;
-    CONFIRMATION_HMAC_SECRET?: string;
     CONFIRMATION_CALLBACK_URL?: string;
     GITHUB_REPOSITORY?: string;
     GITHUB_ACTIONS_TOKEN?: string;
     EXCLUDED_MODELS?: string;
     ENVIRONMENT?: string;
 }
+
+// Cloudflare binds the complete monitor capability set to one Worker. Node splits it into a
+// database-only web process and a private monitor process.
+export type Env = MonitorEnv;
 
 export interface Provider {
     id: string;

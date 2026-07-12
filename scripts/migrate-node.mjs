@@ -1,44 +1,50 @@
-import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, readdirSync, mkdirSync } from 'node:fs';
+/* global console, process */
+
+import { Pool } from 'pg';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const rootDir = join(dirname(fileURLToPath(import.meta.url)), '..');
-const migrationsDir = join(rootDir, 'migrations');
-const dbPath = process.env.DB_PATH ?? join(rootDir, 'data', 'ollama-status.sqlite');
+const migrationsDir = join(rootDir, 'migrations', 'postgres');
 
-if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const client = await pool.connect();
 
-const db = new DatabaseSync(dbPath);
-db.exec('PRAGMA journal_mode = WAL');
-db.exec(
-    'CREATE TABLE IF NOT EXISTS _migrations_applied (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)',
-);
+try {
+    await client.query("SELECT pg_advisory_lock(hashtext('ollama-status-migrations'))");
+    await client.query(
+        'CREATE TABLE IF NOT EXISTS _migrations_applied (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)',
+    );
 
-const applied = new Set(
-    db.prepare('SELECT name FROM _migrations_applied').all().map((row) => row.name),
-);
+    const applied = new Set(
+        (await client.query('SELECT name FROM _migrations_applied')).rows.map((row) => row.name),
+    );
 
-const files = readdirSync(migrationsDir)
-    .filter((file) => file.endsWith('.sql'))
-    .sort();
+    const files = readdirSync(migrationsDir)
+        .filter((file) => file.endsWith('.sql'))
+        .sort();
 
-for (const file of files) {
-    if (applied.has(file)) continue;
-    const sql = readFileSync(join(migrationsDir, file), 'utf8');
-    db.exec('BEGIN');
-    try {
-        db.exec(sql);
-        db.prepare('INSERT INTO _migrations_applied (name, applied_at) VALUES (?, ?)').run(
-            file,
-            new Date().toISOString(),
-        );
-        db.exec('COMMIT');
-        console.log(`applied ${file}`);
-    } catch (error) {
-        db.exec('ROLLBACK');
-        throw new Error(`migration ${file} failed: ${error.message}`);
+    for (const file of files) {
+        if (applied.has(file)) continue;
+        const sql = readFileSync(join(migrationsDir, file), 'utf8');
+        await client.query('BEGIN');
+        try {
+            await client.query(sql);
+            await client.query('INSERT INTO _migrations_applied (name, applied_at) VALUES ($1, $2)', [
+                file,
+                new Date().toISOString(),
+            ]);
+            await client.query('COMMIT');
+            console.log(`applied ${file}`);
+        } catch (error) {
+            await client.query('ROLLBACK');
+            throw new Error(`migration ${file} failed: ${error.message}`);
+        }
     }
+} finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext('ollama-status-migrations'))").catch(() => undefined);
+    client.release();
+    await pool.end();
 }
-
-db.close();

@@ -6,24 +6,29 @@
   "scripts": {
     "dev": "vite",
     "dev:worker": "wrangler dev",
+    "dev:docker": "docker down -v; docker compose build --no-cache; docker compose up -d",
     "build": "tsc -b && vite build",
+    "format": "npx prettier --write ./src/",
     "check": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
+    "test:postgres": "node scripts/test-postgres.mjs",
     "spike": "node scripts/spike.mjs",
     "quota:test": "node scripts/quota-test.mjs",
+    "monitor:run": "node scripts/run-monitor.mjs",
     "lint": "eslint .",
     "dev:node": "node --env-file=.dev.vars --watch src/node/server.ts",
-    "migrate:node": "node scripts/migrate-node.mjs",
-    "docker:up": "docker compose up --build",
+    "start:web": "node src/node/server.ts",
+    "start:runner": "node src/node/runner.ts",
     "deploy:staging": "npm run build && wrangler deploy --env staging",
     "deploy:production": "npm run build && wrangler deploy --env production",
+    "migrate:node": "node scripts/migrate-node.mjs",
     "migrate:staging": "wrangler d1 migrations apply ollama-status-staging --env staging --remote",
-    "migrate:production": "wrangler d1 migrations apply ollama-status --env production --remote",
-    "format": "npx prettier --write ./src/"
+    "migrate:production": "wrangler d1 migrations apply ollama-status --env production --remote"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^5.20260710.1",
     "node-cron": "^4.6.0",
+    "pg": "^8.22.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "srvx": "^0.11.22"
@@ -31,6 +36,7 @@
   "devDependencies": {
     "@eslint/js": "^9.31.0",
     "@types/node": "^24.0.0",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^6.0.1",

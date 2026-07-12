@@ -1,0 +1,10 @@
+ALTER TABLE monitor_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'STARTING';
+ALTER TABLE monitor_runs ADD COLUMN catalog_model_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN scheduled_model_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN completed_model_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN free_probe_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN paid_probe_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN paid_skipped_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN failed_probe_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE monitor_runs ADD COLUMN current_model TEXT;
+CREATE INDEX idx_monitor_runs_started_at ON monitor_runs(started_at DESC);
