@@ -1,7 +1,7 @@
 import { serve } from 'srvx';
 import cron from 'node-cron';
 import { drainManualMonitorJobs } from '../worker/monitor-jobs.ts';
-import { lastMonitorSettledMs, recoverOrphanedRuns, runMonitor } from '../worker/monitor.ts';
+import { hasRecoverableStuckRun, lastMonitorSettledMs, runMonitor } from '../worker/monitor.ts';
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
 import { buildRunnerEnv } from './env.ts';
@@ -60,14 +60,28 @@ cron.schedule(
 setInterval(drainQueue, 5_000).unref();
 void drainQueue();
 
-// A previous process that died mid-run left its run open ("monitor stuck"); close it now instead
-// of waiting for the first cron tick to reclaim the lock. False means the lock is still leased
-// and the cron path will recover once it expires.
-void recoverOrphanedRuns(env)
-    .then((recovered) => {
-        if (recovered) console.log('recovered orphaned monitor runs at boot');
-    })
-    .catch((error: unknown) => console.warn('boot run recovery failed', error));
+// Recovery supervisor: a run left open by a dead or wedged owner (crash, lost lease) would
+// otherwise wait for the next cron tick to be reclaimed — up to a full extra check cadence of
+// missed data. Poll for that state and run the monitor immediately: openRun abandons the orphan
+// and the recovery run probes every due model on the spot. The boot invocation covers restarts,
+// so recovery latency is bounded by the lock lease plus this poll interval, not by cron.
+let supervising = false;
+async function superviseMonitor(): Promise<void> {
+    if (supervising) return;
+    supervising = true;
+    try {
+        if (!(await hasRecoverableStuckRun(env))) return;
+        console.warn('stuck monitor run detected, recovering now');
+        const result = await runMonitor(env, ctx, Date.now());
+        console.log(`recovery monitor run finished: ${result.kind}`);
+    } catch (error) {
+        console.error('monitor recovery supervision failed', error);
+    } finally {
+        supervising = false;
+    }
+}
+setInterval(() => void superviseMonitor(), 30_000).unref();
+void superviseMonitor();
 
 setInterval(() => {
     if (schedulerStaleMs() > WATCHDOG_EXIT_MS) {

@@ -25,7 +25,19 @@ const FREE_PROBE_CONCURRENCY_DEFAULT = 1;
 const PAID_PROBE_CONCURRENCY_DEFAULT = 6;
 const PROBE_DELAY_MIN_MS_DEFAULT = 0;
 const PROBE_DELAY_MAX_MS_DEFAULT = 5_000;
-const LOCK_LEASE_MS = 6 * 60_000;
+// Upper bound on how long a dead/wedged owner blocks a takeover — i.e. the recovery latency for
+// a stuck run. Renewal is progress-based (drainProbeQueues renews before launching work), so the
+// lease only needs to outlive the longest legitimate silence between renewals: one in-flight
+// probe (45s timeout + 5s max delay) plus terminal writes bounded by the DB adapter's timeouts,
+// with the catalog phase time-boxed by SHOW_REFRESH_BUDGET_MS — ~110s worst case. Three minutes
+// keeps comfortable margin while letting the runner's supervisor reclaim a stuck scheduler
+// before due models miss more than one check cadence.
+const LOCK_LEASE_MS = 3 * 60_000;
+// Budget for the /show metadata refreshes inside a catalog sync. They are diagnostic-only data
+// with a 24h staleness tolerance; without a bound, a slow /show endpoint could stretch the
+// catalog phase past the lock lease and cost a healthy run its lock. Skipped models refresh on
+// later cycles.
+const SHOW_REFRESH_BUDGET_MS = 30_000;
 // Absolute wall-clock budget after which a run is forcibly aborted regardless of why it stalled.
 // A legitimate run finishes within one cron interval (the soft deadline in runDeadlineMs stops it
 // starting new batches ~245s in, and the in-flight batch adds ~55s of margin). This hard stop only
@@ -210,6 +222,7 @@ async function syncCatalog(
     try {
         const catalog = await client.tags(signal);
         const timestamp = now();
+        const showDeadline = Date.now() + SHOW_REFRESH_BUDGET_MS;
         const existingModels = await env.DB.prepare(
             'SELECT id,remote_name,last_show_at,digest,active FROM models WHERE provider_id=?',
         )
@@ -253,9 +266,10 @@ async function syncCatalog(
                     .run();
             }
             if (
-                !existing?.last_show_at ||
-                existing.digest !== remoteDigest ||
-                Date.now() - new Date(existing.last_show_at).getTime() >= 24 * 60 * 60_000
+                Date.now() < showDeadline &&
+                (!existing?.last_show_at ||
+                    existing.digest !== remoteDigest ||
+                    Date.now() - new Date(existing.last_show_at).getTime() >= 24 * 60 * 60_000)
             ) {
                 try {
                     const details = await client.show(remote.name, signal);
@@ -740,22 +754,19 @@ async function abandonOpenRuns(env: Env, at: string): Promise<void> {
     ]);
 }
 
-// Startup recovery for the Node runner: a process that died mid-run leaves its run open (the
-// dashboard's "monitor stuck") until a later cron tick reclaims the lock through openRun. Running
-// this at boot closes the orphan as soon as the container restarts instead. Returns false when
-// the lock is still leased — an active or recently-dead owner — in which case the normal cron
-// path recovers once the lease expires.
-export async function recoverOrphanedRuns(env: Env): Promise<boolean> {
-    const owner = crypto.randomUUID();
-    if (!(await acquireLock(env, 'monitor', owner))) return false;
-    try {
-        await abandonOpenRuns(env, now());
-        return true;
-    } finally {
-        await releaseLock(env, 'monitor', owner).catch((error: unknown) =>
-            console.warn(`boot recovery lock release failed: ${error}`),
-        );
-    }
+// True when a run is open but nobody holds a live lease on the monitor lock: its owner died or
+// wedged without closing it. The Node runner's supervisor polls this to launch an immediate
+// recovery run — openRun abandons the orphan and the run probes every due model on the spot —
+// instead of waiting for the next cron tick, so due models miss at most one check cadence.
+export async function hasRecoverableStuckRun(env: Env): Promise<boolean> {
+    const stuck = await env.DB.prepare(
+        `SELECT 1 AS stuck FROM monitor_runs WHERE finished_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM scheduler_locks WHERE name='monitor' AND lease_until > ?)
+         LIMIT 1`,
+    )
+        .bind(now())
+        .first<{ stuck: number }>();
+    return stuck !== null;
 }
 
 // A lock owner must always have a visible run, including initialization failures. Abandons any
@@ -870,8 +881,7 @@ async function drainProbeQueues(
     ) => {
         if (pool === 'free') activeFree += 1;
         else activePaid += 1;
-        let tracked: Promise<WorkerResult>;
-        tracked = work
+        const tracked: Promise<WorkerResult> = work
             .then((task) =>
                 pool === 'free'
                     ? { pool, task: task as PaidProbeTask | undefined }
