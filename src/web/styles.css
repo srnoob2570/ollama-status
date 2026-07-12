@@ -328,6 +328,23 @@ time,
     color: #ffffff;
 }
 
+.tt-reason {
+    display: grid;
+    gap: 4px;
+    padding-top: 10px;
+    border-top: 1px solid #27272a;
+    color: #e4e4e7;
+    line-height: 1.4;
+}
+
+.tt-reason-label {
+    color: #ffffff;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
 .tt-metrics {
     display: grid;
     grid-template-columns: auto 1fr;
