@@ -7,6 +7,16 @@ services:
       - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
     restart: "no"
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?Set the Cloudflare Tunnel token}
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+
   web:
     build: .
     command: ["node", "src/node/server.ts"]
@@ -32,16 +42,8 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate run
-    environment:
-      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?Set the Cloudflare Tunnel token}
-    depends_on:
-      web:
-        condition: service_healthy
-    restart: unless-stopped
+    networks:
+      - coolify
 
   runner:
     build: .
@@ -79,3 +81,8 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    networks:
+      - coolify
+networks:
+  coolify:
+    external: true
