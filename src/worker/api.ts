@@ -1,5 +1,6 @@
 import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status.ts';
 import { enqueueManualMonitorJob } from './monitor-jobs.ts';
+import { analyzeCadence } from './cadence.ts';
 import type { ApiEnv } from './types.ts';
 import { now } from './types.ts';
 
@@ -39,6 +40,7 @@ export type HistoryCheck = {
     classification: string;
     total_duration_ms: number | null;
     rtt_ms: number | null;
+    ttft_ms: number | null;
     execution_id?: string | null;
 };
 export type HistoryExecutionState =
@@ -139,6 +141,7 @@ export function historyBuckets(
         segmentCounts: new Map<string, { status: string; classification: string; checks: number }>(),
         totalDurations: [] as number[],
         rtts: [] as number[],
+        ttfts: [] as number[],
         pending: false,
     }));
     for (const check of checks) {
@@ -162,12 +165,14 @@ export function historyBuckets(
                 classification: check.classification,
                 checks: 1,
             });
+        if (typeof check.ttft_ms === 'number')
+            bucket.ttfts.push(check.ttft_ms);
         if (typeof check.total_duration_ms === 'number')
             bucket.totalDurations.push(check.total_duration_ms);
         if (typeof check.rtt_ms === 'number') bucket.rtts.push(check.rtt_ms);
     }
-    return buckets.map(({ totalDurations, rtts, segmentCounts, ...bucket }) => {
-        const timings = totalDurations.length ? totalDurations : rtts;
+    return buckets.map(({ totalDurations, rtts, ttfts, segmentCounts, ...bucket }) => {
+        const timings = ttfts.length ? ttfts : totalDurations.length ? totalDurations : rtts;
         const averageLatencyMs = timings.length
             ? timings.reduce((sum, value) => sum + value, 0) / timings.length
             : null;
@@ -182,12 +187,14 @@ export function historyBuckets(
     });
 }
 
-function checkLatency(check: HistoryCheck): number | null {
-    return typeof check.total_duration_ms === 'number'
-        ? check.total_duration_ms
-        : typeof check.rtt_ms === 'number'
-          ? check.rtt_ms
-          : null;
+export function checkLatency(check: HistoryCheck): number | null {
+    return typeof check.ttft_ms === 'number'
+        ? check.ttft_ms
+        : typeof check.total_duration_ms === 'number'
+          ? check.total_duration_ms
+          : typeof check.rtt_ms === 'number'
+            ? check.rtt_ms
+            : null;
 }
 
 function completedExecutionBucket(
@@ -390,15 +397,18 @@ export function findActiveRun<T extends { finished_at: string | null; started_at
     return { current, stuck };
 }
 
-function latencyMetrics(checks: HistoryCheck[]) {
+export function latencyMetrics(checks: HistoryCheck[]) {
+    const ttfts = checks
+        .map((check) => check.ttft_ms)
+        .filter((value): value is number => typeof value === 'number');
     const totalDurations = checks
         .map((check) => check.total_duration_ms)
         .filter((value): value is number => typeof value === 'number');
     const rtts = checks
         .map((check) => check.rtt_ms)
         .filter((value): value is number => typeof value === 'number');
-    const latencySource = totalDurations.length ? 'TOTAL_DURATION' : rtts.length ? 'RTT' : null;
-    const timings = (totalDurations.length ? totalDurations : rtts).sort((a, b) => a - b);
+    const latencySource = ttfts.length ? 'TTFT' : totalDurations.length ? 'TOTAL_DURATION' : rtts.length ? 'RTT' : null;
+    const timings = (ttfts.length ? ttfts : totalDurations.length ? totalDurations : rtts).sort((a, b) => a - b);
     const percentile = (p: number) =>
         timings.length
             ? timings[Math.min(timings.length - 1, Math.ceil(timings.length * p) - 1)]
@@ -451,6 +461,8 @@ async function publicGetResponse(request: Request, env: ApiEnv, path: string): P
         return publicStatus(env, new URL(request.url).searchParams.get('range'));
     if (path === '/api/v1/incidents') return incidents(env);
     if (path === '/api/v1/monitor') return monitor(env);
+    if (path === '/api/v1/monitor/cadence')
+        return cadenceHandler(env, new URL(request.url).searchParams.get('window'));
     const modelMatch = path.match(/^\/api\/v1\/models\/([^/]+)(\/history)?$/);
     if (modelMatch)
         return modelDetail(
@@ -569,7 +581,7 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
             'SELECT provider_id,model_id,public_status,classification,last_check_at,last_latency_ms FROM provider_model_status',
         ).all<StatusRow>(),
         env.DB.prepare(
-            "SELECT c.provider_id,c.model_id,c.checked_at,c.public_status,c.classification,c.total_duration_ms,c.rtt_ms,c.execution_id FROM checks c JOIN models m ON m.id=c.model_id WHERE m.provider_id='ollama-free' AND c.checked_at>=? AND c.checked_at<=? ORDER BY c.checked_at",
+            "SELECT c.provider_id,c.model_id,c.checked_at,c.public_status,c.classification,c.total_duration_ms,c.rtt_ms,c.ttft_ms,c.execution_id FROM checks c JOIN models m ON m.id=c.model_id WHERE m.provider_id='ollama-free' AND c.checked_at>=? AND c.checked_at<=? ORDER BY c.checked_at",
         )
             .bind(configuration.start.toISOString(), timestamp.toISOString())
             .all<HistoryCheck>(),
@@ -589,35 +601,44 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
     const statusesByModel = groupBy(statuses.results, (status) => status.model_id);
     const checksByModel = groupBy(checks.results, (check) => check.model_id);
     const executionsByModel = groupBy(executions.results, (execution) => execution.model_id);
-    const models = modelResult.results.map((model) => {
-        const modelStatuses = statusesByModel.get(model.id) ?? [];
-        const providerId = effectiveProvider(model.tier, model.id, modelStatuses);
-        const modelChecks = checksByModel.get(model.id) ?? [];
-        const providerChecks = modelChecks.filter((check) => check.provider_id === providerId);
-        const intervalMinutes = nominalCheckIntervalMinutes(
-            model.tier === 'PAID' ? 'PAID' : model.tier === 'FREE' ? 'FREE' : 'UNKNOWN',
-            env,
-        );
-        const effectiveStatus = statusesByModelProvider.get(`${providerId}:${model.id}`);
-        return {
-            ...model,
-            effectiveProvider: providerId.replace('ollama-', ''),
-            effectiveStatus: effectiveStatus?.public_status ?? 'UNKNOWN',
-            effectiveClassification: effectiveStatus?.classification ?? 'UNKNOWN',
-            lastCheckAt: effectiveStatus?.last_check_at ?? null,
-            lastLatencyMs: effectiveStatus?.last_latency_ms ?? null,
-            intervalMinutes,
-            metrics: latencyMetrics(providerChecks),
-            history:
-                configuration.range === '1h'
-                    ? executionHistoryBuckets(
-                          executionsByModel.get(model.id) ?? [],
-                          modelChecks,
-                          timestamp,
-                      )
-                    : historyBuckets(providerChecks, configuration.range, timestamp),
-        };
-    });
+    const models = await Promise.all(
+        modelResult.results.map(async (model) => {
+            const modelStatuses = statusesByModel.get(model.id) ?? [];
+            const providerId = effectiveProvider(model.tier, model.id, modelStatuses);
+            const modelChecks = checksByModel.get(model.id) ?? [];
+            const providerChecks = modelChecks.filter((check) => check.provider_id === providerId);
+            const intervalMinutes = nominalCheckIntervalMinutes(
+                model.tier === 'PAID' ? 'PAID' : model.tier === 'FREE' ? 'FREE' : 'UNKNOWN',
+                env,
+            );
+            const effectiveStatus = statusesByModelProvider.get(`${providerId}:${model.id}`);
+            let cadence: unknown = null;
+            try {
+                cadence = await analyzeCadence(env.DB, model.id, '1h');
+            } catch {
+                cadence = null;
+            }
+            return {
+                ...model,
+                effectiveProvider: providerId.replace('ollama-', ''),
+                effectiveStatus: effectiveStatus?.public_status ?? 'UNKNOWN',
+                effectiveClassification: effectiveStatus?.classification ?? 'UNKNOWN',
+                lastCheckAt: effectiveStatus?.last_check_at ?? null,
+                lastLatencyMs: effectiveStatus?.last_latency_ms ?? null,
+                intervalMinutes,
+                metrics: latencyMetrics(providerChecks),
+                history:
+                    configuration.range === '1h'
+                        ? executionHistoryBuckets(
+                              executionsByModel.get(model.id) ?? [],
+                              modelChecks,
+                              timestamp,
+                          )
+                        : historyBuckets(providerChecks, configuration.range, timestamp),
+                cadence,
+            };
+        }),
+    );
     return json({
         lastUpdatedAt: monitor.lastSuccessfulFinishedAt,
         checkIntervals: {
@@ -653,7 +674,7 @@ async function modelDetail(
     const configuration = rangeConfiguration(range);
     const from = configuration.start.toISOString();
     const checks = await env.DB.prepare(
-        'SELECT provider_id,checked_at,classification,public_status,total_duration_ms,rtt_ms,load_duration_ms FROM checks WHERE model_id=? AND checked_at>=? ORDER BY checked_at',
+        'SELECT provider_id,checked_at,classification,public_status,total_duration_ms,rtt_ms,ttft_ms,load_duration_ms FROM checks WHERE model_id=? AND checked_at>=? ORDER BY checked_at',
     )
         .bind(modelId, from)
         .all();
@@ -675,6 +696,54 @@ async function incidents(env: ApiEnv): Promise<Response> {
 async function monitor(env: ApiEnv): Promise<Response> {
     const runs = await monitorRuns(env);
     return json(runs);
+}
+
+async function cadenceHandler(env: ApiEnv, rawWindow: string | null): Promise<Response> {
+    const window = rawWindow === '24h' ? '24h' : '1h';
+    const models = await env.DB.prepare(
+        'SELECT id, remote_name, tier FROM models WHERE active=1 AND excluded=0 ORDER BY tier, remote_name',
+    ).all<{ id: string; remote_name: string; tier: string }>();
+
+    const results = await Promise.all(
+        models.results.map((model) =>
+            analyzeCadence(env.DB, model.id, window).then((c) => ({
+                modelId: model.id,
+                modelName: model.remote_name,
+                tier: model.tier,
+                nominalExpected: c.nominalExpected,
+                satisfied: c.satisfied,
+                suppressed: c.suppressed,
+                missed: c.missed,
+                nominalCoverage: c.nominalCoverage,
+                policyAdherence: c.policyAdherence,
+                state: c.state,
+                dominantReason: c.dominantReason,
+            })),
+        ),
+    );
+
+    const reasonDistribution = new Map<string, number>();
+    let degradedCount = 0;
+    let breachedCount = 0;
+    for (const r of results) {
+        if (r.state === 'DEGRADED') degradedCount++;
+        if (r.state === 'BREACHED') breachedCount++;
+        if (r.dominantReason) {
+            reasonDistribution.set(r.dominantReason, (reasonDistribution.get(r.dominantReason) ?? 0) + 1);
+        }
+    }
+
+    return json({
+        window,
+        evaluatedAt: now(),
+        models: results,
+        summary: {
+            totalModels: results.length,
+            degradedCount,
+            breachedCount,
+            reasonDistribution: Object.fromEntries(reasonDistribution),
+        },
+    });
 }
 
 type MonitorRun = {
