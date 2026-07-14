@@ -1414,7 +1414,7 @@ describe('monitor run recovery', () => {
             },
         } as unknown as Env;
         const ctx = { waitUntil() {} } as unknown as Parameters<typeof runMonitor>[1];
-        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        globalThis.fetch = (async (input: Request | URL | string, init?: RequestInit) => {
             const url = input.toString();
             if (url.endsWith('/tags'))
                 return new Response(JSON.stringify({ models: models.map(({ remote_name, digest }) => ({ name: remote_name, digest })) }), { status: 200 });
@@ -1562,7 +1562,7 @@ describe('monitor run recovery', () => {
         const bothChatsStarted = new Promise<void>((resolve) => {
             resolveChatsStarted = resolve;
         });
-        globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        globalThis.fetch = ((input: Request | URL | string, init?: RequestInit) => {
             const url = input.toString();
             if (url.endsWith('/tags'))
                 return Promise.resolve(
@@ -1858,7 +1858,7 @@ describe('monitor run recovery', () => {
                 void p.catch(() => {});
             },
         } as unknown as Parameters<typeof runMonitor>[1];
-        const monitorFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const monitorFetch = (async (input: Request | URL | string, init?: RequestInit) => {
             const url = typeof input === 'string' ? input : input.toString();
             if (url.endsWith('/tags'))
                 // Catalog listing with one model.
@@ -2115,7 +2115,7 @@ describe('monitor run recovery', () => {
                 void p.catch(() => {});
             },
         } as unknown as Parameters<typeof runMonitor>[1];
-        const monitorFetch = (async (input: RequestInfo | URL) => {
+        const monitorFetch = (async (input: Request | URL | string) => {
             const url = typeof input === 'string' ? input : input.toString();
             if (url.endsWith('/tags')) return new Response('service unavailable', { status: 503 });
             // /chat stream: first content chunk proves inference started.

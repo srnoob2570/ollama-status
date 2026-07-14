@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { createTestDb, seedProvider, seedModel, seedExpectation } from './helpers/ledger-fixture.ts';
-import type { D1DatabaseLike } from '../src/worker/types.ts';
+import type { D1DatabaseLike, ExecutionContext } from '../src/worker/types.ts';
 
 // Mock the Cache API global that Cloudflare Workers provide but Node does not.
 const mockCache = {

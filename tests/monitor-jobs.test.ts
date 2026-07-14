@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, readdirSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SqliteD1Adapter } from '../src/node/sqlite-d1-adapter.ts';
-import type { MonitorEnv } from '../src/worker/types.ts';
+import type { ExecutionContext, MonitorEnv } from '../src/worker/types.ts';
 
 const monitor = vi.hoisted(() => ({ runMonitor: vi.fn() }));
 vi.mock('../src/worker/monitor.ts', () => monitor);

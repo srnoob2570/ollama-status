@@ -7,7 +7,7 @@ import { MemoryCache } from '../src/node/memory-cache.ts';
 import { runMonitor } from '../src/worker/monitor.ts';
 import { drainManualMonitorJobs } from '../src/worker/monitor-jobs.ts';
 import { api } from '../src/worker/api.ts';
-import type { Env } from '../src/worker/types.ts';
+import type { CacheStorage, Env, ExecutionContext } from '../src/worker/types.ts';
 
 function migratedDb(): DatabaseSync {
     const db = new DatabaseSync(':memory:');
@@ -29,7 +29,7 @@ describe('node:sqlite D1 adapter parity', () => {
         } as unknown as CacheStorage;
         const ctx = { waitUntil(p: Promise<unknown>) { void p; } } as unknown as ExecutionContext;
         const originalFetch = globalThis.fetch;
-        globalThis.fetch = (async (input: RequestInfo | URL) => {
+        globalThis.fetch = (async (input: Request | URL | string) => {
             const url = String(input);
             if (url.endsWith('/tags'))
                 return new Response(JSON.stringify({ models: [{ name: 'm', digest: 'd' }] }));
@@ -92,7 +92,7 @@ describe('node:sqlite D1 adapter parity', () => {
         } as unknown as ExecutionContext;
         let probeCalls = 0;
         const originalFetch = globalThis.fetch;
-        globalThis.fetch = (async (input: RequestInfo | URL) => {
+        globalThis.fetch = (async (input: Request | URL | string) => {
             const url = String(input);
             if (url.endsWith('/tags'))
                 return new Response(JSON.stringify({ models: [{ name: 'm', digest: 'd' }] }));

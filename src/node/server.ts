@@ -7,6 +7,7 @@ import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
 import { MemoryCache } from './memory-cache.ts';
 import { buildWebEnv } from './env.ts';
+import type { CacheStorage, ExecutionContext } from '../worker/types.ts';
 
 const DIST_DIR = join(import.meta.dirname, '../../dist');
 

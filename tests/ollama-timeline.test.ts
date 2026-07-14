@@ -128,7 +128,7 @@ describe('probe timeline milestones', () => {
     });
 
     it('hard stop via parentSignal: rethrows AbortError for monitor to handle', async () => {
-        globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+        globalThis.fetch = async (_input: Request | URL | string, init?: RequestInit) => {
             if (init?.signal?.aborted) {
                 throw new DOMException('The operation was aborted', 'AbortError');
             }

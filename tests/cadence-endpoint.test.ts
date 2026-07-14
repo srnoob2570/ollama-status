@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, beforeAll } from 'vitest';
 import { createTestDb, seedModel, seedExpectation } from './helpers/ledger-fixture.ts';
-import type { ApiEnv, D1DatabaseLike } from '../src/worker/types.ts';
+import type { ApiEnv, D1DatabaseLike, ExecutionContext } from '../src/worker/types.ts';
 
 interface CadenceModel {
     modelId: string;

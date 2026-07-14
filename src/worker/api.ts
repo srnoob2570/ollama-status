@@ -1,7 +1,7 @@
 import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status.ts';
 import { enqueueManualMonitorJob } from './monitor-jobs.ts';
 import { analyzeCadence } from './cadence.ts';
-import type { ApiEnv } from './types.ts';
+import type { ApiEnv, Cache, CacheStorage, ExecutionContext } from './types.ts';
 import { now } from './types.ts';
 
 const json = (body: unknown, status = 200) =>
@@ -16,7 +16,7 @@ const invalid = (message: string) => json({ error: message }, 400);
 // TTL) and keep the dashboard's 30s polling off D1 ~98% of the time. Evaluated at call time so
 // the module loads in test environments where `caches` is not a global.
 function defaultCache(): Cache {
-    return (caches as unknown as { default: Cache }).default;
+    return ((globalThis as unknown as { caches: CacheStorage }).caches).default;
 }
 
 const HISTORY_1H_WINDOW_MS = 60 * 60_000;

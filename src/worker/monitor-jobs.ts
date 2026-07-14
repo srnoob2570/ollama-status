@@ -1,5 +1,5 @@
 import { runMonitor, type MonitorRunResult } from './monitor.ts';
-import { id, now, type ApiEnv, type MonitorEnv } from './types.ts';
+import { id, now, type ApiEnv, type ExecutionContext, type MonitorEnv } from './types.ts';
 
 const JOB_TTL_MS = 15 * 60_000;
 

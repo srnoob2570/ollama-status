@@ -8,7 +8,7 @@ import {
 } from './status.ts';
 import { recordSchedulerTick, updateSchedulerTick, updateExecutionState, recordProbeAttempt, completeProbeAttempt, updateExpectationState } from './ledger.ts';
 import { materializeExpectations } from './expectations.ts';
-import type { Classification, Env, Model, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
+import type { Classification, Env, ExecutionContext, Model, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
 import { id, now } from './types.ts';
 
 const providerSeeds = [

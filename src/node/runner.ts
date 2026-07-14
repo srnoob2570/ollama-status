@@ -5,6 +5,7 @@ import { hasRecoverableStuckRun, lastMonitorSettledMs, runMonitor } from '../wor
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
 import { buildRunnerEnv } from './env.ts';
+import type { ExecutionContext } from '../worker/types.ts';
 import { startOutboxConsumer } from './outbox-consumer.ts';
 
 // A monitor attempt settles every cron interval (5 min) and a legitimate run can take up to one

@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import type { ApiEnv } from '../src/worker/types.ts';
+import type { ApiEnv, ExecutionContext } from '../src/worker/types.ts';
 
 const { api } = await import('../src/worker/api.ts');
 
