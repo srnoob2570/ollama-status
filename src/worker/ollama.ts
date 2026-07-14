@@ -1,5 +1,7 @@
 import { classifyHttp, isLatencyAnomalous, publicStatusFor } from './status.ts';
-import type { ProbeResult, Provider } from './types.ts';
+import { classifyProbe } from './classifier.ts';
+import type { ProbeResult, Provider, TimeoutStage } from './types.ts';
+import { now } from './types.ts';
 
 // Probe fetch abort threshold. Exported so runMonitor's time-box margin can absorb a full
 // in-flight probe when computing the per-tick deadline (see runDeadlineMs in monitor.ts).
@@ -118,7 +120,8 @@ export class OllamaProvider {
         baseline?: number,
         parentSignal?: AbortSignal,
     ): Promise<ProbeResult> {
-        const started = performance.now();
+        const startedAt = now();
+        const startedMs = Date.now();
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
         // A hard stop at the run level aborts `parentSignal` when the whole run has overstayed its
@@ -127,6 +130,15 @@ export class OllamaProvider {
         const signal = parentSignal
             ? AbortSignal.any([controller.signal, parentSignal])
             : controller.signal;
+
+        // Timeline milestones (spec 002 §2.4)
+        let headersAt: string | null = null;
+        const milestones = { firstByteAt: null as string | null, firstTokenAt: null as string | null };
+        let httpStatus: number | null = null;
+        let timeoutStage: TimeoutStage | null = null;
+        const responseBodySnippet: string | null = null;
+        let retryAfterHeader: string | null | undefined = undefined;
+
         try {
             const response = await fetch(this.url('/chat'), {
                 method: 'POST',
@@ -141,6 +153,10 @@ export class OllamaProvider {
                     options: { num_predict: this.maxResponseTokens, temperature: 0 },
                 }),
             });
+            headersAt = now();
+            httpStatus = response.status;
+            retryAfterHeader = response.headers.get('retry-after') ?? undefined;
+
             if (!response.ok) {
                 // Inspect the response only in memory; errors and generated text are never persisted.
                 const error = await responseTextPrefix(response, maxResponseBytes);
@@ -154,27 +170,74 @@ export class OllamaProvider {
                     classification,
                     publicStatus: publicStatusFor(classification),
                     httpStatus: response.status,
-                    rttMs: performance.now() - started,
+                    rttMs: Date.now() - startedMs,
+                    headersAt,
+                    firstByteAt: milestones.firstByteAt,
+                    firstTokenAt: milestones.firstTokenAt,
+                    ttftMs: null,
                     errorCode: `http_${response.status}`,
                     retryAfterSeconds: Number.isFinite(retryAfter) ? retryAfter : undefined,
                 };
             }
-            return await firstChatToken(response, started, baseline);
+            return await firstChatToken(
+                response,
+                startedAt,
+                startedMs,
+                headersAt,
+                baseline,
+                milestones,
+            );
         } catch (error) {
+            const rttMs = Date.now() - startedMs;
+
             // A run-level hard stop (parentSignal) means the whole run is being aborted; rethrow so
             // runMonitor's catch closes the run as abandoned instead of silently persisting a
             // TIMEOUT check that would mask the stuck run. Only the probe's own 45s timer produces
             // a real TIMEOUT result.
             if (parentSignal?.aborted) throw error;
-            const classification =
-                error instanceof DOMException && error.name === 'AbortError'
-                    ? 'TIMEOUT'
-                    : 'NETWORK_ERROR';
+
+            // When an error occurs (fetch failure or stream error), the HTTP status is either
+            // absent or misleading. Null it so the classifier uses the error-based path.
+            httpStatus = null;
+
+            // Determine timeout stage for the probe's own AbortError
+            if (error instanceof DOMException && error.name === 'AbortError') {
+                if (!headersAt) {
+                    timeoutStage = 'REQUEST_OR_HEADERS';
+                } else if (!milestones.firstByteAt) {
+                    timeoutStage = 'FIRST_BYTE';
+                } else if (!milestones.firstTokenAt) {
+                    timeoutStage = 'FIRST_TOKEN';
+                } else {
+                    timeoutStage = 'NONE';
+                }
+            }
+
+            const classificationResult = classifyProbe({
+                httpStatus,
+                error,
+                timeoutStage,
+                responseBodySnippet,
+                retryAfterHeader,
+            });
+
             return {
-                classification,
-                publicStatus: publicStatusFor(classification),
-                rttMs: performance.now() - started,
-                errorCode: classification.toLowerCase(),
+                classification: classificationResult.classification,
+                publicStatus: classificationResult.publicStatus,
+                httpStatus: classificationResult.httpStatus ?? undefined,
+                rttMs,
+                headersAt,
+                firstByteAt: milestones.firstByteAt,
+                firstTokenAt: milestones.firstTokenAt,
+                ttftMs: milestones.firstTokenAt ? Date.parse(milestones.firstTokenAt) - startedMs : null,
+                timeoutStage: classificationResult.timeoutStage ?? undefined,
+                failureDomain: classificationResult.failureDomain,
+                reasonCode: classificationResult.reasonCode,
+                evidenceSource: classificationResult.evidenceSource,
+                retryability: classificationResult.retryability,
+                contributesToStatus: classificationResult.contributesToStatus,
+                errorCode: classificationResult.classification.toLowerCase(),
+                retryAfterSeconds: classificationResult.retryAfterSeconds ?? undefined,
             };
         } finally {
             clearTimeout(timer);
@@ -184,10 +247,13 @@ export class OllamaProvider {
 
 async function firstChatToken(
     response: Response,
-    started: number,
+    startedAt: string,
+    startedMs: number,
+    headersAt: string,
     baseline?: number,
+    milestones?: { firstByteAt: string | null; firstTokenAt: string | null },
 ): Promise<ProbeResult> {
-    if (!response.body) return protocolError(started, 'missing_stream');
+    if (!response.body) return protocolError(startedAt, startedMs, headersAt, 'missing_stream');
     const reader = response.body.getReader(),
         decoder = new TextDecoder();
     let buffer = '';
@@ -195,10 +261,13 @@ async function firstChatToken(
     try {
         while (true) {
             const { done, value } = await reader.read();
+            if (milestones && !milestones.firstByteAt && value && value.byteLength > 0) {
+                milestones.firstByteAt = now();
+            }
             receivedBytes += value?.byteLength ?? 0;
             if (receivedBytes > maxResponseBytes) {
                 await reader.cancel();
-                return protocolError(started, 'stream_too_large');
+                return protocolError(startedAt, startedMs, headersAt, 'stream_too_large', milestones?.firstByteAt ?? null, milestones?.firstTokenAt ?? null);
             }
             buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
             const lines = buffer.split(/\r?\n/);
@@ -208,12 +277,12 @@ async function firstChatToken(
                 let chunk: ChatChunk;
                 try {
                     const parsed: unknown = JSON.parse(line);
-                    if (!isChatChunk(parsed)) return protocolError(started, 'invalid_stream');
+                    if (!isChatChunk(parsed)) return protocolError(startedAt, startedMs, headersAt, 'invalid_stream', milestones?.firstByteAt ?? null, milestones?.firstTokenAt ?? null);
                     chunk = parsed;
                 } catch {
-                    return protocolError(started, 'invalid_stream');
+                    return protocolError(startedAt, startedMs, headersAt, 'invalid_stream', milestones?.firstByteAt ?? null, milestones?.firstTokenAt ?? null);
                 }
-                if (chunk.error !== undefined) return streamError(started, chunk.error);
+                if (chunk.error !== undefined) return streamError(startedAt, startedMs, headersAt, chunk.error, milestones?.firstByteAt ?? null, milestones?.firstTokenAt ?? null);
                 // Some thinking-capable models emit only a thinking fragment before the
                 // configured token limit. Either field proves that inference started. Cancel the
                 // reader at the first token so the probe measures time-to-first-token and releases
@@ -226,20 +295,41 @@ async function firstChatToken(
                 ) {
                     // Measure time-to-first-token before cancel(), whose own teardown latency is
                     // unrelated to the model and would otherwise inflate the reported RTT.
-                    const rttMs = performance.now() - started;
+                    if (milestones) milestones.firstTokenAt = now();
+                    const rttMs = Date.now() - startedMs;
+                    const ttftMs = milestones?.firstTokenAt ? Date.parse(milestones.firstTokenAt) - startedMs : null;
                     await reader.cancel();
-                    const classification = isLatencyAnomalous(rttMs, baseline)
+                    const classification = isLatencyAnomalous(ttftMs ?? rttMs, baseline)
                         ? 'HIGH_LATENCY'
                         : 'SUCCESS';
+
+                    const classificationResult = classifyProbe({
+                        httpStatus: response.status,
+                        error: null,
+                        timeoutStage: null,
+                        responseBodySnippet: null,
+                        retryAfterHeader: response.headers.get('retry-after') ?? undefined,
+                    });
+
                     return {
                         classification,
-                        publicStatus: publicStatusFor(classification),
+                        publicStatus: classificationResult.publicStatus,
                         httpStatus: response.status,
                         rttMs,
+                        headersAt,
+                        firstByteAt: milestones?.firstByteAt ?? null,
+                        firstTokenAt: milestones?.firstTokenAt ?? null,
+                        ttftMs,
+                        timeoutStage: classificationResult.timeoutStage ?? undefined,
+                        failureDomain: classificationResult.failureDomain,
+                        reasonCode: classificationResult.reasonCode,
+                        evidenceSource: classificationResult.evidenceSource,
+                        retryability: classificationResult.retryability,
+                        contributesToStatus: classificationResult.contributesToStatus,
                     };
                 }
             }
-            if (done) return emptyResponse(started);
+            if (done) return emptyResponse(startedAt, startedMs, headersAt, milestones?.firstByteAt ?? null, milestones?.firstTokenAt ?? null);
         }
     } finally {
         reader.releaseLock();
@@ -271,20 +361,43 @@ async function responseTextPrefix(response: Response, limit: number): Promise<st
     }
 }
 
-function emptyResponse(started: number): ProbeResult {
+function emptyResponse(
+    _startedAt: string,
+    startedMs: number,
+    headersAt: string,
+    firstByteAt: string | null,
+    firstTokenAt: string | null,
+): ProbeResult {
+    const rttMs = Date.now() - startedMs;
     return {
         classification: 'EMPTY_RESPONSE',
         publicStatus: 'OUTAGE',
-        rttMs: performance.now() - started,
+        rttMs,
+        headersAt,
+        firstByteAt,
+        firstTokenAt,
+        ttftMs: firstTokenAt ? Date.parse(firstTokenAt) - startedMs : null,
         errorCode: 'empty_response',
     };
 }
 
-function protocolError(started: number, errorCode: string): ProbeResult {
+function protocolError(
+    _startedAt: string,
+    startedMs: number,
+    headersAt: string,
+    errorCode: string,
+    firstByteAt?: string | null,
+    firstTokenAt?: string | null,
+): ProbeResult {
+    const rttMs = Date.now() - startedMs;
     return {
         classification: 'PROTOCOL_ERROR',
         publicStatus: 'CONFIGURATION',
-        rttMs: performance.now() - started,
+        rttMs,
+        headersAt,
+        firstByteAt: firstByteAt ?? null,
+        firstTokenAt: firstTokenAt ?? null,
+        ttftMs: firstTokenAt ? Date.parse(firstTokenAt) - startedMs : null,
         errorCode,
     };
 }
@@ -293,14 +406,26 @@ function protocolError(started: number, errorCode: string): ProbeResult {
 // capacity) rather than a genuine protocol/configuration problem. Classify those distinctly, the
 // same way the 403 handler above distinguishes SUBSCRIPTION_REQUIRED from a generic auth error,
 // so a transient overload doesn't get the same "requires manual fix" treatment as a corrupt stream.
-function streamError(started: number, message: string): ProbeResult {
+function streamError(
+    _startedAt: string,
+    startedMs: number,
+    headersAt: string,
+    message: string,
+    firstByteAt?: string | null,
+    firstTokenAt?: string | null,
+): ProbeResult {
+    const rttMs = Date.now() - startedMs;
     const classification = /overloaded|too many requests|at capacity|try again/i.test(message)
         ? 'OVERLOADED'
         : 'PROTOCOL_ERROR';
     return {
         classification,
-        publicStatus: publicStatusFor(classification),
-        rttMs: performance.now() - started,
+        publicStatus: classification === 'OVERLOADED' ? 'OUTAGE' : 'CONFIGURATION',
+        rttMs,
+        headersAt,
+        firstByteAt: firstByteAt ?? null,
+        firstTokenAt: firstTokenAt ?? null,
+        ttftMs: firstTokenAt ? Date.parse(firstTokenAt) - startedMs : null,
         errorCode: classification === 'OVERLOADED' ? 'stream_overloaded' : 'stream_error',
     };
 }

@@ -77,7 +77,7 @@ export async function drainManualMonitorJobs(
     const job = await claimManualMonitorJob(env);
     if (!job) return null;
 
-    const result = await runMonitor(env, ctx, Date.now());
+    const result = await runMonitor(env, ctx, Date.now(), 'MANUAL', job.id);
     await settleManualMonitorJob(env, job.id, result);
     return job;
 }

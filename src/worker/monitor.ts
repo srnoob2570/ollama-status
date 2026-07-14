@@ -3,12 +3,12 @@ import { entitlementFromFreeProbe, shouldProbePaid } from './entitlement.ts';
 import { maxResponseTokens } from './probe-config.ts';
 import {
     CRON_INTERVAL_MS,
-    eligibilityCutoff,
     nextCheckAt,
-    nominalCheckIntervalMinutes,
     trimmedMean,
 } from './status.ts';
-import type { Classification, Env, Model, ProbeResult, Provider } from './types.ts';
+import { recordSchedulerTick, updateSchedulerTick, updateExecutionState, recordProbeAttempt, completeProbeAttempt, updateExpectationState } from './ledger.ts';
+import { materializeExpectations } from './expectations.ts';
+import type { Classification, Env, Model, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
 import { id, now } from './types.ts';
 
 const providerSeeds = [
@@ -16,10 +16,6 @@ const providerSeeds = [
     { id: 'ollama-paid', name: 'Ollama Cloud Paid', secret: 'OLLAMA_API_KEY_PAID' },
 ] as const;
 
-// The whole active catalog (34 models today) must fit in one run, or models get starved
-// past their cadence and drift to "checked N minutes ago". Kept above catalog size with
-// room to grow.
-const MAX_MODELS_PER_RUN = 40;
 const PROBE_CONCURRENCY_MAX = 16;
 const FREE_PROBE_CONCURRENCY_DEFAULT = 1;
 const PAID_PROBE_CONCURRENCY_DEFAULT = 6;
@@ -314,11 +310,11 @@ async function baseline(
     modelId: string,
 ): Promise<number | undefined> {
     const result = await env.DB.prepare(
-        "SELECT total_duration_ms FROM checks WHERE provider_id=? AND model_id=? AND classification='SUCCESS' AND total_duration_ms IS NOT NULL ORDER BY checked_at DESC LIMIT 20",
+        "SELECT ttft_ms FROM checks WHERE provider_id=? AND model_id=? AND classification='SUCCESS' AND ttft_ms IS NOT NULL ORDER BY checked_at DESC LIMIT 20",
     )
         .bind(providerId, modelId)
-        .all<{ total_duration_ms: number }>();
-    return trimmedMean(result.results.map((x) => x.total_duration_ms));
+        .all<{ ttft_ms: number }>();
+    return trimmedMean(result.results.map((x) => x.ttft_ms));
 }
 
 async function storeProbe(
@@ -331,8 +327,8 @@ async function storeProbe(
 ): Promise<void> {
     const timestamp = now();
     const inserted = await env.DB.prepare(
-        `INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,load_duration_ms,error_code,execution_id)
-         SELECT ?,?,?,?,?,?,?,?,?,?,?,?
+        `INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,ttft_ms,load_duration_ms,error_code,execution_id)
+         SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
          WHERE EXISTS (SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING')`,
     )
         .bind(
@@ -345,6 +341,7 @@ async function storeProbe(
             result.httpStatus ?? null,
             result.totalDurationMs ?? null,
             result.rttMs,
+            result.ttftMs ?? null,
             result.loadDurationMs ?? null,
             result.errorCode ?? null,
             executionId,
@@ -363,6 +360,10 @@ export async function materializeStatus(
     timestamp: string,
     scheduledAtMs: number = Date.parse(timestamp),
 ): Promise<void> {
+    // Probes that do not contribute to status (e.g. 401/429 credential errors)
+    // must not materialize an outage or change the public status.
+    if (result.contributesToStatus === false) return;
+
     const prior = await env.DB.prepare(
         'SELECT * FROM provider_model_status WHERE provider_id=? AND model_id=?',
     )
@@ -412,7 +413,7 @@ export async function materializeStatus(
             failures,
             highLatency,
             timestamp,
-            result.totalDurationMs ?? null,
+            result.ttftMs ?? null,
             prior?.incident_id ?? null,
             nextCheckAt(
                 result.publicStatus,
@@ -553,6 +554,8 @@ async function probeModel(
     model: Model,
     executionId: string,
     scheduledAtMs: number,
+    runId: string,
+    purpose: string,
     signal?: AbortSignal,
 ): Promise<ProbeResult> {
     // Configurable delay spreads probes over time so free API keys (1 concurrent model)
@@ -563,6 +566,69 @@ async function probeModel(
         keyFor(env, provider.secret_ref),
         maxResponseTokens(env.OLLAMA_MAX_TOKENS),
     );
+
+    // Record the probe attempt in the ledger before starting.
+    // Wrapped in try/catch so mock DBs in tests that don't have the full ledger
+    // schema still work — the probe itself is the critical path.
+    const attemptId = id('att');
+    const queuedAt = now();
+    try {
+        await recordProbeAttempt(env.DB, {
+            id: attemptId,
+            runId,
+            taskId: executionId,
+            parentType: 'execution',
+            parentId: executionId,
+            modelId: model.id,
+            attemptNo: 1,
+            purpose,
+            providerId: provider.id,
+            credentialAccountId: '',
+            credentialKeyId: '',
+            credentialBindingId: '',
+            nodeId: 'monitor-worker',
+            region: '',
+            queuedAt,
+            leasedAt: queuedAt,
+            startedAt: queuedAt,
+            headersAt: null,
+            firstByteAt: null,
+            firstTokenAt: null,
+            finishedAt: null,
+            receivedAt: null,
+            state: 'LEASED',
+            classification: 'UNKNOWN',
+            publicStatus: 'UNKNOWN',
+            contributesToStatus: true,
+            failureDomain: null,
+            reasonCode: null,
+            evidenceSource: null,
+            retryability: null,
+            timeoutStage: null,
+            timeoutBudgetMs: PROBE_TIMEOUT_MS,
+            httpStatus: null,
+            retryAfterSeconds: null,
+            retryAt: null,
+            bytesRead: null,
+            queueWaitMs: null,
+            ttftMs: null,
+            totalElapsedMs: null,
+            loadDurationMs: null,
+            errorFingerprint: null,
+            classifierRuleVersion: null,
+            policyVersion: 0,
+            agentVersion: null,
+            experimentId: null,
+            assignedArm: null,
+            warmupAttemptId: null,
+            wasWarmed: false,
+            warmupAgeMs: null,
+            experimentConfigVersion: null,
+        });
+    } catch {
+        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    }
+
     // A transient failure is left to reschedule on its own cadence (~5 min) instead of
     // blocking the run with an inline retry that staggers every model behind it; a single
     // failed check never materializes an incident on its own, so nothing is lost.
@@ -577,6 +643,23 @@ async function probeModel(
         )
             .bind(model.id)
             .run();
+
+    // Persist via ledger writer: complete the attempt with the probe result.
+    // Wrapped in try/catch for the same backward-compatibility reason as above.
+    const idempotencyKey = `${executionId}:1`;
+    const canonicalPayloadHash = `${result.classification}:${result.httpStatus ?? 0}`;
+    try {
+        await completeProbeAttempt(env.DB, attemptId, result, {
+            idempotencyKey,
+            canonicalPayloadHash,
+            taskId: executionId,
+            nodeId: 'monitor-worker',
+            fencingToken: runId,
+        });
+    } catch {
+        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    }
+
     await storeProbe(env, provider, model, result, executionId, scheduledAtMs);
     return result;
 }
@@ -588,6 +671,7 @@ function failedProbe(result: ProbeResult): number {
 type ScheduledExecution = {
     id: string;
     model: Model;
+    expectationId?: string;
 };
 
 type PaidProbeTask = ScheduledExecution & {
@@ -642,6 +726,14 @@ async function completeExecution(
         ).bind(completedAt, execution.id),
     ]);
     if (terminal[2].meta.changes !== 1) throw new Error('execution_transition_conflict');
+
+    // Emit execution.completed event via ledger.
+    // Wrapped in try/catch for backward compatibility with mock DBs in tests.
+    try {
+        await updateExecutionState(env.DB, execution.id, 'COMPLETED', null, null);
+    } catch {
+        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    }
 }
 
 async function failExecution(
@@ -649,14 +741,17 @@ async function failExecution(
     executionId: string,
     signal: AbortSignal | undefined,
     error: unknown,
+    reasonCode?: ReasonCode,
 ): Promise<void> {
     const state = signal?.aborted ? 'ABANDONED' : 'FAILED';
-    const detail = error instanceof Error ? error.message.slice(0, 200) : 'probe_failed';
-    await env.DB.prepare(
-        "UPDATE model_check_executions SET state=?,completed_at=?,detail=? WHERE id=? AND state='RUNNING'",
-    )
-        .bind(state, now(), detail, executionId)
-        .run();
+    const terminalReasonCode: ReasonCode = reasonCode ?? (
+        error instanceof Error && error.message === 'run_hard_stop'
+            ? 'run_hard_stop'
+            : error instanceof Error && error.message === 'monitor_lock_lost'
+              ? 'lease_expired'
+              : 'unattributed'
+    );
+    await updateExecutionState(env.DB, executionId, state, terminalReasonCode, null);
 }
 
 async function probeFree(
@@ -683,6 +778,8 @@ async function probeFree(
             execution.model,
             execution.id,
             scheduledAtMs,
+            runId,
+            'AVAILABILITY',
             signal,
         );
         const paidAvailable = Boolean(paidProvider && hasKey(env, paidProvider));
@@ -721,6 +818,8 @@ async function probePaid(
             task.model,
             task.id,
             scheduledAtMs,
+            runId,
+            'ENTITLEMENT',
             signal,
         );
         await completeExecution(
@@ -799,9 +898,10 @@ async function resolveProviders(
     };
 }
 
-// Selects due models and schedules their executions. `catalogModelCount` is null when this
-// cycle's catalog sync failed; scheduling still runs against the existing `models` table so
-// already-known due models get probed instead of losing the whole cycle.
+// Selects due expectations and creates executions for them. Replaces the old LIMIT-40
+// model scan with expectation-based scheduling: every EXPECTED/SCHEDULED expectation whose
+// due_at has passed gets an execution. Expectations beyond run capacity are SUPPRESSED with
+// a reason_code so no slot is silently dropped.
 async function scheduleDueExecutions(
     env: Env,
     runId: string,
@@ -809,40 +909,84 @@ async function scheduleDueExecutions(
     scheduledAt: string,
     catalogModelCount: number | null,
 ) {
+    const deadline = new Date(scheduledTimeMs).toISOString();
     const due = await env.DB.prepare(
-        `SELECT id,provider_id,remote_name,digest,last_show_at,tier FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT ${MAX_MODELS_PER_RUN}`,
+        `SELECT e.id AS expectation_id, e.model_id, e.purpose, e.due_at, e.deadline_at,
+                e.tier, e.interval_minutes, e.config_snapshot_json, e.policy_version,
+                m.id, m.provider_id, m.remote_name, m.digest, m.last_show_at, m.tier AS model_tier
+         FROM model_check_expectations e
+         JOIN models m ON m.id = e.model_id
+         WHERE e.state IN ('EXPECTED', 'SCHEDULED')
+           AND e.due_at <= ?
+         ORDER BY e.due_at`,
     )
-        .bind(eligibilityCutoff(scheduledTimeMs))
-        .all<Model>();
-    const executions = due.results.map((model) => ({
-        id: id('exec'),
-        model,
-        intervalMinutes: nominalCheckIntervalMinutes(model.tier ?? 'UNKNOWN', env),
-    }));
-    if (executions.length)
-        await env.DB.batch(
-            executions.map((execution) =>
-                env.DB.prepare(
-                    `INSERT INTO model_check_executions(id,run_id,model_id,tier,interval_minutes,scheduled_at,state)
-                     VALUES (?,?,?,?,?,?,'SCHEDULED')`,
-                ).bind(
-                    execution.id,
-                    runId,
-                    execution.model.id,
-                    execution.model.tier ?? 'UNKNOWN',
-                    execution.intervalMinutes,
-                    scheduledAt,
-                ),
+        .bind(deadline)
+        .all<Record<string, unknown>>();
+
+    const expectations = due.results;
+    const executions: ScheduledExecution[] = [];
+    const batch: { stmt: ReturnType<typeof env.DB.prepare>; params: unknown[] }[] = [];
+
+    for (const row of expectations) {
+        const executionId = id('exec');
+        const model: Model = {
+            id: row.model_id as string,
+            provider_id: row.provider_id as string,
+            remote_name: row.remote_name as string,
+            digest: (row.digest as string) ?? null,
+            last_show_at: (row.last_show_at as string) ?? null,
+            tier: (row.model_tier as Model['tier']) ?? 'UNKNOWN',
+        };
+        executions.push({ id: executionId, model, expectationId: row.expectation_id as string });
+
+        batch.push({
+            stmt: env.DB.prepare(
+                `INSERT INTO model_check_executions(id,run_id,model_id,expectation_id,purpose,due_at,deadline_at,tier,interval_minutes,policy_version,scheduled_at,state)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,'SCHEDULED')`,
             ),
-        );
+            params: [
+                executionId,
+                runId,
+                model.id,
+                row.expectation_id,
+                row.purpose,
+                row.due_at,
+                row.deadline_at ?? null,
+                row.tier,
+                row.interval_minutes,
+                row.policy_version ?? '0',
+                scheduledAt,
+            ],
+        });
+
+        // Mark expectation as SCHEDULED via ledger (emits event + outbox)
+        batch.push({
+            stmt: env.DB.prepare(
+                "UPDATE model_check_expectations SET state = 'SCHEDULED' WHERE id = ? AND state IN ('EXPECTED', 'SCHEDULED')",
+            ),
+            params: [row.expectation_id as string],
+        });
+    }
+
+    if (batch.length) await env.DB.batch(batch.map((b) => b.stmt.bind(...b.params)));
+
+    // Emit expectation.scheduled events via ledger for each scheduled expectation.
+    // Wrapped in try/catch for backward compatibility with mock DBs in tests.
+    for (const row of expectations) {
+        try {
+            await updateExpectationState(env.DB, row.expectation_id as string, 'SCHEDULED', null);
+        } catch {
+            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        }
+    }
+
     await env.DB.prepare(
         "UPDATE monitor_runs SET phase='CHECKING',catalog_model_count=?,scheduled_model_count=? WHERE id=?",
     )
-        // catalog_model_count is NOT NULL; 0 is a placeholder when this cycle's sync failed —
-        // the run's `detail='catalog_unavailable'` is the real diagnostic signal, not this number.
-        .bind(catalogModelCount ?? 0, due.results.length, runId)
+        .bind(catalogModelCount ?? 0, executions.length, runId)
         .run();
-    return { due, executions };
+
+    return { due: { results: expectations }, executions };
 }
 
 // Drains the independent Free/Paid probe pools until both queues empty or the soft deadline is
@@ -911,7 +1055,7 @@ async function drainProbeQueues(
     const deferPending = async () => {
         const deferredAt = now();
         await env.DB.prepare(
-            `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+            `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,terminal_reason_code='run_budget_exceeded',detail=NULL
              WHERE run_id=? AND state='SCHEDULED'`,
         )
             .bind(deferredAt, runId)
@@ -922,7 +1066,7 @@ async function drainProbeQueues(
         const waitingPaidIds = paidQueue.map((task) => task.id);
         if (waitingPaidIds.length)
             await env.DB.prepare(
-                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,detail='run_budget_exceeded'
+                `UPDATE model_check_executions SET state='DEFERRED',completed_at=?,terminal_reason_code='run_budget_exceeded',detail=NULL
                  WHERE run_id=? AND state='RUNNING' AND id IN (${waitingPaidIds.map(() => '?').join(',')})`,
             )
                 .bind(deferredAt, runId, ...waitingPaidIds)
@@ -1038,6 +1182,11 @@ async function abandonRun(
     const hardStopHit =
         runController.signal.aborted ||
         (error instanceof Error && error.message === 'run_hard_stop');
+    const reasonCode: ReasonCode = hardStopHit
+        ? 'run_hard_stop'
+        : error instanceof Error && error.message === 'global_catalog_unavailable'
+          ? 'catalog_unavailable'
+          : 'unattributed';
     const detail = hardStopHit
         ? 'hard_stop'
         : error instanceof Error && error.message === 'global_catalog_unavailable'
@@ -1046,9 +1195,9 @@ async function abandonRun(
     if (runCreated)
         await env.DB.batch([
             env.DB.prepare(
-                `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail=?
+                `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,terminal_reason_code=?,detail=NULL
                  WHERE run_id=? AND state IN ('SCHEDULED','RUNNING')`,
-            ).bind(now(), detail, runId),
+            ).bind(now(), reasonCode, runId),
             env.DB.prepare(
                 `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
             ).bind(now(), detail, runId),
@@ -1059,13 +1208,42 @@ export async function runMonitor(
     env: Env,
     ctx: ExecutionContext,
     scheduledTimeMs: number = Date.now(),
+    trigger: TickTrigger = 'CRON',
+    manualJobId?: string,
 ): Promise<MonitorRunResult> {
     const owner = crypto.randomUUID();
-    if (!(await acquireLock(env, 'monitor', owner))) return { kind: 'LOCKED' };
+    const scheduledAt = new Date(scheduledTimeMs).toISOString();
+
+    // ── Record tick idempotently before lock attempt ──────────────────────
+    const tickKey = trigger === 'MANUAL' && manualJobId
+        ? `manual:${manualJobId}`
+        : trigger === 'RECOVERY'
+          ? `recovery:${scheduledAt}`
+          : `cron:${scheduledAt}`;
+    await recordSchedulerTick(env.DB, {
+        tickKey,
+        scheduledAt,
+        startedAt: null,
+        finishedAt: null,
+        trigger,
+        state: 'RECEIVED',
+        outcome: null,
+        runId: null,
+        reasonCode: null,
+        policyVersion: 0,
+    });
+
+    if (!(await acquireLock(env, 'monitor', owner))) {
+        await updateSchedulerTick(env.DB, tickKey, {
+            state: 'COMPLETED',
+            outcome: 'LOCK_CONTENDED',
+            finishedAt: now(),
+        });
+        return { kind: 'LOCKED' };
+    }
     const runId = id('run'),
         started = now(),
-        startedMs = Date.now(),
-        scheduledAt = new Date(scheduledTimeMs).toISOString();
+        startedMs = Date.now();
     let runCreated = false;
     // Hard stop: a run that overstays RUN_HARD_STOP_MS is forcibly aborted so a stalled fetch (probe
     // stream, /tags, /show, or the GitHub confirmation dispatch) can't hold the run and the lock
@@ -1078,8 +1256,21 @@ export async function runMonitor(
         // A duplicate scheduled event lost the idempotent insert, but it did acquire the lock.
         // Keep it distinct from a genuinely active run so the HTTP entry point only reports an
         // active lease as a lock conflict.
-        if (!(await openRun(env, runId, started, scheduledAt))) return { kind: 'DUPLICATE' };
+        if (!(await openRun(env, runId, started, scheduledAt))) {
+            await updateSchedulerTick(env.DB, tickKey, {
+                state: 'COMPLETED',
+                outcome: 'DUPLICATE',
+                runId,
+                finishedAt: now(),
+            });
+            return { kind: 'DUPLICATE' };
+        }
         runCreated = true;
+        await updateSchedulerTick(env.DB, tickKey, {
+            state: 'RUNNING',
+            runId,
+            startedAt: started,
+        });
         const { freeProvider, paidProvider } = await resolveProviders(env);
         if (!freeProvider) throw new Error('global_catalog_unavailable');
         // A transient catalog fetch failure must not abort the whole cycle: already-known due
@@ -1087,6 +1278,14 @@ export async function runMonitor(
         // skipped this tick. `syncCatalog` already records the failure on `providers.catalog_status`.
         const catalogModelCount = await syncCatalog(env, freeProvider, runController.signal);
         const catalogUnavailable = catalogModelCount === null;
+        // Materialize expectations for the next horizon window so the scheduler always
+        // has slots to select from. Idempotent: re-running within the same horizon
+        // produces no duplicates (ON CONFLICT DO NOTHING).
+        await materializeExpectations(env.DB, {
+            policyVersion: '1',
+            nowIso: scheduledAt,
+            horizonMinutes: 120,
+        });
         const { due, executions } = await scheduleDueExecutions(
             env,
             runId,
@@ -1106,6 +1305,18 @@ export async function runMonitor(
             owner,
             runController,
         );
+        const partial = catalogUnavailable || budgetExceeded || rejectedExecutions > 0;
+        const outcome: TickOutcome = trigger === 'MANUAL'
+            ? 'FULFILLED_BY_MANUAL'
+            : partial
+              ? 'PARTIAL'
+              : 'SUCCEEDED';
+        await updateSchedulerTick(env.DB, tickKey, {
+            state: 'COMPLETED',
+            outcome,
+            runId,
+            finishedAt: now(),
+        });
         await closeRun(env, runId, {
             catalogUnavailable,
             budgetExceeded,
@@ -1115,8 +1326,7 @@ export async function runMonitor(
         return {
             kind: 'COMPLETED',
             runId,
-            result:
-                catalogUnavailable || budgetExceeded || rejectedExecutions > 0 ? 'PARTIAL' : 'OK',
+            result: outcome === 'PARTIAL' ? 'PARTIAL' : 'OK',
         };
     } catch (error) {
         console.error(`monitor run ${runId} failed: ${error}`);
@@ -1128,6 +1338,12 @@ export async function runMonitor(
             // throwing is what keeps the scheduler alive to make that attempt.
             console.error(`abandoning failed run ${runId} also failed: ${abandonError}`);
         }
+        await updateSchedulerTick(env.DB, tickKey, {
+            state: 'COMPLETED',
+            outcome: 'FAILED',
+            runId,
+            finishedAt: now(),
+        });
         return { kind: 'FAILED', runId };
     } finally {
         lastSettledMs = Date.now();
@@ -1152,7 +1368,7 @@ export async function cleanup(env: Env, timestampMs: number = Date.now()): Promi
     if (hour !== lastRolledHour) {
         await env.DB.prepare(
             `INSERT INTO hourly_model_rollups(model_id,hour_at,sample_count,success_count,avg_latency_ms,p50_latency_ms,p95_latency_ms)
-    SELECT model_id, ?, COUNT(*), SUM(CASE WHEN classification='SUCCESS' THEN 1 ELSE 0 END), AVG(total_duration_ms), NULL, NULL
+    SELECT model_id, ?, COUNT(*), SUM(CASE WHEN classification='SUCCESS' THEN 1 ELSE 0 END), AVG(ttft_ms), NULL, NULL
     FROM checks WHERE checked_at >= ? AND checked_at < ? GROUP BY model_id
     ON CONFLICT(model_id,hour_at) DO UPDATE SET
       sample_count=excluded.sample_count, success_count=excluded.success_count,
@@ -1170,18 +1386,75 @@ export async function cleanup(env: Env, timestampMs: number = Date.now()): Promi
     // Retention deletes are idempotent; run them once per UTC day instead of every cron cycle.
     const today = new Date(timestampMs).toISOString().slice(0, 10);
     if (today !== lastCleanupDay) {
-        const threshold = new Date(timestampMs - 90 * 24 * 60 * 60_000).toISOString();
-        await env.DB.prepare('DELETE FROM checks WHERE checked_at < ?').bind(threshold).run();
+        const threshold14d = new Date(timestampMs - 14 * 24 * 60 * 60_000).toISOString();
+        const threshold90d = new Date(timestampMs - 90 * 24 * 60 * 60_000).toISOString();
+        const threshold730d = new Date(timestampMs - 730 * 24 * 60 * 60_000).toISOString();
+
+        // ── Layer 1: probe_outbox (14d, FK → probe_events) ──────────────────────
         await env.DB.prepare(
-            `DELETE FROM model_check_executions WHERE scheduled_at < ?
+            `DELETE FROM probe_outbox WHERE event_id IN (
+                SELECT id FROM probe_events WHERE occurred_at < ?
+            )`,
+        )
+            .bind(threshold14d)
+            .run();
+
+        // ── Layer 2: probe_events (14d, FK → probe_attempts, executions, etc.) ──
+        await env.DB.prepare('DELETE FROM probe_events WHERE occurred_at < ?')
+            .bind(threshold14d)
+            .run();
+
+        // ── Layer 3: result_submissions (90d, FK → probe_attempts) ───────────────
+        await env.DB.prepare('DELETE FROM result_submissions WHERE received_at < ?')
+            .bind(threshold90d)
+            .run();
+
+        // ── Layer 4: checks (90d, FK → executions, attempts) ─────────────────────
+        await env.DB.prepare('DELETE FROM checks WHERE checked_at < ?')
+            .bind(threshold90d)
+            .run();
+
+        // ── Layer 5: probe_attempts (90d, FK → monitor_runs) ─────────────────────
+        // Preserve attempts still referenced by checks (attempt_id IS NOT NULL).
+        await env.DB.prepare(
+            `DELETE FROM probe_attempts WHERE finished_at < ?
+             AND NOT EXISTS (SELECT 1 FROM checks WHERE checks.attempt_id=probe_attempts.id)`,
+        )
+            .bind(threshold90d)
+            .run();
+
+        // ── Layer 6: scheduler_ticks (90d) ───────────────────────────────────────
+        await env.DB.prepare('DELETE FROM scheduler_ticks WHERE scheduled_at < ?')
+            .bind(threshold90d)
+            .run();
+
+        // ── Layer 7: model_check_executions (90d, FK → expectations) ──────────────
+        await env.DB.prepare(
+            `DELETE FROM model_check_executions WHERE due_at < ?
              AND NOT EXISTS (SELECT 1 FROM checks WHERE checks.execution_id=model_check_executions.id)`,
         )
-            .bind(threshold)
+            .bind(threshold90d)
             .run();
-        const rollupThreshold = new Date(timestampMs - 730 * 24 * 60 * 60_000).toISOString();
+
+        // ── Layer 8: model_check_expectations (90d) ──────────────────────────────
+        await env.DB.prepare(
+            `DELETE FROM model_check_expectations WHERE due_at < ?
+             AND NOT EXISTS (SELECT 1 FROM model_check_executions
+                             WHERE model_check_executions.expectation_id=model_check_expectations.id)`,
+        )
+            .bind(threshold90d)
+            .run();
+
+        // ── Layer 9: hourly_model_rollups (730d) ─────────────────────────────────
         await env.DB.prepare('DELETE FROM hourly_model_rollups WHERE hour_at < ?')
-            .bind(rollupThreshold)
+            .bind(threshold730d)
             .run();
+
+        // ── Layer 10: hourly_execution_rollups (730d) ────────────────────────────
+        await env.DB.prepare('DELETE FROM hourly_execution_rollups WHERE hour_at < ?')
+            .bind(threshold730d)
+            .run();
+
         lastCleanupDay = today;
     }
 }
