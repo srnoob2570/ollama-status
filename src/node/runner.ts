@@ -5,6 +5,7 @@ import { hasRecoverableStuckRun, lastMonitorSettledMs, runMonitor } from '../wor
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
 import { buildRunnerEnv } from './env.ts';
+import { startOutboxConsumer } from './outbox-consumer.ts';
 
 // A monitor attempt settles every cron interval (5 min) and a legitimate run can take up to one
 // interval more, so the gap between settles never legitimately exceeds ~10 min. Past three
@@ -113,3 +114,26 @@ const health = serve({
 });
 await health.ready();
 console.log(`ollama-status runner health listening on ${health.url}`);
+
+// ── Outbox consumer ──────────────────────────────────────────────────────────
+const db = new PostgresD1Adapter(pool);
+const outboxConsumer = startOutboxConsumer(db, {
+    consumerId: 'node-1',
+    pollIntervalMs: 1_000,
+    batchSize: 10,
+    onError: (error, event) => {
+        console.error(`outbox consumer: error processing ${event.outbox.id} (${event.event.event_type})`, error);
+    },
+});
+
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+async function shutdown(signal: string): Promise<void> {
+    console.log(`received ${signal}, shutting down...`);
+    await outboxConsumer.stop();
+    await health.close();
+    console.log('shutdown complete');
+    process.exit(0);
+}
+
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
