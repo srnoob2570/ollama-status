@@ -29,6 +29,7 @@ import {
 import {
     acquireLock,
     cleanup,
+    hasRecoverableStuckRun,
     materializeStatus,
     materializedStatus,
     nextCheckTier,
@@ -627,6 +628,34 @@ describe('Ollama status classification', () => {
         );
     });
 
+    it('detects a recoverable stuck run only when the lock lease is no longer live', async () => {
+        const fakeEnv = (row: { stuck: number } | null) => {
+            let bindings: unknown[] = [];
+            const env = {
+                DB: {
+                    prepare(statement: string) {
+                        expect(statement).toContain('finished_at IS NULL');
+                        expect(statement).toContain('lease_until > ?');
+                        return {
+                            bind(...values: unknown[]) {
+                                bindings = values;
+                                return { first: async () => row };
+                            },
+                        };
+                    },
+                },
+            } as unknown as Env;
+            return { env, bindings: () => bindings };
+        };
+
+        const stuck = fakeEnv({ stuck: 1 });
+        expect(await hasRecoverableStuckRun(stuck.env)).toBe(true);
+        expect(Date.parse(stuck.bindings()[0] as string)).not.toBeNaN();
+
+        const healthy = fakeEnv(null);
+        expect(await hasRecoverableStuckRun(healthy.env)).toBe(false);
+    });
+
     it('trims outliers only with enough samples', () => {
         expect(trimmedMean([1, 2, 3])).toBe(2);
         expect(trimmedMean([1, 2, 3, 4, 5, 6, 7, 8, 9, 1_000])).toBe(5.5);
@@ -1129,7 +1158,7 @@ describe('D1 write avoidance', () => {
             DB: {
                 prepare(sql: string) {
                     return {
-                        bind(..._args: unknown[]) {
+                        bind() {
                             const route = routes.find((r) => r.match.test(sql));
                             return {
                                 first: async () => route?.first?.() ?? null,
