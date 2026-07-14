@@ -11,3 +11,5 @@ coverage/
 .codebase-memory/
 docs/superpowers/specs/
 .omc/
+.sisyphus
+docs/specs
