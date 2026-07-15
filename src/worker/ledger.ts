@@ -1,4 +1,4 @@
-import type { D1DatabaseLike } from './types.ts';
+import type { D1DatabaseLike, D1StatementLike } from './types.ts';
 import type {
     SchedulerTick,
     ProbeAttempt,
@@ -25,11 +25,32 @@ import { metrics } from './metrics.ts';
 // ── Detail JSON allowlists per event_type ──────────────────────────────────
 
 const DETAIL_ALLOWLISTS: Record<string, Set<string>> = {
+    'run.started': new Set(['run_id', 'trigger', 'scheduled_at']),
+    'run.completed': new Set(['run_id', 'outcome', 'reason_code']),
+    'run.abandoned': new Set(['run_id', 'reason_code', 'timeout_stage']),
+    'scheduler.lock_contended': new Set(['tick_key', 'owner']),
+    'expectation.created': new Set(['model_id', 'purpose', 'due_at', 'tier']),
+    'expectation.scheduled': new Set(['model_id', 'purpose', 'due_at', 'execution_id']),
+    'expectation.suppressed': new Set(['model_id', 'purpose', 'due_at', 'reason_code']),
+    'expectation.missed': new Set(['model_id', 'purpose', 'due_at', 'reason_code']),
+    'expectation.satisfied': new Set(['model_id', 'purpose', 'due_at', 'attempt_id']),
+    'expectation.cancelled': new Set(['model_id', 'purpose', 'due_at', 'reason_code']),
+    'probe.queued': new Set(['attempt_id', 'model_id', 'purpose']),
+    'probe.leased': new Set(['attempt_id', 'node_id', 'lease_expires_at']),
     'probe.started': new Set(['started_at', 'model_id', 'purpose']),
+    'probe.headers': new Set(['attempt_id', 'http_status', 'headers_at']),
+    'probe.first_byte': new Set(['attempt_id', 'first_byte_at']),
+    'probe.first_token': new Set(['attempt_id', 'first_token_at', 'ttft_ms']),
     'probe.completed': new Set(['classification', 'reason_code', 'http_status', 'timeout_stage']),
+    'probe.failed': new Set(['attempt_id', 'reason_code', 'failure_domain', 'timeout_stage']),
+    'credential.cooldown_started': new Set(['credential_account_id', 'reason_code', 'retry_at']),
+    'credential.cooldown_recovered': new Set(['credential_account_id']),
+    'cadence.violation_detected': new Set(['model_id', 'window', 'state', 'policy_adherence']),
     'mitigation.proposed': new Set(['reason_code', 'action', 'policy_version', 'deadline_at', 'budget_remaining', 'kill_switch_active']),
     'mitigation.applied': new Set(['reason_code', 'action', 'policy_version', 'deadline_at', 'budget_remaining', 'kill_switch_active']),
     'mitigation.skipped': new Set(['reason_code', 'action', 'policy_version', 'deadline_at', 'budget_remaining', 'kill_switch_active']),
+    'warmup.started': new Set(['attempt_id', 'model_id']),
+    'warmup.completed': new Set(['attempt_id', 'model_id', 'warmup_age_ms']),
 };
 
 function validateDetailJson(eventType: string, detailJson: string | null): void {
@@ -55,6 +76,46 @@ function validateDetailJson(eventType: string, detailJson: string | null): void 
             );
         }
     }
+    const BYTE_LIMIT = 4096;
+    const byteLength = new TextEncoder().encode(detailJson).length;
+    if (byteLength > BYTE_LIMIT) {
+        throw new Error(
+            `detail_json for "${eventType}" exceeds ${BYTE_LIMIT}-byte limit (${byteLength} bytes)`,
+        );
+    }
+}
+
+function eventAndOutboxStatements(
+    db: D1DatabaseLike,
+    eventId: string,
+    eventType: string,
+    occurredAt: string,
+    recordedAt: string,
+    subjectType: string,
+    subjectId: string,
+    runId: string | null,
+    expectationId: string | null,
+    executionId: string | null,
+    taskId: string | null,
+    attemptId: string | null,
+    detailJson: string | null,
+): D1StatementLike[] {
+    validateDetailJson(eventType, detailJson);
+    const outboxId = id('pout');
+    return [
+        db.prepare(
+            `INSERT INTO probe_events (id, event_type, event_version, occurred_at, recorded_at,
+                actor_type, actor_id, subject_type, subject_id,
+                scheduler_tick_id, run_id, expectation_id, execution_id, task_id, attempt_id,
+                causation_event_id, correlation_id, sequence, idempotency_key, detail_json)
+             VALUES (?, ?, '1', ?, ?, 'system', 'ledger', ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)`,
+        ).bind(eventId, eventType, occurredAt, recordedAt, subjectType, subjectId,
+               runId, expectationId, executionId, taskId, attemptId, detailJson),
+        db.prepare(
+            `INSERT INTO probe_outbox (id, event_id, consumed_at, consumer_id, attempts)
+             VALUES (?, ?, NULL, NULL, 0)`,
+        ).bind(outboxId, eventId),
+    ];
 }
 
 // ── Row mappers (snake_case DB → camelCase TS) ────────────────────────────
@@ -398,6 +459,14 @@ export async function acceptResult(
     attemptId: string,
     submission: SubmissionInput & { receivedAt: string },
 ): Promise<{ disposition: SubmissionDisposition; reasonCode?: ReasonCode }> {
+    const attemptState = await db.prepare('SELECT state FROM probe_attempts WHERE id = ?')
+        .bind(attemptId).first<{ state: string }>();
+    if (!attemptState) throw new Error(`probe_attempt "${attemptId}" not found`);
+    const terminalStates = ['COMPLETED', 'FAILED', 'EXPIRED', 'CANCELLED'];
+    if (terminalStates.includes(attemptState.state)) {
+        return { disposition: 'REJECTED', reasonCode: 'stale_result' };
+    }
+
     // Check for exact duplicate
     const duplicate = await db.prepare(
         `SELECT 1 FROM result_submissions
@@ -502,7 +571,6 @@ export async function completeProbeAttempt(
     const eventType = 'probe.completed';
     const eventId = id('pevt');
     const submissionId = id('sub');
-    const outboxId = id('pout');
 
     statements.push(
         db.prepare(
@@ -625,32 +693,26 @@ export async function completeProbeAttempt(
         statements.push(
             db.prepare(
                 `UPDATE model_check_expectations SET state = ?, reason_code = ?, resolved_at = ?
-                 WHERE id = ?`,
+                 WHERE id = ? AND state NOT IN ('SATISFIED', 'MISSED', 'CANCELLED')`,
             ).bind(newExpectationState, result.reasonCode ?? null, receivedAt, expectationId),
         );
     }
 
-    // 6. Insert probe_event
+    // 6. Insert probe_event + 7. Insert probe_outbox
     const detailJson = JSON.stringify({
         classification: result.classification,
         reason_code: result.reasonCode ?? null,
         http_status: result.httpStatus ?? null,
         timeout_stage: result.timeoutStage ?? null,
     });
-    validateDetailJson(eventType, detailJson);
-
     statements.push(
-        db.prepare(
-            `INSERT INTO probe_events (id, event_type, event_version, occurred_at, recorded_at,
-                actor_type, actor_id, subject_type, subject_id,
-                scheduler_tick_id, run_id, expectation_id, execution_id, task_id, attempt_id,
-                causation_event_id, correlation_id, sequence, idempotency_key, detail_json)
-             VALUES (?, ?, '1', ?, ?, 'system', 'ledger', 'probe_attempt', ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)`,
-        ).bind(
+        ...eventAndOutboxStatements(
+            db,
             eventId,
             eventType,
             receivedAt,
             receivedAt,
+            'probe_attempt',
             attemptId,
             runId,
             expectationId,
@@ -659,14 +721,6 @@ export async function completeProbeAttempt(
             attemptId,
             detailJson,
         ),
-    );
-
-    // 7. Insert probe_outbox
-    statements.push(
-        db.prepare(
-            `INSERT INTO probe_outbox (id, event_id, consumed_at, consumer_id, attempts)
-             VALUES (?, ?, NULL, NULL, 0)`,
-        ).bind(outboxId, eventId),
     );
 
     // ── Execute transaction ────────────────────────────────────────────
@@ -775,7 +829,6 @@ export async function recordMitigationEvent(
     },
 ): Promise<void> {
     const eventId = id('pevt');
-    const outboxId = id('pout');
     const recordedAt = now();
 
     validateDetailJson(event.eventType, event.detailJson ?? null);
@@ -803,7 +856,7 @@ export async function recordMitigationEvent(
         db.prepare(
             `INSERT INTO probe_outbox (id, event_id, consumed_at, consumer_id, attempts)
              VALUES (?, ?, NULL, NULL, 0)`,
-        ).bind(outboxId, eventId),
+        ).bind(id('pout'), eventId),
     ];
 
     await db.batch(statements);
@@ -824,24 +877,27 @@ export async function updateExpectationState(
     const now_ = now();
     const eventType = expectationStateToEventType(state);
     const eventId = id('pevt');
-    const outboxId = id('pout');
 
     const statements = [
         db.prepare(
             `UPDATE model_check_expectations SET state = ?, reason_code = ?, resolved_at = ?
              WHERE id = ?`,
         ).bind(state, reasonCode ?? null, now_, expectationId),
-        db.prepare(
-            `INSERT INTO probe_events (id, event_type, event_version, occurred_at, recorded_at,
-                actor_type, actor_id, subject_type, subject_id,
-                scheduler_tick_id, run_id, expectation_id, execution_id, task_id, attempt_id,
-                causation_event_id, correlation_id, sequence, idempotency_key, detail_json)
-             VALUES (?, ?, '1', ?, ?, 'system', 'ledger', 'model_check_expectation', ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
-        ).bind(eventId, eventType, now_, now_, expectationId, expectationId),
-        db.prepare(
-            `INSERT INTO probe_outbox (id, event_id, consumed_at, consumer_id, attempts)
-             VALUES (?, ?, NULL, NULL, 0)`,
-        ).bind(outboxId, eventId),
+        ...eventAndOutboxStatements(
+            db,
+            eventId,
+            eventType,
+            now_,
+            now_,
+            'model_check_expectation',
+            expectationId,
+            null,
+            expectationId,
+            null,
+            null,
+            null,
+            null,
+        ),
     ];
 
     await db.batch(statements);
@@ -863,24 +919,27 @@ export async function updateExecutionState(
     const now_ = now();
     const eventType = executionStateToEventType(state);
     const eventId = id('pevt');
-    const outboxId = id('pout');
 
     const statements = [
         db.prepare(
             `UPDATE model_check_executions SET state = ?, terminal_reason_code = ?, accepted_attempt_id = ?
              WHERE id = ?`,
         ).bind(state, terminalReasonCode ?? null, acceptedAttemptId ?? null, executionId),
-        db.prepare(
-            `INSERT INTO probe_events (id, event_type, event_version, occurred_at, recorded_at,
-                actor_type, actor_id, subject_type, subject_id,
-                scheduler_tick_id, run_id, expectation_id, execution_id, task_id, attempt_id,
-                causation_event_id, correlation_id, sequence, idempotency_key, detail_json)
-             VALUES (?, ?, '1', ?, ?, 'system', 'ledger', 'model_check_execution', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
-        ).bind(eventId, eventType, now_, now_, executionId, executionId),
-        db.prepare(
-            `INSERT INTO probe_outbox (id, event_id, consumed_at, consumer_id, attempts)
-             VALUES (?, ?, NULL, NULL, 0)`,
-        ).bind(outboxId, eventId),
+        ...eventAndOutboxStatements(
+            db,
+            eventId,
+            eventType,
+            now_,
+            now_,
+            'model_check_execution',
+            executionId,
+            null,
+            null,
+            executionId,
+            null,
+            null,
+            null,
+        ),
     ];
 
     await db.batch(statements);

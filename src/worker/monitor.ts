@@ -6,9 +6,11 @@ import {
     nextCheckAt,
     trimmedMean,
 } from './status.ts';
-import { recordSchedulerTick, updateSchedulerTick, updateExecutionState, recordProbeAttempt, completeProbeAttempt, updateExpectationState } from './ledger.ts';
+import { recordSchedulerTick, updateSchedulerTick, updateExecutionState, recordProbeAttempt, completeProbeAttempt, updateExpectationState, recordProbeEvent } from './ledger.ts';
 import { materializeExpectations } from './expectations.ts';
-import type { Classification, Env, ExecutionContext, Model, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
+import { proposeMitigation, executeMitigation } from './mitigations.ts';
+import { upsertHourlyExecutionRollup } from './rollups.ts';
+import type { Classification, Env, ExecutionContext, Model, ModelCheckExpectation, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
 import { id, now } from './types.ts';
 
 const providerSeeds = [
@@ -326,29 +328,16 @@ async function storeProbe(
     scheduledAtMs: number,
 ): Promise<void> {
     const timestamp = now();
-    const inserted = await env.DB.prepare(
-        `INSERT INTO checks(id,provider_id,model_id,checked_at,classification,public_status,http_status,total_duration_ms,rtt_ms,ttft_ms,load_duration_ms,error_code,execution_id)
-         SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
-         WHERE EXISTS (SELECT 1 FROM model_check_executions WHERE id=? AND state='RUNNING')`,
+    // The check row is inserted by the ledger (completeProbeAttempt) with attempt_id
+    // and observation_role. Here we only materialize the public status transition.
+    // Guard: only materialize if the execution is still RUNNING (preserves the
+    // existing guard semantics that prevent writing status for a stale execution).
+    const running = await env.DB.prepare(
+        'SELECT 1 FROM model_check_executions WHERE id=? AND state=?',
     )
-        .bind(
-            id('chk'),
-            provider.id,
-            model.id,
-            timestamp,
-            result.classification,
-            result.publicStatus,
-            result.httpStatus ?? null,
-            result.totalDurationMs ?? null,
-            result.rttMs,
-            result.ttftMs ?? null,
-            result.loadDurationMs ?? null,
-            result.errorCode ?? null,
-            executionId,
-            executionId,
-        )
-        .run();
-    if (inserted.meta.changes !== 1) throw new Error('execution_not_running');
+        .bind(executionId, 'RUNNING')
+        .first<{ 1: number }>();
+    if (!running) throw new Error('execution_not_running');
     await materializeStatus(env, provider, model, result, timestamp, scheduledAtMs);
 }
 
@@ -473,6 +462,45 @@ export async function materializeStatus(
                 'UPDATE provider_model_status SET incident_id=NULL WHERE provider_id=? AND model_id=?',
             ).bind(provider.id, model.id),
         ]);
+    }
+    if (
+        (status === 'RATE_LIMITED' || status === 'AUTHENTICATION') &&
+        prior?.public_status !== status
+    ) {
+        try {
+            await recordProbeEvent(env.DB, {
+                eventType: 'credential.cooldown_started',
+                eventVersion: 1,
+                occurredAt: timestamp,
+                subjectType: 'provider_model',
+                subjectId: `${provider.id}:${model.id}`,
+                detailJson: JSON.stringify({
+                    credential_account_id: provider.id,
+                    reason_code: status === 'RATE_LIMITED' ? 'credential_rate_limited' : 'credential_auth_failed',
+                    retry_at: result.retryAfterSeconds ?? null,
+                }),
+            });
+        } catch {
+            // Non-fatal
+        }
+    }
+    if (
+        prior?.public_status &&
+        (prior.public_status === 'RATE_LIMITED' || prior.public_status === 'AUTHENTICATION') &&
+        status !== prior.public_status
+    ) {
+        try {
+            await recordProbeEvent(env.DB, {
+                eventType: 'credential.cooldown_recovered',
+                eventVersion: 1,
+                occurredAt: timestamp,
+                subjectType: 'provider_model',
+                subjectId: `${provider.id}:${model.id}`,
+                detailJson: JSON.stringify({ credential_account_id: provider.id }),
+            });
+        } catch {
+            // Non-fatal
+        }
     }
 }
 
@@ -656,6 +684,58 @@ async function probeModel(
             nodeId: 'monitor-worker',
             fencingToken: runId,
         });
+    } catch {
+        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    }
+
+    try {
+        if (result.headersAt) {
+            await recordProbeEvent(env.DB, {
+                eventType: 'probe.headers',
+                eventVersion: 1,
+                occurredAt: result.headersAt,
+                subjectType: 'probe_attempt',
+                subjectId: attemptId,
+                attemptId,
+                runId,
+                detailJson: JSON.stringify({
+                    attempt_id: attemptId,
+                    http_status: result.httpStatus ?? null,
+                    headers_at: result.headersAt,
+                }),
+            });
+        }
+        if (result.firstByteAt) {
+            await recordProbeEvent(env.DB, {
+                eventType: 'probe.first_byte',
+                eventVersion: 1,
+                occurredAt: result.firstByteAt,
+                subjectType: 'probe_attempt',
+                subjectId: attemptId,
+                attemptId,
+                runId,
+                detailJson: JSON.stringify({
+                    attempt_id: attemptId,
+                    first_byte_at: result.firstByteAt,
+                }),
+            });
+        }
+        if (result.firstTokenAt) {
+            await recordProbeEvent(env.DB, {
+                eventType: 'probe.first_token',
+                eventVersion: 1,
+                occurredAt: result.firstTokenAt,
+                subjectType: 'probe_attempt',
+                subjectId: attemptId,
+                attemptId,
+                runId,
+                detailJson: JSON.stringify({
+                    attempt_id: attemptId,
+                    first_token_at: result.firstTokenAt,
+                    ttft_ms: result.ttftMs ?? null,
+                }),
+            });
+        }
     } catch {
         // Non-fatal: mock DBs in tests may not have the full ledger schema
     }
@@ -918,16 +998,19 @@ async function scheduleDueExecutions(
          JOIN models m ON m.id = e.model_id
          WHERE e.state IN ('EXPECTED', 'SCHEDULED')
            AND e.due_at <= ?
-         ORDER BY e.due_at`,
+         ORDER BY e.due_at NULLS LAST`,
     )
         .bind(deadline)
         .all<Record<string, unknown>>();
 
     const expectations = due.results;
+    const MAX_EXECUTIONS_PER_RUN = 200;
+    const admitted = expectations.slice(0, MAX_EXECUTIONS_PER_RUN);
+    const overflow = expectations.slice(MAX_EXECUTIONS_PER_RUN);
     const executions: ScheduledExecution[] = [];
     const batch: { stmt: ReturnType<typeof env.DB.prepare>; params: unknown[] }[] = [];
 
-    for (const row of expectations) {
+    for (const row of admitted) {
         const executionId = id('exec');
         const model: Model = {
             id: row.model_id as string,
@@ -970,9 +1053,46 @@ async function scheduleDueExecutions(
 
     if (batch.length) await env.DB.batch(batch.map((b) => b.stmt.bind(...b.params)));
 
+    // Expectations beyond the run's execution cap are SUPPRESSED so no slot is
+    // silently dropped (spec line 123-124).
+    for (const row of overflow) {
+        try {
+            await updateExpectationState(
+                env.DB,
+                row.expectation_id as string,
+                'SUPPRESSED',
+                'selection_limit' as ReasonCode,
+            );
+        } catch {
+            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        }
+        try {
+            const expectation: ModelCheckExpectation = {
+                id: row.expectation_id as string,
+                modelId: row.model_id as string,
+                purpose: row.purpose as string,
+                dueAt: row.due_at as string,
+                deadlineAt: (row.deadline_at as string) ?? '',
+                tier: (row.tier as string) ?? 'FREE',
+                intervalMinutes: (row.interval_minutes as number) ?? 5,
+                configSnapshotJson: (row.config_snapshot_json as string) ?? null,
+                policyVersion: typeof row.policy_version === 'string' ? parseInt(row.policy_version, 10) || 0 : (row.policy_version as number) ?? 0,
+                state: 'SUPPRESSED',
+                reasonCode: 'selection_limit',
+                resolvedAt: null,
+                cutoverAt: null,
+                migrationOrigin: null,
+            };
+            const action = await proposeMitigation(env.DB, expectation, 'selection_limit');
+            await executeMitigation(env.DB, action, expectation);
+        } catch {
+            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        }
+    }
+
     // Emit expectation.scheduled events via ledger for each scheduled expectation.
     // Wrapped in try/catch for backward compatibility with mock DBs in tests.
-    for (const row of expectations) {
+    for (const row of admitted) {
         try {
             await updateExpectationState(env.DB, row.expectation_id as string, 'SCHEDULED', null);
         } catch {
@@ -1071,6 +1191,20 @@ async function drainProbeQueues(
             )
                 .bind(deferredAt, runId, ...waitingPaidIds)
                 .run();
+        // Mark the corresponding expectations as MISSED so no slot is unresolved (AC#11).
+        try {
+            await env.DB.prepare(
+                `UPDATE model_check_expectations SET state='MISSED', reason_code='run_budget_exceeded', resolved_at=?
+                 WHERE id IN (
+                     SELECT expectation_id FROM model_check_executions
+                     WHERE run_id=? AND state='DEFERRED' AND expectation_id IS NOT NULL
+                 ) AND state NOT IN ('SATISFIED','MISSED','CANCELLED')`,
+            )
+                .bind(deferredAt, runId)
+                .run();
+        } catch {
+            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        }
     };
     const waitForWorker = async () => {
         if (active.size) await Promise.race(active);
@@ -1234,6 +1368,18 @@ export async function runMonitor(
     });
 
     if (!(await acquireLock(env, 'monitor', owner))) {
+        try {
+            await recordProbeEvent(env.DB, {
+                eventType: 'scheduler.lock_contended',
+                eventVersion: 1,
+                occurredAt: now(),
+                subjectType: 'scheduler_tick',
+                subjectId: tickKey,
+                detailJson: JSON.stringify({ tick_key: tickKey, owner: 'monitor' }),
+            });
+        } catch {
+            // Non-fatal
+        }
         await updateSchedulerTick(env.DB, tickKey, {
             state: 'COMPLETED',
             outcome: 'LOCK_CONTENDED',
@@ -1271,6 +1417,19 @@ export async function runMonitor(
             runId,
             startedAt: started,
         });
+        try {
+            await recordProbeEvent(env.DB, {
+                eventType: 'run.started',
+                eventVersion: 1,
+                occurredAt: started,
+                subjectType: 'monitor_run',
+                subjectId: runId,
+                runId,
+                detailJson: JSON.stringify({ run_id: runId, trigger, scheduled_at: scheduledAt }),
+            });
+        } catch {
+            // Non-fatal
+        }
         const { freeProvider, paidProvider } = await resolveProviders(env);
         if (!freeProvider) throw new Error('global_catalog_unavailable');
         // A transient catalog fetch failure must not abort the whole cycle: already-known due
@@ -1323,6 +1482,19 @@ export async function runMonitor(
             rejectedExecutions,
             dueCount: due.results.length,
         });
+        try {
+            await recordProbeEvent(env.DB, {
+                eventType: 'run.completed',
+                eventVersion: 1,
+                occurredAt: now(),
+                subjectType: 'monitor_run',
+                subjectId: runId,
+                runId,
+                detailJson: JSON.stringify({ run_id: runId, outcome, reason_code: null }),
+            });
+        } catch {
+            // Non-fatal
+        }
         return {
             kind: 'COMPLETED',
             runId,
@@ -1337,6 +1509,19 @@ export async function runMonitor(
             // successful openRun re-runs the same statements; returning FAILED instead of
             // throwing is what keeps the scheduler alive to make that attempt.
             console.error(`abandoning failed run ${runId} also failed: ${abandonError}`);
+        }
+        try {
+            await recordProbeEvent(env.DB, {
+                eventType: 'run.abandoned',
+                eventVersion: 1,
+                occurredAt: now(),
+                subjectType: 'monitor_run',
+                subjectId: runId,
+                runId,
+                detailJson: JSON.stringify({ run_id: runId, reason_code: 'run_hard_stop', timeout_stage: null }),
+            });
+        } catch {
+            // Non-fatal
         }
         await updateSchedulerTick(env.DB, tickKey, {
             state: 'COMPLETED',
@@ -1381,6 +1566,57 @@ export async function cleanup(env: Env, timestampMs: number = Date.now()): Promi
                 new Date(timestampMs).toISOString().slice(0, 13) + ':00:00.000Z',
             )
             .run();
+
+        // Logical rollups from expectations (spec 002 line 225)
+        const hourStart = `${hour}:00:00.000Z`;
+        try {
+            const pairs = await env.DB.prepare(
+                `SELECT DISTINCT model_id, purpose
+                 FROM model_check_expectations
+                 WHERE due_at >= ? AND due_at < ?`,
+            )
+                .bind(hourStart, new Date(new Date(hourStart).getTime() + 60 * 60_000).toISOString())
+                .all<{ model_id: string; purpose: string }>();
+            for (const { model_id, purpose } of pairs.results) {
+                try {
+                    await upsertHourlyExecutionRollup(env.DB, model_id, hourStart, purpose);
+                } catch {
+                    // Non-fatal: a single rollup failure shouldn't block cleanup
+                }
+            }
+        } catch {
+            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        }
+
+        try {
+            const breached = await env.DB.prepare(
+                `SELECT model_id, purpose, policy_adherence
+                 FROM hourly_execution_rollups
+                 WHERE hour_at = ? AND policy_adherence IS NOT NULL AND policy_adherence < 0.5`,
+            ).bind(hourStart).all<{ model_id: string; purpose: string; policy_adherence: number }>();
+            for (const row of breached.results) {
+                try {
+                    await recordProbeEvent(env.DB, {
+                        eventType: 'cadence.violation_detected',
+                        eventVersion: 1,
+                        occurredAt: now(),
+                        subjectType: 'model',
+                        subjectId: row.model_id,
+                        detailJson: JSON.stringify({
+                            model_id: row.model_id,
+                            window: hourStart,
+                            state: 'BREACHED',
+                            policy_adherence: row.policy_adherence,
+                        }),
+                    });
+                } catch {
+                    // Non-fatal
+                }
+            }
+        } catch {
+            // Non-fatal
+        }
+
         lastRolledHour = hour;
     }
     // Retention deletes are idempotent; run them once per UTC day instead of every cron cycle.

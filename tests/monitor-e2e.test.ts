@@ -14,12 +14,16 @@ import { analyzeCadence } from '../src/worker/cadence.ts';
 import { id, now } from '../src/worker/types.ts';
 import type { D1DatabaseLike, Env, ProbeResult, ProbeAttempt } from '../src/worker/types.ts';
 
+// Use the real wall clock so expectations materialized here have deadlines in
+// the future relative to `now()` used internally by `completeProbeAttempt`.
+// A fixed past date caused the ledger's STALE guard (receivedAt > deadline_at)
+// to mark every attempt STALE -> MISSED.
 function makeNow(): string {
-    return new Date('2026-07-14T12:00:00Z').toISOString();
+    return new Date().toISOString();
 }
 
 function minutesFromNow(minutes: number): string {
-    return new Date(new Date('2026-07-14T12:00:00Z').getTime() + minutes * 60_000).toISOString();
+    return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
 function makeResult(overrides?: Partial<ProbeResult>): ProbeResult {
@@ -330,14 +334,15 @@ describe('monitor e2e integration', () => {
 
     describe('cadence analyzed → API exposes', () => {
         it('analyzes cadence from expectations', async () => {
+            const t = makeNow();
             await materializeExpectations(db, {
                 policyVersion: '1',
-                nowIso: makeNow(),
+                nowIso: t,
                 horizonMinutes: 60,
             });
 
             const window = await analyzeCadence(db, modelId, '1h', {
-                nowIso: makeNow(),
+                nowIso: t,
             });
 
             expect(window.modelId).toBe(modelId);

@@ -28,6 +28,18 @@ function minutesFromNow(minutes: number): string {
     return new Date(new Date(NOW).getTime() + minutes * 60_000).toISOString();
 }
 
+// Deadline based on real wall-clock time, so it stays in the future relative to
+// the ledger's `now()` (which uses Date.now()) and submissions are not STALE.
+function deadlineInMinutes(minutes: number): string {
+    return new Date(Date.now() + minutes * 60_000).toISOString();
+}
+
+// HTTP-date Retry-After value that is `minutes` in the future relative to real
+// wall-clock time (classifyProbe -> normalizeRetryAfter uses Date.now()).
+function retryAfterHttpDate(minutes: number): string {
+    return new Date(Date.now() + minutes * 60_000).toUTCString();
+}
+
 function makeProbeResult(overrides: Partial<ProbeResult> = {}): ProbeResult {
     return {
         classification: 'SUCCESS',
@@ -207,8 +219,8 @@ describe('Criterion 1 — Attempt terminal row with parent, purpose, credential,
 // ── Criterion 2: Timeout preserves Classification=TIMEOUT + phase; hard stop preserves ABANDONED ──
 
 describe('Criterion 2 — Timeout preserves TIMEOUT + phase; hard stop preserves ABANDONED', () => {
-    it('classifyProbe returns TIMEOUT with timeout_stage for a proper timeout', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns TIMEOUT with timeout_stage for a proper timeout', async () => {
+        const result = await classifyProbe({
             httpStatus: null,
             error: new DOMException('The operation was aborted', 'AbortError'),
             timeoutStage: 'FIRST_TOKEN',
@@ -219,8 +231,8 @@ describe('Criterion 2 — Timeout preserves TIMEOUT + phase; hard stop preserves
         expect(result.timeoutStage).toBe('FIRST_TOKEN');
     });
 
-    it('classifyProbe returns TIMEOUT with timeout_stage for REQUEST_OR_HEADERS phase', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns TIMEOUT with timeout_stage for REQUEST_OR_HEADERS phase', async () => {
+        const result = await classifyProbe({
             httpStatus: null,
             error: new DOMException('The operation was aborted', 'AbortError'),
             timeoutStage: 'REQUEST_OR_HEADERS',
@@ -231,8 +243,8 @@ describe('Criterion 2 — Timeout preserves TIMEOUT + phase; hard stop preserves
         expect(result.timeoutStage).toBe('REQUEST_OR_HEADERS');
     });
 
-    it('classifyProbe returns TIMEOUT with timeout_stage for FIRST_BYTE phase', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns TIMEOUT with timeout_stage for FIRST_BYTE phase', async () => {
+        const result = await classifyProbe({
             httpStatus: null,
             error: new DOMException('The operation was aborted', 'AbortError'),
             timeoutStage: 'FIRST_BYTE',
@@ -243,8 +255,8 @@ describe('Criterion 2 — Timeout preserves TIMEOUT + phase; hard stop preserves
         expect(result.timeoutStage).toBe('FIRST_BYTE');
     });
 
-    it('hard stop (run_hard_stop) is classified as UNKNOWN/unattributed at classifier level', () => {
-        const result = classifyProbe({
+    it('hard stop (run_hard_stop) is classified as UNKNOWN/unattributed at classifier level', async () => {
+        const result = await classifyProbe({
             httpStatus: null,
             error: new Error('run_hard_stop'),
             timeoutStage: null,
@@ -261,8 +273,8 @@ describe('Criterion 2 — Timeout preserves TIMEOUT + phase; hard stop preserves
 // ── Criterion 3: http_status is literal or null; never fabricated 408/504 for local timeout ──
 
 describe('Criterion 3 — http_status is literal or null; never fabricated', () => {
-    it('classifyProbe returns httpStatus=null for local timeout (no HTTP response)', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns httpStatus=null for local timeout (no HTTP response)', async () => {
+        const result = await classifyProbe({
             httpStatus: null,
             error: new DOMException('The operation was aborted', 'AbortError'),
             timeoutStage: 'FIRST_TOKEN',
@@ -275,8 +287,8 @@ describe('Criterion 3 — http_status is literal or null; never fabricated', () 
         expect(result.httpStatus).not.toBe(504);
     });
 
-    it('classifyProbe preserves literal httpStatus when present', () => {
-        const result = classifyProbe({
+    it('classifyProbe preserves literal httpStatus when present', async () => {
+        const result = await classifyProbe({
             httpStatus: 429,
             error: null,
             timeoutStage: null,
@@ -286,8 +298,8 @@ describe('Criterion 3 — http_status is literal or null; never fabricated', () 
         expect(result.httpStatus).toBe(429);
     });
 
-    it('classifyProbe preserves literal httpStatus 200 on success', () => {
-        const result = classifyProbe({
+    it('classifyProbe preserves literal httpStatus 200 on success', async () => {
+        const result = await classifyProbe({
             httpStatus: 200,
             error: null,
             timeoutStage: null,
@@ -301,8 +313,8 @@ describe('Criterion 3 — http_status is literal or null; never fabricated', () 
 // ── Criterion 4: Retry-After persisted and guides scheduling ──
 
 describe('Criterion 4 — Retry-After persisted and guides scheduling', () => {
-    it('classifyProbe parses Retry-After seconds', () => {
-        const result = classifyProbe({
+    it('classifyProbe parses Retry-After seconds', async () => {
+        const result = await classifyProbe({
             httpStatus: 429,
             error: null,
             timeoutStage: null,
@@ -313,9 +325,9 @@ describe('Criterion 4 — Retry-After persisted and guides scheduling', () => {
         expect(result.retryAt).not.toBeNull();
     });
 
-    it('classifyProbe parses Retry-After HTTP-date', () => {
-        const httpDate = 'Tue, 14 Jul 2026 12:05:00 GMT';
-        const result = classifyProbe({
+    it('classifyProbe parses Retry-After HTTP-date', async () => {
+        const httpDate = retryAfterHttpDate(5);
+        const result = await classifyProbe({
             httpStatus: 429,
             error: null,
             timeoutStage: null,
@@ -326,8 +338,8 @@ describe('Criterion 4 — Retry-After persisted and guides scheduling', () => {
         expect(result.retryAt).not.toBeNull();
     });
 
-    it('classifyProbe returns null retry when no Retry-After header', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns null retry when no Retry-After header', async () => {
+        const result = await classifyProbe({
             httpStatus: 200,
             error: null,
             timeoutStage: null,
@@ -338,8 +350,8 @@ describe('Criterion 4 — Retry-After persisted and guides scheduling', () => {
         expect(result.retryAt).toBeNull();
     });
 
-    it('classifyProbe parses Retry-After and returns retryAfterSeconds', () => {
-        const result = classifyProbe({
+    it('classifyProbe parses Retry-After and returns retryAfterSeconds', async () => {
+        const result = await classifyProbe({
             httpStatus: 429,
             error: null,
             timeoutStage: null,
@@ -384,7 +396,7 @@ describe('Criterion 5 — TTFT canonical across baseline, status, API, rollups',
         // Use future deadline so submission is not STALE
         const expect_ = await seedExpectation(db, {
             model_id: m.id, purpose: 'AVAILABILITY', due_at: NOW,
-            deadline_at: minutesFromNow(60), tier: 'FREE', interval_minutes: 5,
+            deadline_at: deadlineInMinutes(60), tier: 'FREE', interval_minutes: 5,
         });
         const exec = await seedExecution(db, { run_id: run.id, model_id: m.id, expectation_id: expect_.id, purpose: 'AVAILABILITY' });
 
@@ -763,8 +775,8 @@ describe('Criterion 12 — 401/429 from one account not materializing as fall of
 
     beforeEach(() => { db = createTestDb(); });
 
-    it('classifyProbe returns RATE_LIMITED for 429, not a blanket failure', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns RATE_LIMITED for 429, not a blanket failure', async () => {
+        const result = await classifyProbe({
             httpStatus: 429,
             error: null,
             timeoutStage: null,
@@ -775,8 +787,8 @@ describe('Criterion 12 — 401/429 from one account not materializing as fall of
         expect(result.failureDomain).toBe('ACCOUNT');
     });
 
-    it('classifyProbe returns AUTH_ERROR for 401, not a blanket failure', () => {
-        const result = classifyProbe({
+    it('classifyProbe returns AUTH_ERROR for 401, not a blanket failure', async () => {
+        const result = await classifyProbe({
             httpStatus: 401,
             error: null,
             timeoutStage: null,
@@ -1155,7 +1167,7 @@ describe('Criterion 17 — Replay of evidence does not duplicate', () => {
         const run = await seedMonitorRun(db, { id: 'run-rep' });
         const expect_ = await seedExpectation(db, {
             model_id: m.id, purpose: 'AVAILABILITY', due_at: NOW,
-            deadline_at: minutesFromNow(60), tier: 'FREE', interval_minutes: 5,
+            deadline_at: deadlineInMinutes(60), tier: 'FREE', interval_minutes: 5,
         });
         const exec = await seedExecution(db, { run_id: run.id, model_id: m.id, expectation_id: expect_.id, purpose: 'AVAILABILITY' });
 
@@ -1181,7 +1193,10 @@ describe('Criterion 17 — Replay of evidence does not duplicate', () => {
             nodeId: 'node', fencingToken: 'ft',
         });
 
-        // Now acceptResult with same key should detect DUPLICATE
+        // The attempt is now in a terminal (COMPLETED) state. After the C2 fix,
+        // acceptResult checks attempt state FIRST and returns REJECTED for a
+        // terminal attempt, rather than DUPLICATE (the duplicate check only
+        // applies while the attempt is still non-terminal).
         const duplicate = await acceptResult(db, attemptId, {
             idempotencyKey: 'ik-rep',
             canonicalPayloadHash: 'hash-rep',
@@ -1190,7 +1205,7 @@ describe('Criterion 17 — Replay of evidence does not duplicate', () => {
             fencingToken: 'ft',
             receivedAt: NOW,
         });
-        expect(duplicate.disposition).toBe('DUPLICATE');
+        expect(duplicate.disposition).toBe('REJECTED');
     });
 
     it('completeProbeAttempt is idempotent (CAS prevents re-completion)', async () => {
@@ -1199,7 +1214,7 @@ describe('Criterion 17 — Replay of evidence does not duplicate', () => {
         const run = await seedMonitorRun(db, { id: 'run-cas' });
         const expect_ = await seedExpectation(db, {
             model_id: m.id, purpose: 'AVAILABILITY', due_at: NOW,
-            deadline_at: minutesFromNow(60), tier: 'FREE', interval_minutes: 5,
+            deadline_at: deadlineInMinutes(60), tier: 'FREE', interval_minutes: 5,
         });
         const exec = await seedExecution(db, { run_id: run.id, model_id: m.id, expectation_id: expect_.id, purpose: 'AVAILABILITY' });
 
@@ -1326,7 +1341,7 @@ describe('Criterion 18 — Cleanup respects FKs and check→attempt invariant', 
         const run = await seedMonitorRun(db, { id: 'run-inv' });
         const expect_ = await seedExpectation(db, {
             model_id: m.id, purpose: 'AVAILABILITY', due_at: NOW,
-            deadline_at: minutesFromNow(60), tier: 'FREE', interval_minutes: 5,
+            deadline_at: deadlineInMinutes(60), tier: 'FREE', interval_minutes: 5,
         });
         const exec = await seedExecution(db, { run_id: run.id, model_id: m.id, expectation_id: expect_.id, purpose: 'AVAILABILITY' });
 

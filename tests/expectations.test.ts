@@ -303,7 +303,20 @@ describe('expectations', () => {
             const afterCount = await db
                 .prepare('SELECT COUNT(*) as c FROM model_check_expectations')
                 .first<{ c: number }>();
-            expect(afterCount?.c).toBe((beforeCount?.c ?? 0) - cancelled);
+            expect(afterCount?.c).toBe(beforeCount?.c ?? 0);
+
+            const cancelledRows = await db
+                .prepare(
+                    `SELECT state, reason_code, resolved_at
+                     FROM model_check_expectations
+                     WHERE policy_version = 'v1' AND state = 'CANCELLED'`,
+                )
+                .all<{ state: string; reason_code: string; resolved_at: string }>();
+            expect(cancelledRows.results.length).toBe(cancelled);
+            for (const r of cancelledRows.results) {
+                expect(r.reason_code).toBe('policy_change');
+                expect(r.resolved_at).toBe(makeNow());
+            }
 
             const remaining = await db
                 .prepare(

@@ -65,10 +65,10 @@ describe('analyzeCadence', () => {
         expect(result.dominantReason).toBeNull();
     });
 
-    it('returns DEGRADED when coverage is between 0.5 and target', async () => {
+    it('returns DEGRADED when policyAdherence is below target in a single window', async () => {
         await seedModel(db, { id: 'm1', tier: 'FREE' });
 
-        // 8 satisfied, 4 missed → 0.67 coverage
+        // 8 satisfied, 4 missed (attributed) → policyAdherence 0.67 < 0.90
         for (let i = 1; i <= 8; i++) {
             await seedExpectation(db, {
                 model_id: 'm1',
@@ -87,6 +87,7 @@ describe('analyzeCadence', () => {
                 tier: 'FREE',
                 interval_minutes: 5,
                 state: 'MISSED',
+                reason_code: 'timeout_before_headers',
             });
         }
 
@@ -99,10 +100,10 @@ describe('analyzeCadence', () => {
         expect(result.state).toBe('DEGRADED');
     });
 
-    it('returns BREACHED when coverage is below 0.5', async () => {
+    it('returns BREACHED when below target in two consecutive windows', async () => {
         await seedModel(db, { id: 'm1', tier: 'FREE' });
 
-        // 3 satisfied, 9 missed → 0.25 coverage
+        // 3 satisfied, 9 missed (attributed) → policyAdherence 0.25 < 0.90
         for (let i = 1; i <= 3; i++) {
             await seedExpectation(db, {
                 model_id: 'm1',
@@ -121,10 +122,15 @@ describe('analyzeCadence', () => {
                 tier: 'FREE',
                 interval_minutes: 5,
                 state: 'MISSED',
+                reason_code: 'timeout_before_headers',
             });
         }
 
-        const result = await analyzeCadence(db, 'm1', '1h', { nowIso: NOW });
+        // Previous window was also below target → BREACHED (spec line 343)
+        const result = await analyzeCadence(db, 'm1', '1h', {
+            nowIso: NOW,
+            previousWindowBreached: true,
+        });
 
         expect(result.nominalExpected).toBe(12);
         expect(result.satisfied).toBe(3);
@@ -203,6 +209,7 @@ describe('analyzeCadence', () => {
                 tier: 'FREE',
                 interval_minutes: 5,
                 state: 'MISSED',
+                reason_code: 'timeout_before_headers',
             });
         }
 
@@ -272,7 +279,7 @@ describe('analyzeCadence', () => {
         expect(result.dominantReason).toBe('timeout_before_headers');
     });
 
-    it('treats UNATTRIBUTED as instrumentation defect and still reports it', async () => {
+    it('treats unattributed MISSED (no reason_code) as instrumentation defect → BREACHED', async () => {
         await seedModel(db, { id: 'm1', tier: 'FREE' });
 
         for (let i = 1; i <= 6; i++) {
@@ -283,18 +290,14 @@ describe('analyzeCadence', () => {
                 tier: 'FREE',
                 interval_minutes: 5,
                 state: 'MISSED',
+                reason_code: null,
             });
-            await db
-                .prepare(
-                    `UPDATE model_check_expectations SET reason_code = 'unattributed' WHERE model_id = ? AND due_at = ?`,
-                )
-                .bind('m1', minutesAgo(i * 5))
-                .run();
         }
 
         const result = await analyzeCadence(db, 'm1', '1h', { nowIso: NOW });
 
-        expect(result.dominantReason).toBe('unattributed');
+        expect(result.missed).toBe(6);
+        expect(result.dominantReason).toBeNull();
         expect(result.state).toBe('BREACHED');
     });
 
@@ -405,7 +408,7 @@ describe('analyzeCadence', () => {
     it('respects custom target threshold', async () => {
         await seedModel(db, { id: 'm1', tier: 'FREE' });
 
-        // 8 satisfied, 4 missed → 0.67 coverage
+        // 8 satisfied, 4 missed (attributed) → policyAdherence 0.67
         for (let i = 1; i <= 8; i++) {
             await seedExpectation(db, {
                 model_id: 'm1',
@@ -424,14 +427,15 @@ describe('analyzeCadence', () => {
                 tier: 'FREE',
                 interval_minutes: 5,
                 state: 'MISSED',
+                reason_code: 'timeout_before_headers',
             });
         }
 
-        // With target 0.95 → DEGRADED (0.67 < 0.95)
+        // With target 0.95 → DEGRADED (policyAdherence 0.67 < 0.95)
         const strict = await analyzeCadence(db, 'm1', '1h', { nowIso: NOW, target: 0.95 });
         expect(strict.state).toBe('DEGRADED');
 
-        // With target 0.60 → HEALTHY (0.67 >= 0.60)
+        // With target 0.60 → HEALTHY (policyAdherence 0.67 >= 0.60)
         const loose = await analyzeCadence(db, 'm1', '1h', { nowIso: NOW, target: 0.6 });
         expect(loose.state).toBe('HEALTHY');
     });

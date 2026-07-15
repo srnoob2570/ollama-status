@@ -347,6 +347,14 @@ CREATE TABLE hourly_execution_rollups (
 CREATE INDEX idx_hourly_execution_rollups_hour_at ON hourly_execution_rollups(hour_at);
 
 -- ---------------------------------------------------------------------------
+-- 10b. _expectation_watermarks — per-policy materialization watermark
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS _expectation_watermarks (
+    policy_version TEXT PRIMARY KEY,
+    watermark      TEXT NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
 -- 11. ALTER checks — add ledger and observation columns
 -- ---------------------------------------------------------------------------
 ALTER TABLE checks

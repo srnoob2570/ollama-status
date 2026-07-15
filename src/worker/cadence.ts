@@ -1,6 +1,7 @@
 import type { D1DatabaseLike, CadenceWindow, CadenceWindowState, ReasonCode } from './types.ts';
 import { now } from './types.ts';
 import { metrics } from './metrics.ts';
+import { round4 } from './utils.ts';
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
@@ -9,6 +10,15 @@ export interface CadenceOptions {
     target?: number;
     /** Override current time for deterministic testing. */
     nowIso?: string;
+    /**
+     * Whether the immediately preceding window of the same duration was below
+     * target.  When true and this window is also below target, the state
+     * becomes BREACHED ("dos ventanas consecutivas", spec line 343).
+     *
+     * Callers (e.g. the API) supply this by querying `hourly_execution_rollups`
+     * for the prior window so `analyzeCadence` stays pure.  Defaults to false.
+     */
+    previousWindowBreached?: boolean;
 }
 
 // ── Window parsing ────────────────────────────────────────────────────────────
@@ -60,11 +70,20 @@ function parseWindow(raw: string, nowIso: string): ParsedWindow {
 
 // ── State classification ──────────────────────────────────────────────────────
 
-function classifyState(nominalExpected: number, nominalCoverage: number, target: number): CadenceWindowState {
+function classifyState(
+    nominalExpected: number,
+    policyAdherence: number,
+    target: number,
+    hasUnattributedMissed: boolean,
+    previousWindowBreached: boolean,
+): CadenceWindowState {
     if (nominalExpected === 0) return 'INSUFFICIENT_DATA';
-    if (nominalCoverage >= target) return 'HEALTHY';
-    if (nominalCoverage >= 0.5) return 'DEGRADED';
-    return 'BREACHED';
+    // Unattributed MISSED is an instrumentation defect → BREACHED immediately (spec line 384).
+    if (hasUnattributedMissed) return 'BREACHED';
+    if (policyAdherence >= target) return 'HEALTHY';
+    // Below target: two consecutive windows → BREACHED, otherwise DEGRADED.
+    if (previousWindowBreached) return 'BREACHED';
+    return 'DEGRADED';
 }
 
 // ── Dominant reason ───────────────────────────────────────────────────────────
@@ -81,12 +100,6 @@ function dominantReason(
         }
     }
     return best;
-}
-
-// ── Rounding helper ───────────────────────────────────────────────────────────
-
-function round4(n: number): number {
-    return Math.round(n * 10_000) / 10_000;
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -111,9 +124,10 @@ function round4(n: number): number {
  *
  * **State machine**
  *   INSUFFICIENT_DATA  →  nominalExpected === 0
- *   HEALTHY            →  nominalCoverage >= target (default 0.90)
- *   DEGRADED           →  0.50 <= nominalCoverage < target
- *   BREACHED           →  nominalCoverage < 0.50
+ *   HEALTHY            →  policyAdherence >= target (default 0.90)
+ *   DEGRADED           →  policyAdherence < target in a single window
+ *   BREACHED           →  unattributed MISSED slots, OR below target in
+ *                         two consecutive windows
  *
  * **Dominant reason**
  *   The most frequent `reason_code` among non-satisfied slots (MISSED +
@@ -147,6 +161,7 @@ export async function analyzeCadence(
     let missed = 0;
     let cancelled = 0;
     let unresolved = 0; // EXPECTED | SCHEDULED in a past window
+    let unattributedMissed = 0;
     const reasonCounts = new Map<string, number>();
 
     for (const row of rows.results) {
@@ -162,6 +177,9 @@ export async function analyzeCadence(
                 break;
             case 'MISSED':
                 missed++;
+                if (!row.reason_code) {
+                    unattributedMissed++; // instrumentation defect → BREACHED
+                }
                 if (row.reason_code) {
                     reasonCounts.set(row.reason_code, (reasonCounts.get(row.reason_code) ?? 0) + 1);
                 }
@@ -184,7 +202,13 @@ export async function analyzeCadence(
 
     const nominalCoverage = nominalExpected > 0 ? satisfied / nominalExpected : 0;
     const policyAdherence = nominalExpected > 0 ? (satisfied + suppressed) / nominalExpected : 0;
-    const state = classifyState(nominalExpected, nominalCoverage, target);
+    const state = classifyState(
+        nominalExpected,
+        policyAdherence,
+        target,
+        unattributedMissed > 0,
+        options.previousWindowBreached ?? false,
+    );
 
     metrics.cadenceWindowsTotal.inc({ state, window: label });
 

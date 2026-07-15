@@ -10,22 +10,10 @@ export interface MaterializeOptions {
     cutoverAt?: string;
 }
 
-async function ensureWatermarkTable(db: D1DatabaseLike): Promise<void> {
-    await db
-        .prepare(
-            `CREATE TABLE IF NOT EXISTS _expectation_watermarks (
-                policy_version TEXT PRIMARY KEY,
-                watermark      TEXT NOT NULL
-            )`,
-        )
-        .run();
-}
-
 export async function getWatermark(
     db: D1DatabaseLike,
     policyVersion: string,
 ): Promise<string | null> {
-    await ensureWatermarkTable(db);
     const row = await db
         .prepare('SELECT watermark FROM _expectation_watermarks WHERE policy_version = ?')
         .bind(policyVersion)
@@ -38,7 +26,6 @@ export async function setWatermark(
     policyVersion: string,
     watermark: string,
 ): Promise<void> {
-    await ensureWatermarkTable(db);
     await db
         .prepare(
             `INSERT INTO _expectation_watermarks (policy_version, watermark)
@@ -141,7 +128,16 @@ export async function materializeExpectations(
                           interval_minutes, config_snapshot_json, policy_version,
                           state, reason_code, cutover_at)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (model_id, purpose, due_at) DO NOTHING`,
+                         ON CONFLICT (model_id, purpose, due_at) DO UPDATE SET
+                             state = excluded.state,
+                             reason_code = excluded.reason_code,
+                             policy_version = excluded.policy_version,
+                             config_snapshot_json = excluded.config_snapshot_json,
+                             interval_minutes = excluded.interval_minutes,
+                             deadline_at = excluded.deadline_at,
+                             tier = excluded.tier,
+                             resolved_at = NULL
+                         WHERE model_check_expectations.state = 'CANCELLED'`,
                     )
                     .bind(
                         id('expect'),
@@ -182,12 +178,13 @@ export async function cancelExpectationsForPolicyChange(
 
     const result = await db
         .prepare(
-            `DELETE FROM model_check_expectations
+            `UPDATE model_check_expectations
+             SET state = 'CANCELLED', reason_code = 'policy_change', resolved_at = ?
              WHERE policy_version = ?
                AND state IN ('EXPECTED', 'SCHEDULED')
                AND due_at >= ?`,
         )
-        .bind(oldPolicyVersion, now_)
+        .bind(now_, oldPolicyVersion, now_)
         .run();
 
     return result.meta.changes;

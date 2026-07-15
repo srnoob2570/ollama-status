@@ -210,6 +210,11 @@ CREATE TABLE IF NOT EXISTS hourly_execution_rollups (
 
 CREATE INDEX IF NOT EXISTS idx_hourly_execution_rollups_hour_at ON hourly_execution_rollups(hour_at);
 
+CREATE TABLE IF NOT EXISTS _expectation_watermarks (
+    policy_version TEXT PRIMARY KEY,
+    watermark      TEXT NOT NULL
+);
+
 ALTER TABLE checks ADD COLUMN attempt_id TEXT;
 ALTER TABLE checks ADD COLUMN observation_role TEXT;
 ALTER TABLE checks ADD COLUMN retry_after_seconds INTEGER;

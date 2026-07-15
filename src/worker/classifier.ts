@@ -7,7 +7,7 @@ import type {
     Retryability,
     TimeoutStage,
 } from './types.ts';
-import { publicStatusFor } from './status.ts';
+import { publicStatusFor, classifyHttp } from './status.ts';
 
 // ── Public API types ──────────────────────────────────────────────────────────
 
@@ -42,9 +42,9 @@ export interface ClassificationResult {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const CLASSIFIER_RULE_VERSION = 1;
+export const CLASSIFIER_RULE_VERSION = 1;
 
-const SUBSCRIPTION_MARKERS = [
+export const SUBSCRIPTION_MARKERS = [
     'subscription required',
     'requires subscription',
     'model entitlement',
@@ -60,11 +60,10 @@ let _nodeCreateHash: ((alg: string) => {
     update(data: string): { digest(enc: 'hex'): string };
 }) | null | undefined;
 
-function getNodeCreateHash() {
+async function getNodeCreateHash() {
     if (_nodeCreateHash === undefined) {
         try {
-            // eslint-disable-next-line @typescript-eslint/no-require-imports
-            const m = require('node:crypto') as { createHash: typeof _nodeCreateHash };
+            const m = await import('node:crypto');
             _nodeCreateHash = m.createHash;
         } catch {
             _nodeCreateHash = null;
@@ -75,10 +74,28 @@ function getNodeCreateHash() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function isSubscription403(snippet: string | null): boolean {
+export function isSubscription403(snippet: string | null): boolean {
     if (!snippet) return false;
     const lower = snippet.toLowerCase();
     return SUBSCRIPTION_MARKERS.some((marker) => lower.includes(marker));
+}
+
+export function classifySubscription403(
+    httpStatus: number,
+    bodySnippet: string | null,
+): { classification: Classification; reasonCode: ReasonCode | null; evidenceSource: EvidenceSource } {
+    if (httpStatus === 403 && isSubscription403(bodySnippet)) {
+        return {
+            classification: 'SUBSCRIPTION_REQUIRED',
+            reasonCode: 'subscription_required',
+            evidenceSource: 'CLASSIFIER_RULE',
+        };
+    }
+    return {
+        classification: classifyHttp(httpStatus),
+        reasonCode: null,
+        evidenceSource: 'HTTP_STATUS',
+    };
 }
 
 function isAbortError(error: unknown): boolean {
@@ -168,11 +185,11 @@ export function normalizeRetryAfter(
  * Error messages are truncated to 200 chars, lowercased, and stripped of
  * non-alphanumeric characters. No bodies, API keys, or prompts are included.
  */
-export function errorFingerprint(
+export async function errorFingerprint(
     error: unknown,
     stage: TimeoutStage | null,
     httpStatus: number | null,
-): string {
+): Promise<string> {
     const errorType = error instanceof Error ? error.constructor.name : typeof error;
     const normalizedMessage = normalizeErrorMessage(error);
     const stageStr = stage ?? 'NONE';
@@ -180,7 +197,7 @@ export function errorFingerprint(
     const input =
         `http_status=${httpStatus ?? 'null'}|stage=${stageStr}|error_type=${errorType}|message=${normalizedMessage}`;
 
-    const nodeHash = getNodeCreateHash();
+    const nodeHash = await getNodeCreateHash();
     if (nodeHash) {
         return nodeHash('sha256').update(input).digest('hex').slice(0, 32);
     }
@@ -200,13 +217,13 @@ export function errorFingerprint(
  * Maps HTTP status codes, timeout stages, network errors, and stream errors
  * to the full diagnostic taxonomy from spec 002.
  */
-export function classifyProbe(context: ProbeContext): ClassificationResult {
+export async function classifyProbe(context: ProbeContext): Promise<ClassificationResult> {
     const { httpStatus, error, timeoutStage, responseBodySnippet, retryAfterHeader } = context;
 
     if (httpStatus !== null) {
         switch (httpStatus) {
             case 401:
-                return result({
+                return await result({
                     classification: 'AUTH_ERROR',
                     failureDomain: 'ACCOUNT',
                     reasonCode: 'credential_auth_failed',
@@ -218,7 +235,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
 
             case 403: {
                 if (isSubscription403(responseBodySnippet)) {
-                    return result({
+                    return await result({
                         classification: 'SUBSCRIPTION_REQUIRED',
                         failureDomain: 'MODEL',
                         reasonCode: 'subscription_required',
@@ -228,7 +245,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                         httpStatus,
                     });
                 }
-                return result({
+                return await result({
                     classification: 'PROTOCOL_ERROR',
                     failureDomain: 'PROTOCOL',
                     reasonCode: 'unattributed',
@@ -240,7 +257,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
             }
 
             case 404:
-                return result({
+                return await result({
                     classification: 'MODEL_NOT_FOUND',
                     failureDomain: 'MODEL',
                     reasonCode: 'model_not_found',
@@ -251,7 +268,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                 });
 
             case 408:
-                return result({
+                return await result({
                     classification: 'TIMEOUT',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'provider_http_timeout',
@@ -263,7 +280,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
 
             case 429: {
                 const ra = normalizeRetryAfter(retryAfterHeader);
-                return result({
+                return await result({
                     classification: 'RATE_LIMITED',
                     failureDomain: 'ACCOUNT',
                     reasonCode: 'credential_rate_limited',
@@ -277,7 +294,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
             }
 
             case 503:
-                return result({
+                return await result({
                     classification: 'OVERLOADED',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'provider_overloaded',
@@ -288,7 +305,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                 });
 
             case 504:
-                return result({
+                return await result({
                     classification: 'TIMEOUT',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'provider_http_timeout',
@@ -300,7 +317,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
 
             default:
                 if (httpStatus >= 500) {
-                    return result({
+                    return await result({
                         classification: 'MODEL_UNREACHABLE',
                         failureDomain: 'PROVIDER',
                         reasonCode: 'provider_http_5xx',
@@ -310,7 +327,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                         httpStatus,
                     });
                 }
-                return result({
+                return await result({
                     classification: 'PROTOCOL_ERROR',
                     failureDomain: 'PROTOCOL',
                     reasonCode: 'unattributed',
@@ -327,7 +344,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
 
         switch (stage) {
             case 'REQUEST_OR_HEADERS':
-                return result({
+                return await result({
                     classification: 'TIMEOUT',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'timeout_before_headers',
@@ -339,7 +356,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                 });
 
             case 'FIRST_BYTE':
-                return result({
+                return await result({
                     classification: 'TIMEOUT',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'timeout_waiting_first_byte',
@@ -351,7 +368,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                 });
 
             case 'FIRST_TOKEN':
-                return result({
+                return await result({
                     classification: 'TIMEOUT',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'timeout_waiting_first_token',
@@ -363,7 +380,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
                 });
 
             default:
-                return result({
+                return await result({
                     classification: 'TIMEOUT',
                     failureDomain: 'PROVIDER',
                     reasonCode: 'timeout_before_headers',
@@ -377,7 +394,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
     }
 
     if (isNetworkError(error)) {
-        return result({
+        return await result({
             classification: 'NETWORK_ERROR',
             failureDomain: 'NETWORK_PATH',
             reasonCode: 'network_error',
@@ -390,7 +407,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
 
     const streamIssue = isStreamError(error);
     if (streamIssue.type === 'empty') {
-        return result({
+        return await result({
             classification: 'EMPTY_RESPONSE',
             failureDomain: 'PROVIDER',
             reasonCode: 'empty_response',
@@ -401,7 +418,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
         });
     }
     if (streamIssue.type === 'invalid') {
-        return result({
+        return await result({
             classification: 'PROTOCOL_ERROR',
             failureDomain: 'PROTOCOL',
             reasonCode: 'invalid_stream',
@@ -412,7 +429,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
         });
     }
     if (streamIssue.type === 'too_large') {
-        return result({
+        return await result({
             classification: 'PROTOCOL_ERROR',
             failureDomain: 'PROTOCOL',
             reasonCode: 'stream_too_large',
@@ -424,7 +441,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
     }
 
     if (error) {
-        return result({
+        return await result({
             classification: 'UNKNOWN',
             failureDomain: 'UNKNOWN',
             reasonCode: 'unattributed',
@@ -436,7 +453,7 @@ export function classifyProbe(context: ProbeContext): ClassificationResult {
     }
 
     // No error, no HTTP status — should not happen, but handle gracefully
-    return result({
+    return await result({
         classification: 'UNKNOWN',
         failureDomain: 'UNKNOWN',
         reasonCode: 'unattributed',
@@ -462,9 +479,9 @@ interface ResultOverrides {
     retryAt?: string | null;
 }
 
-function result(overrides: ResultOverrides): ClassificationResult {
+async function result(overrides: ResultOverrides): Promise<ClassificationResult> {
     const publicStatus = publicStatusFor(overrides.classification);
-    const fp = errorFingerprint(
+    const fp = await errorFingerprint(
         null, // No error object for HTTP-based classifications
         overrides.timeoutStage ?? null,
         overrides.httpStatus,

@@ -332,6 +332,33 @@ describe('ledger', () => {
             });
             expect(result.disposition).toBe('STALE');
         });
+
+        it('returns REJECTED when attempt is already terminal', async () => {
+            const db = makeDb();
+            const { providerId, modelId, runId } = seedBase(db);
+            const { executionId } = seedExpectationAndExecution(db, modelId, runId);
+            const attempt = makeAttempt({ runId, modelId, providerId, parentId: executionId });
+            await recordProbeAttempt(db, attempt);
+
+            await completeProbeAttempt(db, attempt.id, makeResult(), {
+                idempotencyKey: 'ik-first',
+                canonicalPayloadHash: 'hash-first',
+                taskId: '',
+                nodeId: '',
+                fencingToken: '',
+            });
+
+            const result = await acceptResult(db, attempt.id, {
+                idempotencyKey: 'ik-late',
+                canonicalPayloadHash: 'hash-late',
+                taskId: '',
+                nodeId: '',
+                fencingToken: '',
+                receivedAt: now(),
+            });
+            expect(result.disposition).toBe('REJECTED');
+            expect(result.reasonCode).toBe('stale_result');
+        });
     });
 
     describe('completeProbeAttempt', () => {
@@ -481,6 +508,53 @@ describe('ledger', () => {
             ).bind(attempt.id).first();
             expect(check).toBeNull();
         });
+
+        it('C2: does not revert SATISFIED expectation on a non-ACCEPTED replay', async () => {
+            const db = makeDb();
+            const { providerId, modelId, runId } = seedBase(db);
+            const { executionId, expectationId } = seedExpectationAndExecution(db, modelId, runId);
+            const attempt = makeAttempt({ runId, modelId, providerId, parentId: executionId });
+            await recordProbeAttempt(db, attempt);
+
+            await completeProbeAttempt(db, attempt.id, makeResult(), {
+                idempotencyKey: 'ik-acc',
+                canonicalPayloadHash: 'hash-acc',
+                taskId: '',
+                nodeId: '',
+                fencingToken: '',
+            });
+
+            const before = await db.prepare(
+                'SELECT state FROM model_check_expectations WHERE id = ?',
+            ).bind(expectationId).first<{ state: string }>();
+            expect(before?.state).toBe('SATISFIED');
+
+            await db.prepare(
+                'UPDATE model_check_expectations SET deadline_at = ? WHERE id = ?',
+            ).bind(new Date(Date.now() - 3600_000).toISOString(), expectationId).run();
+
+            const second = makeAttempt({
+                runId,
+                modelId,
+                providerId,
+                parentId: executionId,
+                id: id('att2'),
+            });
+            await recordProbeAttempt(db, second);
+
+            await completeProbeAttempt(db, second.id, makeResult({ classification: 'TIMEOUT' }), {
+                idempotencyKey: 'ik-stale-2',
+                canonicalPayloadHash: 'hash-stale-2',
+                taskId: '',
+                nodeId: '',
+                fencingToken: '',
+            });
+
+            const after = await db.prepare(
+                'SELECT state, reason_code FROM model_check_expectations WHERE id = ?',
+            ).bind(expectationId).first<{ state: string; reason_code: string | null }>();
+            expect(after?.state).toBe('SATISFIED');
+        });
     });
 
     describe('recordProbeEvent', () => {
@@ -578,6 +652,23 @@ describe('ledger', () => {
                 detailJson: null,
             });
             expect(event.id).toBeTruthy();
+        });
+
+        it('rejects detail_json exceeding the byte limit', async () => {
+            const db = makeDb();
+            const big = JSON.stringify({ started_at: 'x'.repeat(5000), model_id: 'm1', purpose: 'AVAILABILITY' });
+            await expect(
+                recordProbeEvent(db, {
+                    eventType: 'probe.started',
+                    eventVersion: 1,
+                    occurredAt: now(),
+                    actorType: 'system',
+                    actorId: 'test',
+                    subjectType: 'probe_attempt',
+                    subjectId: 'att-1',
+                    detailJson: big,
+                }),
+            ).rejects.toThrow(/exceeds 4096-byte limit/);
         });
     });
 

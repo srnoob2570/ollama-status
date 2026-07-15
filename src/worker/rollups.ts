@@ -1,4 +1,5 @@
 import type { D1DatabaseLike } from './types.ts';
+import { round4 } from './utils.ts';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -181,6 +182,3 @@ export async function upsertHourlyExecutionRollup(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function round4(n: number): number {
-    return Math.round(n * 10_000) / 10_000;
-}

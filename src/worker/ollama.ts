@@ -1,5 +1,5 @@
-import { classifyHttp, isLatencyAnomalous, publicStatusFor } from './status.ts';
-import { classifyProbe } from './classifier.ts';
+import { isLatencyAnomalous, publicStatusFor } from './status.ts';
+import { classifyProbe, classifySubscription403 } from './classifier.ts';
 import type { ProbeResult, Provider, TimeoutStage } from './types.ts';
 import { now } from './types.ts';
 
@@ -160,11 +160,8 @@ export class OllamaProvider {
             if (!response.ok) {
                 // Inspect the response only in memory; errors and generated text are never persisted.
                 const error = await responseTextPrefix(response, maxResponseBytes);
-                const classification =
-                    response.status === 403 &&
-                    /requires a subscription|upgrade for access/i.test(error)
-                        ? 'SUBSCRIPTION_REQUIRED'
-                        : classifyHttp(response.status);
+                const sub = classifySubscription403(response.status, error);
+                const classification = sub.classification;
                 const retryAfter = Number.parseInt(response.headers.get('retry-after') ?? '', 10);
                 return {
                     classification,
@@ -177,6 +174,8 @@ export class OllamaProvider {
                     ttftMs: null,
                     errorCode: `http_${response.status}`,
                     retryAfterSeconds: Number.isFinite(retryAfter) ? retryAfter : undefined,
+                    reasonCode: sub.reasonCode ?? undefined,
+                    evidenceSource: sub.evidenceSource ?? undefined,
                 };
             }
             return await firstChatToken(
@@ -213,7 +212,7 @@ export class OllamaProvider {
                 }
             }
 
-            const classificationResult = classifyProbe({
+            const classificationResult = await classifyProbe({
                 httpStatus,
                 error,
                 timeoutStage,
@@ -303,7 +302,7 @@ async function firstChatToken(
                         ? 'HIGH_LATENCY'
                         : 'SUCCESS';
 
-                    const classificationResult = classifyProbe({
+                    const classificationResult = await classifyProbe({
                         httpStatus: response.status,
                         error: null,
                         timeoutStage: null,
