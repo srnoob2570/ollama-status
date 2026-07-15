@@ -357,7 +357,7 @@ export interface MonitorEnv extends ApiEnv {
     PROBE_DELAY_MIN_MS?: string;
     PROBE_DELAY_MAX_MS?: string;
     OLLAMA_API_KEY_FREE: string;
-    OLLAMA_API_KEY_PAID: string;
+    OLLAMA_API_KEY_PAID?: string;
     CONFIRMATION_CALLBACK_URL?: string;
     GITHUB_REPOSITORY?: string;
     GITHUB_ACTIONS_TOKEN?: string;

@@ -972,9 +972,10 @@ async function resolveProviders(
 ): Promise<{ freeProvider: Provider | undefined; paidProvider: Provider | undefined }> {
     await ensureProviders(env);
     const activeProviders = await providers(env);
+    const paid = activeProviders.find((provider) => provider.id === 'ollama-paid');
     return {
         freeProvider: activeProviders.find((provider) => provider.id === 'ollama-free'),
-        paidProvider: activeProviders.find((provider) => provider.id === 'ollama-paid'),
+        paidProvider: paid && hasKey(env, paid) ? paid : undefined,
     };
 }
 

@@ -33,7 +33,7 @@ export function buildRunnerEnv(db: D1DatabaseLike): MonitorEnv {
         PROBE_DELAY_MIN_MS: process.env.PROBE_DELAY_MIN_MS,
         PROBE_DELAY_MAX_MS: process.env.PROBE_DELAY_MAX_MS,
         OLLAMA_API_KEY_FREE: required('OLLAMA_API_KEY_FREE'),
-        OLLAMA_API_KEY_PAID: required('OLLAMA_API_KEY_PAID'),
+        OLLAMA_API_KEY_PAID: process.env.OLLAMA_API_KEY_PAID ?? '',
         CONFIRMATION_CALLBACK_URL: process.env.CONFIRMATION_CALLBACK_URL,
         GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
         GITHUB_ACTIONS_TOKEN: process.env.GITHUB_ACTIONS_TOKEN,
