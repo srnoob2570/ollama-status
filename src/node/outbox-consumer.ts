@@ -119,7 +119,10 @@ export function startOutboxConsumer(
         consumerId = 'node-1',
         processor = DEFAULT_PROCESSORS,
         onError = (error, event) =>
-            console.error(`outbox consumer: error processing event ${event.outbox.id} (${event.event.event_type})`, error),
+            console.error(
+                `outbox consumer: error processing event ${event.outbox.id} (${event.event.event_type})`,
+                error,
+            ),
     } = options;
 
     let stopped = false;
@@ -131,9 +134,7 @@ export function startOutboxConsumer(
         try {
             // Fetch unconsumed outbox rows
             const rows = await db
-                .prepare(
-                    `SELECT * FROM probe_outbox WHERE consumed_at IS NULL ORDER BY id LIMIT ?`,
-                )
+                .prepare(`SELECT * FROM probe_outbox WHERE consumed_at IS NULL ORDER BY id LIMIT ?`)
                 .bind(batchSize)
                 .all<OutboxRow>();
 
@@ -245,10 +246,7 @@ export function startOutboxConsumer(
         }
     }
 
-    async function incrementAttempts(
-        db: D1DatabaseLike,
-        outboxId: string,
-    ): Promise<void> {
+    async function incrementAttempts(db: D1DatabaseLike, outboxId: string): Promise<void> {
         await db
             .prepare(
                 `UPDATE probe_outbox SET attempts = attempts + 1 WHERE id = ? AND consumed_at IS NULL`,

@@ -1,9 +1,14 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { D1DatabaseLike, D1StatementLike } from '../worker/types.ts';
 
-// node:sqlite throws a TypeError on `undefined`/`boolean` bound params, where D1/SQLite accept
-// them (undefined behaves like omitted, boolean coerces to 0/1). Normalizing here means a
-// `.bind()` call that forgets `?? null` breaks identically on both targets instead of only here.
+/**
+ * D1DatabaseLike adapter backed by `node:sqlite`.
+ *
+ * Used for lightweight local testing where PostgreSQL is unavailable.
+ * The `batch()` method wraps statements in a BEGIN/COMMIT/ROLLBACK
+ * transaction. Parameter normalization handles `undefined` → `null` and
+ * `boolean` → `0`/`1` coercion for compatibility with D1 semantics.
+ */
 function normalize(value: unknown): unknown {
     if (value === undefined) return null;
     if (typeof value === 'boolean') return value ? 1 : 0;

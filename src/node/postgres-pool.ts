@@ -1,8 +1,13 @@
 import { Pool, type PoolConfig } from 'pg';
 
-// pg-connection-string currently treats `sslmode=require` as `verify-full`, while libpq's
-// documented `require` mode encrypts the connection without validating a self-signed CA. Keep
-// that compatibility explicitly so Coolify's self-signed PostgreSQL certificate still uses TLS.
+/**
+ * Build a pg.PoolConfig from a connection string, handling `sslmode=require`
+ * compatibility for self-signed PostgreSQL certificates (e.g. Coolify).
+ *
+ * pg-connection-string currently treats `sslmode=require` as `verify-full`,
+ * while libpq's documented `require` mode encrypts without validating a
+ * self-signed CA. This bridges that gap.
+ */
 export function postgresPoolConfig(connectionString: string): PoolConfig {
     const url = new URL(connectionString);
     if (url.searchParams.get('sslmode') !== 'require') return { connectionString };
@@ -15,6 +20,13 @@ export function postgresPoolConfig(connectionString: string): PoolConfig {
     };
 }
 
+/**
+ * Create a pg.Pool with timeouts and error handling for the monitor process.
+ *
+ * Query/statement timeouts prevent hung DB connections from blocking the
+ * monitor's run closure. The pool error handler logs rather than crashing on
+ * idle-client errors, which would otherwise leave an open run row behind.
+ */
 export function createPostgresPool(connectionString: string): Pool {
     const pool = new Pool({
         ...postgresPoolConfig(connectionString),

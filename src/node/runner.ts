@@ -1,3 +1,16 @@
+/**
+ * ollama-status monitor runner process.
+ *
+ * Runs on a 5-minute cron schedule in UTC: drains the manual monitor queue,
+ * then runs the full monitor cycle if no manual job was pending. A recovery
+ * supervisor polls every 30 seconds for stuck runs left open by a dead or
+ * wedged owner and re-runs the monitor immediately. A watchdog exits the
+ * process if no monitor attempt settles within 20 minutes, relying on
+ * Docker's `restart: unless-stopped` for recovery.
+ *
+ * Also starts the outbox consumer (event processing loop) and exposes a
+ * local health endpoint on port 3001 for Docker health checks.
+ */
 import { serve } from 'srvx';
 import cron from 'node-cron';
 import { drainManualMonitorJobs } from '../worker/monitor-jobs.ts';
@@ -28,7 +41,9 @@ const pool = createPostgresPool(process.env.DATABASE_URL);
 const env = buildRunnerEnv(new PostgresD1Adapter(pool));
 const ctx = {
     waitUntil(promise: Promise<unknown>) {
-        void promise.catch((error: unknown) => console.error('runner background task failed', error));
+        void promise.catch((error: unknown) =>
+            console.error('runner background task failed', error),
+        );
     },
 } as ExecutionContext;
 
@@ -105,9 +120,7 @@ const health = serve({
             {
                 ok: !stale,
                 role: 'runner',
-                lastMonitorSettledAt: new Date(
-                    lastMonitorSettledMs() ?? bootMs,
-                ).toISOString(),
+                lastMonitorSettledAt: new Date(lastMonitorSettledMs() ?? bootMs).toISOString(),
             },
             { status: stale ? 503 : 200 },
         );
@@ -123,7 +136,10 @@ const outboxConsumer = startOutboxConsumer(db, {
     pollIntervalMs: 1_000,
     batchSize: 10,
     onError: (error, event) => {
-        console.error(`outbox consumer: error processing ${event.outbox.id} (${event.event.event_type})`, error);
+        console.error(
+            `outbox consumer: error processing ${event.outbox.id} (${event.event.event_type})`,
+            error,
+        );
     },
 });
 
