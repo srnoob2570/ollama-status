@@ -476,10 +476,11 @@ time,
 
 .signals .checking {
     display: inline-block;
-    max-width: 220px;
+    width: 220px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: left;
     vertical-align: bottom;
 }
 
