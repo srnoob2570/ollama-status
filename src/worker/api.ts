@@ -1,6 +1,7 @@
 import { CRON_INTERVAL_MS, nominalCheckIntervalMinutes } from './status.ts';
 import { enqueueManualMonitorJob } from './monitor-jobs.ts';
 import { analyzeCadence } from './cadence.ts';
+import { FREE_PROVIDER_ID, PAID_PROVIDER_ID } from './monitor.ts';
 import type { ApiEnv, Cache, CacheStorage, ExecutionContext } from './types.ts';
 import { now } from './types.ts';
 
@@ -231,8 +232,8 @@ function effectiveExecutionCheck(
     // value is frozen at scheduling time and is still 'UNKNOWN' during a model's very first
     // classification cycle, even though a Paid check already exists for that same execution.
     return (
-        executionChecks.find((check) => check.provider_id === 'ollama-paid') ??
-        executionChecks.find((check) => check.provider_id === 'ollama-free') ??
+        executionChecks.find((check) => check.provider_id === PAID_PROVIDER_ID) ??
+        executionChecks.find((check) => check.provider_id === FREE_PROVIDER_ID) ??
         executionChecks[0]
     );
 }
@@ -286,13 +287,13 @@ export function effectiveProvider(
     tier: string,
     modelId: string,
     statuses: StatusRow[],
-): 'ollama-free' | 'ollama-paid' {
+): typeof FREE_PROVIDER_ID | typeof PAID_PROVIDER_ID {
     return tier === 'PAID' &&
         statuses.some(
-            (status) => status.model_id === modelId && status.provider_id === 'ollama-paid',
+            (status) => status.model_id === modelId && status.provider_id === PAID_PROVIDER_ID,
         )
-        ? 'ollama-paid'
-        : 'ollama-free';
+        ? PAID_PROVIDER_ID
+        : FREE_PROVIDER_ID;
 }
 
 export function nextUpdatesForModels(models: ScheduledModel[]): {
@@ -581,15 +582,16 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
             key_configured: number;
         }>(),
         env.DB.prepare(
-            "SELECT id,remote_name,tier,next_check_at FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 ORDER BY tier,remote_name",
-        ).all<{ id: string; remote_name: string; tier: string; next_check_at: string | null }>(),
+            "SELECT id,remote_name,tier,next_check_at FROM models WHERE provider_id=? AND active=1 AND excluded=0 ORDER BY tier,remote_name",
+        ).bind(FREE_PROVIDER_ID)
+            .all<{ id: string; remote_name: string; tier: string; next_check_at: string | null }>(),
         env.DB.prepare(
             'SELECT provider_id,model_id,public_status,classification,last_check_at,last_latency_ms FROM provider_model_status',
         ).all<StatusRow>(),
         env.DB.prepare(
-            "SELECT c.provider_id,c.model_id,c.checked_at,c.public_status,c.classification,c.total_duration_ms,c.rtt_ms,c.ttft_ms,c.execution_id FROM checks c JOIN models m ON m.id=c.model_id WHERE m.provider_id='ollama-free' AND c.checked_at>=? AND c.checked_at<=? ORDER BY c.checked_at",
+            "SELECT c.provider_id,c.model_id,c.checked_at,c.public_status,c.classification,c.total_duration_ms,c.rtt_ms,c.ttft_ms,c.execution_id FROM checks c JOIN models m ON m.id=c.model_id WHERE m.provider_id=? AND c.checked_at>=? AND c.checked_at<=? ORDER BY c.checked_at",
         )
-            .bind(configuration.start.toISOString(), timestamp.toISOString())
+            .bind(FREE_PROVIDER_ID, configuration.start.toISOString(), timestamp.toISOString())
             .all<HistoryCheck>(),
         env.DB.prepare(
             `SELECT id,model_id,tier,interval_minutes,scheduled_at,started_at,completed_at,state
@@ -645,7 +647,7 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
             };
         }),
     );
-    const paidProviderRow = providers.results.find((provider) => provider.id === 'ollama-paid');
+    const paidProviderRow = providers.results.find((provider) => provider.id === PAID_PROVIDER_ID);
     const paidKeyConfigured = paidProviderRow ? paidProviderRow.key_configured === 1 : false;
     return json({
         lastUpdatedAt: monitor.lastSuccessfulFinishedAt,
@@ -674,9 +676,9 @@ async function modelDetail(
     range: string | null,
 ): Promise<Response> {
     const model = await env.DB.prepare(
-        "SELECT * FROM models WHERE id=? AND provider_id='ollama-free'",
+        "SELECT * FROM models WHERE id=? AND provider_id=?",
     )
-        .bind(modelId)
+        .bind(modelId, FREE_PROVIDER_ID)
         .first<{ tier: string }>();
     if (!model) return json({ error: 'Model not found' }, 404);
     if (!history) return json({ model });
