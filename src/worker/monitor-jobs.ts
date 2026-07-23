@@ -1,5 +1,5 @@
 import { runMonitor, type MonitorRunResult } from './monitor.ts';
-import { id, now, type ApiEnv, type MonitorEnv } from './types.ts';
+import { id, now, type ApiEnv, type ExecutionContext, type MonitorEnv } from './types.ts';
 
 const JOB_TTL_MS = 15 * 60_000;
 
@@ -77,7 +77,7 @@ export async function drainManualMonitorJobs(
     const job = await claimManualMonitorJob(env);
     if (!job) return null;
 
-    const result = await runMonitor(env, ctx, Date.now());
+    const result = await runMonitor(env, ctx, Date.now(), 'MANUAL', job.id);
     await settleManualMonitorJob(env, job.id, result);
     return job;
 }

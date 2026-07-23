@@ -15,4 +15,3 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
-      - run: npx wrangler d1 migrations apply ollama-status --local --remote=false

@@ -1,3 +1,16 @@
+/**
+ * ollama-status monitor runner process.
+ *
+ * Runs on a 5-minute cron schedule in UTC: drains the manual monitor queue,
+ * then runs the full monitor cycle if no manual job was pending. A recovery
+ * supervisor polls every 30 seconds for stuck runs left open by a dead or
+ * wedged owner and re-runs the monitor immediately. A watchdog exits the
+ * process if no monitor attempt settles within 20 minutes, relying on
+ * Docker's `restart: unless-stopped` for recovery.
+ *
+ * Also starts the outbox consumer (event processing loop) and exposes a
+ * local health endpoint on port 3001 for Docker health checks.
+ */
 import { serve } from 'srvx';
 import cron from 'node-cron';
 import { drainManualMonitorJobs } from '../worker/monitor-jobs.ts';
@@ -5,6 +18,8 @@ import { hasRecoverableStuckRun, lastMonitorSettledMs, runMonitor } from '../wor
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
 import { buildRunnerEnv } from './env.ts';
+import type { ExecutionContext } from '../worker/types.ts';
+import { startOutboxConsumer } from './outbox-consumer.ts';
 
 // A monitor attempt settles every cron interval (5 min) and a legitimate run can take up to one
 // interval more, so the gap between settles never legitimately exceeds ~10 min. Past three
@@ -26,7 +41,9 @@ const pool = createPostgresPool(process.env.DATABASE_URL);
 const env = buildRunnerEnv(new PostgresD1Adapter(pool));
 const ctx = {
     waitUntil(promise: Promise<unknown>) {
-        void promise.catch((error: unknown) => console.error('runner background task failed', error));
+        void promise.catch((error: unknown) =>
+            console.error('runner background task failed', error),
+        );
     },
 } as ExecutionContext;
 
@@ -103,9 +120,7 @@ const health = serve({
             {
                 ok: !stale,
                 role: 'runner',
-                lastMonitorSettledAt: new Date(
-                    lastMonitorSettledMs() ?? bootMs,
-                ).toISOString(),
+                lastMonitorSettledAt: new Date(lastMonitorSettledMs() ?? bootMs).toISOString(),
             },
             { status: stale ? 503 : 200 },
         );
@@ -113,3 +128,29 @@ const health = serve({
 });
 await health.ready();
 console.log(`ollama-status runner health listening on ${health.url}`);
+
+// ── Outbox consumer ──────────────────────────────────────────────────────────
+const db = new PostgresD1Adapter(pool);
+const outboxConsumer = startOutboxConsumer(db, {
+    consumerId: 'node-1',
+    pollIntervalMs: 1_000,
+    batchSize: 10,
+    onError: (error, event) => {
+        console.error(
+            `outbox consumer: error processing ${event.outbox.id} (${event.event.event_type})`,
+            error,
+        );
+    },
+});
+
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+async function shutdown(signal: string): Promise<void> {
+    console.log(`received ${signal}, shutting down...`);
+    await outboxConsumer.stop();
+    await health.close();
+    console.log('shutdown complete');
+    process.exit(0);
+}
+
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));

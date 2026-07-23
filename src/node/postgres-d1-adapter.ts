@@ -6,8 +6,14 @@ function normalize(value: unknown): unknown {
     return value;
 }
 
-// Worker SQL uses D1's positional `?` parameters. Translate only parameter tokens, leaving
-// quoted literals intact so SQL such as `state='RUNNING'` is passed to PostgreSQL unchanged.
+/**
+ * Translate D1-style positional parameters (`?`) to PostgreSQL positional
+ * parameters (`$1`, `$2`, ...).
+ *
+ * Respects single- and double-quoted literals so that SQL like
+ * `state='RUNNING'` passes through unchanged. Parameter tokens inside quoted
+ * strings are left as-is.
+ */
 export function postgresQuery(sql: string): string {
     let parameter = 0;
     let quote: "'" | '"' | null = null;
@@ -31,6 +37,14 @@ export function postgresQuery(sql: string): string {
     return result;
 }
 
+/**
+ * D1StatementLike implementation backed by a pg.Pool.
+ *
+ * Each call to `bind()` creates a new statement instance with the given
+ * parameters. Pool-level execution is used for `run()`, `all()`, and
+ * `first()`; transactional execution via `execute(client)` is used by the
+ * adapter's `batch()` method.
+ */
 class PostgresStatement implements D1StatementLike {
     private readonly pool: Pool;
     private readonly sql: string;
@@ -67,6 +81,13 @@ class PostgresStatement implements D1StatementLike {
     }
 }
 
+/**
+ * D1DatabaseLike adapter backed by a pg.Pool.
+ *
+ * Translates D1's `?`-parameter SQL to PostgreSQL `$N` syntax for every
+ * statement. The `batch()` method wraps statements in a BEGIN/COMMIT
+ * transaction with ROLLBACK on error.
+ */
 export class PostgresD1Adapter implements D1DatabaseLike {
     private readonly pool: Pool;
 

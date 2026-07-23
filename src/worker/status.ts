@@ -132,7 +132,7 @@ export function nextCheckAt(
     return new Date(anchorMs + minutes * 60_000).toISOString();
 }
 
-// The monitor only ever runs on a cron tick (every 5 minutes; see wrangler crons).
+// The monitor only ever runs on a cron tick (every 5 minutes; see node-cron in src/node/runner.ts).
 // A model whose next_check_at lands even a second after a tick would otherwise wait a
 // whole extra cycle, drifting the cadence from ~5 toward ~10 minutes. Admitting
 // anything that comes due before the next tick pins every tier to its exact nominal

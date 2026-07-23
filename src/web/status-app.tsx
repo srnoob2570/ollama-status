@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { cadenceLegend } from './cadence';
 import { nextUpdateLabel } from './next-update';
+import { parseMonitorRunEvent } from './live-progress';
 
 type HistoryRange = '1h' | '24h' | '7d' | '30d';
 type HistorySegment = {
@@ -47,6 +48,7 @@ type Status = {
     range: HistoryRange;
     stale: boolean;
     infeasible: boolean;
+    paidKeyConfigured: boolean;
     monitor: { started_at?: string } | null;
     monitorProgress: MonitorRun | null;
     monitorActive: boolean;
@@ -147,6 +149,25 @@ export function App() {
         return () => clearInterval(timer);
     }, []);
 
+    useEffect(() => {
+        const source = new EventSource('/api/v1/monitor/stream');
+        source.onmessage = (event) => {
+            const run = parseMonitorRunEvent(event.data);
+            if (!run) return;
+            setStatus((current) =>
+                current
+                    ? {
+                          ...current,
+                          monitor: { started_at: run.started_at },
+                          monitorProgress: run,
+                          monitorActive: run.finished_at === null,
+                      }
+                    : current,
+            );
+        };
+        return () => source.close();
+    }, []);
+
     const summary = useMemo(
         () =>
             status?.models.reduce<Record<string, number>>((counts, model) => {
@@ -211,6 +232,12 @@ export function App() {
                     catalog.
                 </section>
             )}
+            {!status.paidKeyConfigured && (
+                <section className="notice info">
+                    PAID MODELS DISABLED — no paid Ollama API key is configured. Paid-tier checks
+                    are skipped to control cost; only free-tier models are actively monitored.
+                </section>
+            )}
             <section className="summary" aria-label="Catalog summary">
                 {Object.entries(summary)
                     .filter(([, count]) => count > 0)
@@ -230,9 +257,10 @@ export function App() {
                 range={status.range}
             />
             <ModelCategory
-                title="Paid models"
+                title={status.paidKeyConfigured ? 'Paid models' : 'Paid models (not monitored)'}
                 models={status.models.filter((model) => model.tier === 'PAID')}
                 range={status.range}
+                showHistory={status.paidKeyConfigured}
             />
             <ModelCategory
                 title="Unclassified models"
@@ -278,17 +306,20 @@ function StatusSignals({ status }: { status: Status }) {
     const signalTone = status.stuckRun || running || run?.outcome === 'ERROR' ? 'warn' : 'ok';
     const title = status.stuckRun
         ? `Stuck since ${run?.started_at ?? status.stuckRun.started_at ?? 'unknown'}`
-        : running && run?.current_model
-          ? `Checking ${run.current_model}`
-          : run?.detail
-            ? run.detail
-            : undefined;
+        : run?.detail
+          ? run.detail
+          : undefined;
     return (
         <div className="signals" aria-label="Monitor status">
             <span className={catalog === 'OK' ? 'ok' : 'warn'}>Catalog {catalog}</span>
             <span className={signalTone} title={title}>
                 {progress}
             </span>
+            {running && run?.current_model && (
+                <span className="checking" title={`Checking ${run.current_model}`}>
+                    Checking {run.current_model}
+                </span>
+            )}
         </div>
     );
 }
@@ -316,7 +347,8 @@ function SummaryMetric({
         <div className={`metric ${tier.toLowerCase()} `}>
             <strong>{count}</strong>
             <span>{label}</span>
-            {nextCheckAt !== null || tier !== 'UNKNOWN' ? (
+            {tier === 'PAID' && !status.paidKeyConfigured ? null : nextCheckAt !== null ||
+              tier !== 'UNKNOWN' ? (
                 <span className="next-check">
                     Next check: {nextUpdateLabel(nextCheckAt, status.monitorActive, currentTime)}
                 </span>
@@ -352,28 +384,45 @@ function ModelCategory({
     title,
     models,
     range,
+    showHistory = true,
 }: {
     title: string;
     models: Model[];
     range: HistoryRange;
+    showHistory?: boolean;
 }) {
     if (!models.length) return null;
     return (
         <section className="panel">
             <div className="panel-heading">
                 <h2>{title}</h2>
-                <span>{models.length} monitored</span>
+                <span>
+                    {models.length} {showHistory ? 'monitored' : 'not monitored'}
+                </span>
             </div>
             <div className="model-list">
                 {models.map((model) => (
-                    <ModelRow key={model.id} model={model} range={range} />
+                    <ModelRow
+                        key={model.id}
+                        model={model}
+                        range={range}
+                        showHistory={showHistory}
+                    />
                 ))}
             </div>
         </section>
     );
 }
 
-function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
+function ModelRow({
+    model,
+    range,
+    showHistory = true,
+}: {
+    model: Model;
+    range: HistoryRange;
+    showHistory?: boolean;
+}) {
     const label = labels[model.effectiveStatus] ?? 'Unknown';
     const reason = availabilityReason(model.effectiveStatus, model.effectiveClassification);
     return (
@@ -390,7 +439,7 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
                     </span>
                 </div>
             </div>
-            <History model={model} range={range} />
+            {showHistory && <History model={model} range={range} />}
         </article>
     );
 }

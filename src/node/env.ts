@@ -6,9 +6,6 @@ function required(name: string): string {
     return value;
 }
 
-// ASSETS is Cloudflare-only: grep confirms it is read exclusively from src/worker/index.ts,
-// which the Node target never loads. The cast documents that this field is intentionally unused
-// here rather than silently `undefined`.
 function apiEnv(db: D1DatabaseLike): ApiEnv {
     return {
         DB: db,
@@ -19,10 +16,22 @@ function apiEnv(db: D1DatabaseLike): ApiEnv {
     };
 }
 
+/**
+ * Build an ApiEnv for the web server process.
+ *
+ * ASSETS is Cloudflare-only and intentionally left undefined here since
+ * the Node web server never loads `src/worker/index.ts`.
+ */
 export function buildWebEnv(db: D1DatabaseLike): ApiEnv {
     return apiEnv(db);
 }
 
+/**
+ * Build a MonitorEnv for the runner process, requiring Ollama credentials.
+ *
+ * Reads all monitor-specific env vars and throws if OLLAMA_BASE_URL or
+ * OLLAMA_API_KEY_FREE are missing.
+ */
 export function buildRunnerEnv(db: D1DatabaseLike): MonitorEnv {
     return {
         ...apiEnv(db),
@@ -33,7 +42,7 @@ export function buildRunnerEnv(db: D1DatabaseLike): MonitorEnv {
         PROBE_DELAY_MIN_MS: process.env.PROBE_DELAY_MIN_MS,
         PROBE_DELAY_MAX_MS: process.env.PROBE_DELAY_MAX_MS,
         OLLAMA_API_KEY_FREE: required('OLLAMA_API_KEY_FREE'),
-        OLLAMA_API_KEY_PAID: required('OLLAMA_API_KEY_PAID'),
+        OLLAMA_API_KEY_PAID: process.env.OLLAMA_API_KEY_PAID ?? '',
         CONFIRMATION_CALLBACK_URL: process.env.CONFIRMATION_CALLBACK_URL,
         GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY,
         GITHUB_ACTIONS_TOKEN: process.env.GITHUB_ACTIONS_TOKEN,

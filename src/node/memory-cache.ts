@@ -1,6 +1,10 @@
-// Replacement for `caches.default` (Workers Cache API) in a single long-lived Node process.
-// Mirrors the subset of Cache semantics api.ts relies on: match()/put() keyed by request URL,
-// with the same `cache-control: max-age` convention driving expiry.
+/**
+ * In-memory replacement for the Workers Cache API (`caches.default`).
+ *
+ * Supports `match()` and `put()` keyed by request URL, with TTL driven by
+ * the `cache-control: max-age` response header. Runs in a single long-lived
+ * Node process where the Cloudflare Cache API is unavailable.
+ */
 export class MemoryCache {
     private readonly store = new Map<string, { response: Response; expiresAt: number }>();
 
