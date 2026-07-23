@@ -1,6 +1,6 @@
 import type { ApiEnv, D1DatabaseLike, MonitorEnv } from '../worker/types.ts';
 
-function required(name: string): string {
+export function required(name: string): string {
     const value = process.env[name];
     if (!value) throw new Error(`${name} not configured`);
     return value;

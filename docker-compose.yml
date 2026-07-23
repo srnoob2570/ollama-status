@@ -32,6 +32,7 @@ services:
     environment:
       - PORT=${PORT:-3000}
       - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
+      - PG_INSECURE=${PG_INSECURE:-true}
       - CONFIRMATION_HMAC_SECRET=${CONFIRMATION_HMAC_SECRET:?Set the monitor request signing secret}
       - FREE_CHECK_INTERVAL_MINUTES=${FREE_CHECK_INTERVAL_MINUTES:-5}
       - PAID_CHECK_INTERVAL_MINUTES=${PAID_CHECK_INTERVAL_MINUTES:-10}
@@ -60,6 +61,7 @@ services:
     command: ["node", "src/node/runner.ts"]
     environment:
       - DATABASE_URL=${DATABASE_URL:?Set the Coolify PostgreSQL connection URL}
+      - PG_INSECURE=${PG_INSECURE:-true}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-https://ollama.com/api}
       - OLLAMA_API_KEY_FREE=${OLLAMA_API_KEY_FREE:?Set the free Ollama API key}
       - OLLAMA_API_KEY_PAID=${OLLAMA_API_KEY_PAID:-}

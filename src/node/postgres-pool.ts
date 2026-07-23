@@ -6,7 +6,10 @@ import { Pool, type PoolConfig } from 'pg';
  *
  * pg-connection-string currently treats `sslmode=require` as `verify-full`,
  * while libpq's documented `require` mode encrypts without validating a
- * self-signed CA. This bridges that gap.
+ * self-signed CA. Certificate verification is disabled ONLY when
+ * `PG_INSECURE=true` (for self-signed environments like Coolify). Without
+ * that flag, `sslmode=require` refuses to connect and instructs the operator
+ * to either configure a trusted CA or opt into the insecure mode explicitly.
  */
 export function postgresPoolConfig(connectionString: string): PoolConfig {
     const url = new URL(connectionString);
@@ -14,6 +17,19 @@ export function postgresPoolConfig(connectionString: string): PoolConfig {
 
     url.searchParams.delete('sslmode');
     url.searchParams.delete('uselibpqcompat');
+
+    // Node's pg driver treats `sslmode=require` as `verify-full` (rejects self-signed certs).
+    // Unlike libpq's documented `require` mode, it will NOT connect without a trusted CA chain.
+    // `rejectUnauthorized: false` restores libpq's semantics: encrypt, but skip CA validation.
+    // Guard this behind an explicit opt-in so it's never the default.
+    if (process.env.PG_INSECURE !== 'true') {
+        throw new Error(
+            'ssl connection requires PG_INSECURE=true (the PostgreSQL server uses a self-signed ' +
+            'certificate that the Node driver cannot validate without this flag). Set it to opt in, ' +
+            'or configure a trusted CA certificate and remove sslmode=require from the connection URL.',
+        );
+    }
+
     return {
         connectionString: url.toString(),
         ssl: { rejectUnauthorized: false },
