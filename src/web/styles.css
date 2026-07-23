@@ -474,6 +474,15 @@ time,
     background-color: rgba(249, 115, 22, 0.05);
 }
 
+.signals .checking {
+    display: inline-block;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+}
+
 .range-control {
     position: fixed;
     right: clamp(24px, 3vw, 56px);

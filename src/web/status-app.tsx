@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { cadenceLegend } from './cadence';
 import { nextUpdateLabel } from './next-update';
+import { parseMonitorRunEvent } from './live-progress';
 
 type HistoryRange = '1h' | '24h' | '7d' | '30d';
 type HistorySegment = {
@@ -147,6 +148,25 @@ export function App() {
         return () => clearInterval(timer);
     }, []);
 
+    useEffect(() => {
+        const source = new EventSource('/api/v1/monitor/stream');
+        source.onmessage = (event) => {
+            const run = parseMonitorRunEvent(event.data);
+            if (!run) return;
+            setStatus((current) =>
+                current
+                    ? {
+                          ...current,
+                          monitor: { started_at: run.started_at },
+                          monitorProgress: run,
+                          monitorActive: run.finished_at === null,
+                      }
+                    : current,
+            );
+        };
+        return () => source.close();
+    }, []);
+
     const summary = useMemo(
         () =>
             status?.models.reduce<Record<string, number>>((counts, model) => {
@@ -278,17 +298,20 @@ function StatusSignals({ status }: { status: Status }) {
     const signalTone = status.stuckRun || running || run?.outcome === 'ERROR' ? 'warn' : 'ok';
     const title = status.stuckRun
         ? `Stuck since ${run?.started_at ?? status.stuckRun.started_at ?? 'unknown'}`
-        : running && run?.current_model
-          ? `Checking ${run.current_model}`
-          : run?.detail
-            ? run.detail
-            : undefined;
+        : run?.detail
+          ? run.detail
+          : undefined;
     return (
         <div className="signals" aria-label="Monitor status">
             <span className={catalog === 'OK' ? 'ok' : 'warn'}>Catalog {catalog}</span>
             <span className={signalTone} title={title}>
                 {progress}
             </span>
+            {running && run?.current_model && (
+                <span className="checking" title={`Checking ${run.current_model}`}>
+                    Checking {run.current_model}
+                </span>
+            )}
         </div>
     );
 }
