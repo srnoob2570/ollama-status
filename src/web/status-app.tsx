@@ -260,6 +260,7 @@ export function App() {
                 title={status.paidKeyConfigured ? 'Paid models' : 'Paid models (not monitored)'}
                 models={status.models.filter((model) => model.tier === 'PAID')}
                 range={status.range}
+                showHistory={status.paidKeyConfigured}
             />
             <ModelCategory
                 title="Unclassified models"
@@ -382,10 +383,12 @@ function ModelCategory({
     title,
     models,
     range,
+    showHistory = true,
 }: {
     title: string;
     models: Model[];
     range: HistoryRange;
+    showHistory?: boolean;
 }) {
     if (!models.length) return null;
     return (
@@ -396,14 +399,22 @@ function ModelCategory({
             </div>
             <div className="model-list">
                 {models.map((model) => (
-                    <ModelRow key={model.id} model={model} range={range} />
+                    <ModelRow key={model.id} model={model} range={range} showHistory={showHistory} />
                 ))}
             </div>
         </section>
     );
 }
 
-function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
+function ModelRow({
+    model,
+    range,
+    showHistory = true,
+}: {
+    model: Model;
+    range: HistoryRange;
+    showHistory?: boolean;
+}) {
     const label = labels[model.effectiveStatus] ?? 'Unknown';
     const reason = availabilityReason(model.effectiveStatus, model.effectiveClassification);
     return (
@@ -420,7 +431,7 @@ function ModelRow({ model, range }: { model: Model; range: HistoryRange }) {
                     </span>
                 </div>
             </div>
-            <History model={model} range={range} />
+            {showHistory && <History model={model} range={range} />}
         </article>
     );
 }

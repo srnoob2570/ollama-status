@@ -63,6 +63,7 @@ export type ReasonCode =
     | 'credential_rate_limited'
     | 'credential_cooldown'
     | 'no_eligible_credential'
+    | 'paid_key_not_configured'
     | 'plan_access_denied'
     // Provider / model
     | 'subscription_required'

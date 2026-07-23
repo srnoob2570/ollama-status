@@ -100,6 +100,78 @@ describe('node:sqlite D1 adapter parity', () => {
         expect(body.paidKeyConfigured).toBe(false);
     });
 
+    it('never dispatches a paid-tier probe when OLLAMA_API_KEY_PAID is unset', async () => {
+        const db = new SqliteD1Adapter(migratedDb());
+        await db
+            .prepare(
+                "INSERT INTO providers (id,name,kind,base_url,secret_ref,created_at) VALUES (?,?,'ollama',?,?,?)",
+            )
+            .bind('ollama-free', 'Free', 'https://example.test/api', 'OLLAMA_API_KEY_FREE', new Date().toISOString())
+            .run();
+        await db
+            .prepare(
+                "INSERT INTO providers (id,name,kind,base_url,secret_ref,created_at) VALUES (?,?,'ollama',?,?,?)",
+            )
+            .bind('ollama-paid', 'Paid', 'https://example.test/api', 'OLLAMA_API_KEY_PAID', new Date().toISOString())
+            .run();
+        // Pre-seed a model already classified PAID from a prior run — the real starting state in
+        // production, since a model only becomes tier=PAID after a free probe once returned
+        // SUBSCRIPTION_REQUIRED. Digest matches the /tags mock so syncCatalog leaves it untouched.
+        await seedModel(db, {
+            id: 'paid-model',
+            provider_id: 'ollama-free',
+            remote_name: 'premium-model',
+            tier: 'PAID',
+            digest: 'd-premium',
+        });
+
+        const env = {
+            DB: db,
+            OLLAMA_BASE_URL: 'https://example.test/api',
+            OLLAMA_API_KEY_FREE: 'k',
+        } as unknown as Env;
+        (globalThis as unknown as { caches: CacheStorage }).caches = {
+            default: new MemoryCache(),
+        } as unknown as CacheStorage;
+        const ctx = { waitUntil(p: Promise<unknown>) { void p; } } as unknown as ExecutionContext;
+        const probedModels: string[] = [];
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = (async (input: Request | URL | string, init?: RequestInit) => {
+            const url = String(input);
+            if (url.endsWith('/tags'))
+                return new Response(
+                    JSON.stringify({ models: [{ name: 'premium-model', digest: 'd-premium' }] }),
+                );
+            if (url.endsWith('/show')) return new Response('{}');
+            const requestBody = init?.body ? (JSON.parse(String(init.body)) as { model: string }) : null;
+            if (requestBody) probedModels.push(requestBody.model);
+            return new Response('{"model":"premium-model","message":{"content":"OK"},"done":true}\n');
+        }) as typeof fetch;
+        try {
+            await runMonitor(env, ctx, Date.now());
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+
+        expect(probedModels).toHaveLength(0);
+
+        const executionCount = await db
+            .prepare('SELECT COUNT(*) as c FROM model_check_executions WHERE model_id=?')
+            .bind('paid-model')
+            .first<{ c: number }>();
+        expect(executionCount?.c).toBe(0);
+
+        const expectations = await db
+            .prepare('SELECT state, reason_code FROM model_check_expectations WHERE model_id=?')
+            .bind('paid-model')
+            .all<{ state: string; reason_code: string }>();
+        expect(expectations.results.length).toBeGreaterThan(0);
+        for (const r of expectations.results) {
+            expect(r.state).toBe('SUPPRESSED');
+            expect(r.reason_code).toBe('paid_key_not_configured');
+        }
+    });
+
     it('runs a manual cycle through the shared API without probing models before their cadence', async () => {
         const secret = 'monitor-test-secret';
         const env = {

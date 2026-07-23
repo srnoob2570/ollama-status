@@ -7,7 +7,7 @@ import {
     trimmedMean,
 } from './status.ts';
 import { recordSchedulerTick, updateSchedulerTick, updateExecutionState, recordProbeAttempt, completeProbeAttempt, updateExpectationState, recordProbeEvent } from './ledger.ts';
-import { materializeExpectations } from './expectations.ts';
+import { materializeExpectations, reconcilePaidAvailability } from './expectations.ts';
 import { proposeMitigation, executeMitigation } from './mitigations.ts';
 import { upsertHourlyExecutionRollup } from './rollups.ts';
 import type { Classification, Env, ExecutionContext, Model, ModelCheckExpectation, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
@@ -1482,6 +1482,7 @@ export async function runMonitor(
         }
         const { freeProvider, paidProvider } = await resolveProviders(env);
         if (!freeProvider) throw new Error('global_catalog_unavailable');
+        await reconcilePaidAvailability(env.DB, Boolean(paidProvider));
         // A transient catalog fetch failure must not abort the whole cycle: already-known due
         // models still get probed on their normal cadence, only discovery of new models is
         // skipped this tick. `syncCatalog` already records the failure on `providers.catalog_status`.
@@ -1494,6 +1495,7 @@ export async function runMonitor(
             policyVersion: '1',
             nowIso: scheduledAt,
             horizonMinutes: 120,
+            paidAvailable: Boolean(paidProvider),
         });
         const { due, executions } = await scheduleDueExecutions(
             env,

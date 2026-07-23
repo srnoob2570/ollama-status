@@ -5,6 +5,7 @@ import {
     getWatermark,
     setWatermark,
     cancelExpectationsForPolicyChange,
+    reconcilePaidAvailability,
 } from '../src/worker/expectations.ts';
 import type { D1DatabaseLike } from '../src/worker/types.ts';
 
@@ -280,6 +281,130 @@ describe('expectations', () => {
             for (const r of suppressed.results) {
                 expect(r.reason_code).toBe('credential_auth_failed');
             }
+        });
+
+        it('suppresses PAID model slots up front when paidAvailable is false', async () => {
+            await seedModel(db, { id: 'm1', tier: 'FREE' });
+            await seedModel(db, { id: 'm2', tier: 'PAID' });
+
+            await materializeExpectations(db, {
+                policyVersion: 'v1',
+                nowIso: makeNow(),
+                horizonMinutes: 60,
+                paidAvailable: false,
+            });
+
+            const free = await db
+                .prepare(`SELECT state FROM model_check_expectations WHERE model_id = ?`)
+                .bind('m1')
+                .all<{ state: string }>();
+            expect(free.results.length).toBeGreaterThan(0);
+            for (const r of free.results) expect(r.state).toBe('EXPECTED');
+
+            const paid = await db
+                .prepare(`SELECT state, reason_code FROM model_check_expectations WHERE model_id = ?`)
+                .bind('m2')
+                .all<{ state: string; reason_code: string }>();
+            expect(paid.results.length).toBeGreaterThan(0);
+            for (const r of paid.results) {
+                expect(r.state).toBe('SUPPRESSED');
+                expect(r.reason_code).toBe('paid_key_not_configured');
+            }
+        });
+    });
+
+    describe('reconcilePaidAvailability', () => {
+        it('suppresses pending PAID expectations when the key is unavailable', async () => {
+            await seedModel(db, { id: 'm1', tier: 'PAID' });
+            await materializeExpectations(db, {
+                policyVersion: 'v1',
+                nowIso: makeNow(),
+                horizonMinutes: 60,
+            });
+
+            await reconcilePaidAvailability(db, false);
+
+            const rows = await db
+                .prepare(`SELECT state, reason_code FROM model_check_expectations WHERE model_id = ?`)
+                .bind('m1')
+                .all<{ state: string; reason_code: string }>();
+            expect(rows.results.length).toBeGreaterThan(0);
+            for (const r of rows.results) {
+                expect(r.state).toBe('SUPPRESSED');
+                expect(r.reason_code).toBe('paid_key_not_configured');
+            }
+        });
+
+        it('does not touch FREE model expectations', async () => {
+            await seedModel(db, { id: 'm1', tier: 'FREE' });
+            await materializeExpectations(db, {
+                policyVersion: 'v1',
+                nowIso: makeNow(),
+                horizonMinutes: 60,
+            });
+
+            await reconcilePaidAvailability(db, false);
+
+            const rows = await db
+                .prepare(`SELECT state FROM model_check_expectations WHERE model_id = ?`)
+                .bind('m1')
+                .all<{ state: string }>();
+            for (const r of rows.results) expect(r.state).toBe('EXPECTED');
+        });
+
+        it('resumes suppressed PAID expectations once the key is available again', async () => {
+            await seedModel(db, { id: 'm1', tier: 'PAID' });
+            await materializeExpectations(db, {
+                policyVersion: 'v1',
+                nowIso: makeNow(),
+                horizonMinutes: 60,
+            });
+            await reconcilePaidAvailability(db, false);
+
+            await reconcilePaidAvailability(db, true);
+
+            const rows = await db
+                .prepare(`SELECT state, reason_code FROM model_check_expectations WHERE model_id = ?`)
+                .bind('m1')
+                .all<{ state: string; reason_code: string | null }>();
+            expect(rows.results.length).toBeGreaterThan(0);
+            for (const r of rows.results) {
+                expect(r.state).toBe('EXPECTED');
+                expect(r.reason_code).toBeNull();
+            }
+        });
+
+        it('leaves non-paid-key suppressions alone when the key becomes available', async () => {
+            const provider = await seedProvider(db);
+            await seedModel(db, { id: 'm1', tier: 'FREE', provider_id: provider.id });
+
+            const cooldownUntil = minutesFromNow(20);
+            await db
+                .prepare(
+                    `INSERT INTO provider_model_status
+                     (provider_id, model_id, public_status, classification, next_check_at, updated_at)
+                     VALUES (?, ?, 'RATE_LIMITED', 'RATE_LIMITED', ?, ?)`,
+                )
+                .bind(provider.id, 'm1', cooldownUntil, makeNow())
+                .run();
+
+            await materializeExpectations(db, {
+                policyVersion: 'v1',
+                nowIso: makeNow(),
+                horizonMinutes: 60,
+            });
+
+            await reconcilePaidAvailability(db, true);
+
+            const suppressed = await db
+                .prepare(
+                    `SELECT reason_code FROM model_check_expectations
+                     WHERE model_id = ? AND state = 'SUPPRESSED'`,
+                )
+                .bind('m1')
+                .all<{ reason_code: string }>();
+            expect(suppressed.results.length).toBeGreaterThan(0);
+            for (const r of suppressed.results) expect(r.reason_code).toBe('credential_rate_limited');
         });
     });
 

@@ -8,6 +8,7 @@ export interface MaterializeOptions {
     policyVersion: string;
     config?: CheckIntervalConfig;
     cutoverAt?: string;
+    paidAvailable?: boolean;
 }
 
 export async function getWatermark(
@@ -72,6 +73,7 @@ export async function materializeExpectations(
         policyVersion,
         config = {},
         cutoverAt,
+        paidAvailable = true,
     } = options;
 
     const horizonMs = horizonMinutes * 60_000;
@@ -100,6 +102,10 @@ export async function materializeExpectations(
     for (const model of models.results) {
         const tier = (model.tier === 'PAID' ? 'PAID' : 'FREE') as 'FREE' | 'PAID';
         const intervalMin = nominalCheckIntervalMinutes(tier, config);
+        // Without a paid key the scheduler can never probe this model — suppress every slot up
+        // front instead of materializing EXPECTED slots that scheduleDueExecutions would then
+        // have to skip one by one each tick.
+        const paidUnavailable = tier === 'PAID' && !paidAvailable;
 
         const purposes: string[] = ['AVAILABILITY'];
         if (tier === 'PAID') purposes.push('ENTITLEMENT');
@@ -118,8 +124,10 @@ export async function materializeExpectations(
                 const activeCooldown = modelCooldowns.find(
                     (c) => new Date(dueAt) < new Date(c.until),
                 );
-                const state = activeCooldown ? 'SUPPRESSED' : 'EXPECTED';
-                const reasonCode = activeCooldown?.reasonCode ?? null;
+                const state = paidUnavailable || activeCooldown ? 'SUPPRESSED' : 'EXPECTED';
+                const reasonCode = paidUnavailable
+                    ? 'paid_key_not_configured'
+                    : (activeCooldown?.reasonCode ?? null);
 
                 await db
                     .prepare(
@@ -166,6 +174,33 @@ export async function materializeExpectations(
     }
 
     return generated;
+}
+
+// materializeExpectations only guards new slots (INSERT ... ON CONFLICT DO UPDATE only fires for
+// CANCELLED rows), so paid-tier slots already materialized inside the current horizon — up to
+// 120 minutes of already-EXPECTED/SCHEDULED work — would otherwise still reach
+// scheduleDueExecutions and dispatch real probes. Call this once per tick, right after resolving
+// providers, to suppress that backlog immediately when the paid key is absent, and to release it
+// again the moment the key comes back.
+export async function reconcilePaidAvailability(
+    db: D1DatabaseLike,
+    paidAvailable: boolean,
+): Promise<void> {
+    if (paidAvailable) {
+        await db
+            .prepare(
+                `UPDATE model_check_expectations SET state='EXPECTED', reason_code=NULL, resolved_at=NULL
+                 WHERE tier='PAID' AND state='SUPPRESSED' AND reason_code='paid_key_not_configured'`,
+            )
+            .run();
+    } else {
+        await db
+            .prepare(
+                `UPDATE model_check_expectations SET state='SUPPRESSED', reason_code='paid_key_not_configured', resolved_at=NULL
+                 WHERE tier='PAID' AND state IN ('EXPECTED','SCHEDULED')`,
+            )
+            .run();
+    }
 }
 
 export async function cancelExpectationsForPolicyChange(
