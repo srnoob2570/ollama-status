@@ -347,7 +347,8 @@ function SummaryMetric({
         <div className={`metric ${tier.toLowerCase()} `}>
             <strong>{count}</strong>
             <span>{label}</span>
-            {nextCheckAt !== null || tier !== 'UNKNOWN' ? (
+            {tier === 'PAID' && !status.paidKeyConfigured ? null : nextCheckAt !== null ||
+              tier !== 'UNKNOWN' ? (
                 <span className="next-check">
                     Next check: {nextUpdateLabel(nextCheckAt, status.monitorActive, currentTime)}
                 </span>
@@ -395,11 +396,18 @@ function ModelCategory({
         <section className="panel">
             <div className="panel-heading">
                 <h2>{title}</h2>
-                <span>{models.length} monitored</span>
+                <span>
+                    {models.length} {showHistory ? 'monitored' : 'not monitored'}
+                </span>
             </div>
             <div className="model-list">
                 {models.map((model) => (
-                    <ModelRow key={model.id} model={model} range={range} showHistory={showHistory} />
+                    <ModelRow
+                        key={model.id}
+                        model={model}
+                        range={range}
+                        showHistory={showHistory}
+                    />
                 ))}
             </div>
         </section>
