@@ -138,15 +138,25 @@ export function startOutboxConsumer(
                 .bind(batchSize)
                 .all<OutboxRow>();
 
+            if (stopped || rows.results.length === 0) return;
+
+            // Fetch all associated probe_events in one batch query
+            const eventIds = rows.results.map((r) => r.event_id);
+            const eventRows = await db
+                .prepare(
+                    `SELECT * FROM probe_events WHERE id IN (${eventIds.map(() => '?').join(',')})`,
+                )
+                .bind(...eventIds)
+                .all<Record<string, unknown>>();
+            const eventsById = new Map(eventRows.results.map((e) => [e.id as string, e]));
+
             for (const outbox of rows.results) {
                 if (stopped) return;
 
+                let event: OutboxEvent | null = null;
+
                 try {
-                    // Fetch the associated probe_event
-                    const eventRow = await db
-                        .prepare(`SELECT * FROM probe_events WHERE id = ?`)
-                        .bind(outbox.event_id)
-                        .first<Record<string, unknown>>();
+                    const eventRow = eventsById.get(outbox.event_id);
 
                     if (!eventRow) {
                         console.warn(
@@ -156,7 +166,7 @@ export function startOutboxConsumer(
                         continue;
                     }
 
-                    const event: OutboxEvent = {
+                    event = {
                         outbox,
                         event: {
                             id: eventRow.id as string,
@@ -194,7 +204,7 @@ export function startOutboxConsumer(
                 } catch (error) {
                     // Increment attempts even on error so retry count is tracked
                     await incrementAttempts(db, outbox.id);
-                    onError(error, {
+                    onError(error, event ?? {
                         outbox,
                         event: {
                             id: '',

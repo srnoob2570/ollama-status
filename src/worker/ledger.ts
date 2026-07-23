@@ -227,8 +227,14 @@ function purposeToObservationRole(purpose: string): ObservationRole {
     return 'AVAILABILITY';
 }
 
-function terminalAttemptStates(): string {
-    return "'COMPLETED','FAILED','EXPIRED','CANCELLED'";
+const TERMINAL_ATTEMPT_STATES = ['COMPLETED', 'FAILED', 'EXPIRED', 'CANCELLED'] as const;
+
+function terminalAttemptStateSet(): ReadonlySet<string> {
+    return new Set(TERMINAL_ATTEMPT_STATES);
+}
+
+function terminalAttemptStatesSql(): string {
+    return TERMINAL_ATTEMPT_STATES.map(s => `'${s}'`).join(',');
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -462,8 +468,8 @@ export async function acceptResult(
     const attemptState = await db.prepare('SELECT state FROM probe_attempts WHERE id = ?')
         .bind(attemptId).first<{ state: string }>();
     if (!attemptState) throw new Error(`probe_attempt "${attemptId}" not found`);
-    const terminalStates = ['COMPLETED', 'FAILED', 'EXPIRED', 'CANCELLED'];
-    if (terminalStates.includes(attemptState.state)) {
+    const terminalStates = terminalAttemptStateSet();
+    if (terminalStates.has(attemptState.state)) {
         return { disposition: 'REJECTED', reasonCode: 'stale_result' };
     }
 
@@ -533,8 +539,7 @@ export async function completeProbeAttempt(
     const attempt = mapAttempt(attemptRow);
 
     // CAS pre-check: if already terminal, fail fast before any writes
-    const terminalStates = ['COMPLETED', 'FAILED', 'EXPIRED', 'CANCELLED'];
-    if (terminalStates.includes(attempt.state)) {
+    if (terminalAttemptStateSet().has(attempt.state)) {
         throw new Error(
             `CAS failed: probe_attempt "${attemptId}" is already in terminal state "${attempt.state}"`,
         );
@@ -584,7 +589,7 @@ export async function completeProbeAttempt(
                 headers_at = COALESCE(headers_at, ?),
                 first_byte_at = COALESCE(first_byte_at, ?),
                 first_token_at = COALESCE(first_token_at, ?)
-             WHERE id = ? AND state NOT IN (${terminalAttemptStates()})`,
+             WHERE id = ? AND state NOT IN (${terminalAttemptStatesSql()})`,
         ).bind(
             terminalState,
             result.classification,

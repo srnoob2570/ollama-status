@@ -17,7 +17,7 @@ import { drainManualMonitorJobs } from '../worker/monitor-jobs.ts';
 import { hasRecoverableStuckRun, lastMonitorSettledMs, runMonitor } from '../worker/monitor.ts';
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
-import { buildRunnerEnv } from './env.ts';
+import { buildRunnerEnv, required } from './env.ts';
 import type { ExecutionContext } from '../worker/types.ts';
 import { startOutboxConsumer } from './outbox-consumer.ts';
 
@@ -36,8 +36,7 @@ function schedulerStaleMs(): number {
     return Date.now() - (lastMonitorSettledMs() ?? bootMs);
 }
 
-if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL not configured');
-const pool = createPostgresPool(process.env.DATABASE_URL);
+const pool = createPostgresPool(required('DATABASE_URL'));
 const env = buildRunnerEnv(new PostgresD1Adapter(pool));
 const ctx = {
     waitUntil(promise: Promise<unknown>) {
@@ -130,8 +129,7 @@ await health.ready();
 console.log(`ollama-status runner health listening on ${health.url}`);
 
 // ── Outbox consumer ──────────────────────────────────────────────────────────
-const db = new PostgresD1Adapter(pool);
-const outboxConsumer = startOutboxConsumer(db, {
+const outboxConsumer = startOutboxConsumer(env.DB, {
     consumerId: 'node-1',
     pollIntervalMs: 1_000,
     batchSize: 10,

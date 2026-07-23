@@ -75,6 +75,14 @@ const IDEMPOTENT_RETRY_REASONS: Set<ReasonCode> = new Set([
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
+function isReasonCodeGated(reasonCode: ReasonCode, flags: MitigationFlags): boolean {
+    if (REQUEUE_REASONS.has(reasonCode) && !flags.requeueLease) return true;
+    if (REASSIGN_REASONS.has(reasonCode) && !flags.requeueNode) return true;
+    if (CROSS_REGION_REASONS.has(reasonCode) && !flags.routing) return true;
+    if ((DISABLE_KEY_REASONS.has(reasonCode) || BACKOFF_REASONS.has(reasonCode)) && !flags.circuitBreaker) return true;
+    return false;
+}
+
 /**
  * Propose a mitigation action for a given expectation and reason code.
  *
@@ -169,15 +177,7 @@ export async function proposeMitigation(
     }
 
     // ── Per-flag gating ─────────────────────────────────────────────────
-    // Map reason-code groups to the flag that gates them. When the flag is
-    // off the action is downgraded to NO_ACTION and a mitigation.skipped
-    // event is emitted instead of mitigation.proposed.
-    let flagOff = false;
-    if (REQUEUE_REASONS.has(reasonCode) && !f.requeueLease) flagOff = true;
-    else if (REASSIGN_REASONS.has(reasonCode) && !f.requeueNode) flagOff = true;
-    else if (CROSS_REGION_REASONS.has(reasonCode) && !f.routing) flagOff = true;
-    else if (DISABLE_KEY_REASONS.has(reasonCode) && !f.circuitBreaker) flagOff = true;
-    else if (BACKOFF_REASONS.has(reasonCode) && !f.circuitBreaker) flagOff = true;
+    const flagOff = isReasonCodeGated(reasonCode, f);
 
     if (flagOff) {
         const action = buildAction('NO_ACTION', reasonCode, 0, null, null, policyVersion);
@@ -337,13 +337,8 @@ export async function executeMitigation(
         return;
     }
 
-    // ── Per-flag gating (activation order: requeue → routing → circuit breaker) ──
-    let flagOff = false;
-    if (REQUEUE_REASONS.has(reasonCode) && !f.requeueLease) flagOff = true;
-    else if (REASSIGN_REASONS.has(reasonCode) && !f.requeueNode) flagOff = true;
-    else if (CROSS_REGION_REASONS.has(reasonCode) && !f.routing) flagOff = true;
-    else if (DISABLE_KEY_REASONS.has(reasonCode) && !f.circuitBreaker) flagOff = true;
-    else if (BACKOFF_REASONS.has(reasonCode) && !f.circuitBreaker) flagOff = true;
+    // ── Per-flag gating ─────────────────────────────────
+    const flagOff = isReasonCodeGated(reasonCode, f);
 
     if (flagOff) {
         await recordMitigationEvent(db, {

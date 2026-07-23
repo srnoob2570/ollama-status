@@ -36,6 +36,7 @@ export function startLiveProgress(connectionString: string): LiveProgressHandle 
 
     async function connect(): Promise<void> {
         if (stopped) return;
+        const oldClient = client;
         const current = new Client(postgresPoolConfig(connectionString));
         client = current;
         current.on('notification', (message) => {
@@ -49,8 +50,10 @@ export function startLiveProgress(connectionString: string): LiveProgressHandle 
         try {
             await current.connect();
             await current.query(`LISTEN ${CHANNEL}`);
+            if (oldClient) await oldClient.end().catch(() => undefined);
         } catch (error) {
             console.error('live progress: failed to connect/listen', error);
+            await current.end().catch(() => undefined);
             scheduleReconnect();
         }
     }

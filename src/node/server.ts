@@ -14,7 +14,7 @@ import { api } from '../worker/api.ts';
 import { PostgresD1Adapter } from './postgres-d1-adapter.ts';
 import { createPostgresPool } from './postgres-pool.ts';
 import { MemoryCache } from './memory-cache.ts';
-import { buildWebEnv } from './env.ts';
+import { buildWebEnv, required } from './env.ts';
 import { startLiveProgress, type LiveProgressHandle } from './live-progress.ts';
 import type { CacheStorage, ExecutionContext } from '../worker/types.ts';
 
@@ -24,18 +24,13 @@ const DIST_DIR = join(import.meta.dirname, '../../dist');
     default: new MemoryCache(),
 } as unknown as CacheStorage;
 
-const pool = createPostgresPool(requiredDatabaseUrl());
+const pool = createPostgresPool(required('DATABASE_URL'));
 const env = buildWebEnv(new PostgresD1Adapter(pool));
-const liveProgress = startLiveProgress(requiredDatabaseUrl());
+const liveProgress = startLiveProgress(required('DATABASE_URL'));
 
-function requiredDatabaseUrl(): string {
-    if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL not configured');
-    return process.env.DATABASE_URL;
-}
-
-async function serveIndexFallback(): Promise<Response> {
-    const html = await readFile(join(DIST_DIR, 'index.html'), 'utf8');
-    return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+const indexHtml = await readFile(join(DIST_DIR, 'index.html'), 'utf8');
+function serveIndexFallback(): Response {
+    return new Response(indexHtml, { headers: { 'content-type': 'text/html; charset=utf-8' } });
 }
 
 // Pushes monitor_runs updates to the browser the instant Postgres NOTIFYs (see
@@ -54,6 +49,7 @@ function monitorStream(request: Request, live: LiveProgressHandle): Response {
         closed = true;
         unsubscribe();
         if (heartbeat) clearInterval(heartbeat);
+        request.signal.removeEventListener('abort', cleanup);
     }
 
     const stream = new ReadableStream<Uint8Array>({
@@ -66,15 +62,13 @@ function monitorStream(request: Request, live: LiveProgressHandle): Response {
                     cleanup();
                 }
             };
-            // Fires EventSource's `onopen` immediately and keeps intermediate proxies (the
-            // deployment sits behind a Cloudflare Tunnel) from buffering an empty stream.
             send(': connected\n\n');
             unsubscribe = live.subscribe((payload) => send(`data: ${payload}\n\n`));
             heartbeat = setInterval(() => send(': ping\n\n'), HEARTBEAT_MS);
         },
         cancel: cleanup,
     });
-    request.signal.addEventListener('abort', cleanup);
+    request.signal.addEventListener('abort', cleanup, { once: true });
 
     return new Response(stream, {
         headers: {

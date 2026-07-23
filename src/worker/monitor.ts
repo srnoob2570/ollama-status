@@ -13,10 +13,17 @@ import { upsertHourlyExecutionRollup } from './rollups.ts';
 import type { Classification, Env, ExecutionContext, Model, ModelCheckExpectation, ProbeResult, Provider, ReasonCode, TickOutcome, TickTrigger } from './types.ts';
 import { id, now } from './types.ts';
 
+export class RunHardStopError extends Error { constructor() { super('run_hard_stop'); } }
+export class MonitorLockLostError extends Error { constructor() { super('monitor_lock_lost'); } }
+export class GlobalCatalogUnavailableError extends Error { constructor() { super('global_catalog_unavailable'); } }
+
 const providerSeeds = [
     { id: 'ollama-free', name: 'Ollama Cloud Free', secret: 'OLLAMA_API_KEY_FREE' },
     { id: 'ollama-paid', name: 'Ollama Cloud Paid', secret: 'OLLAMA_API_KEY_PAID' },
 ] as const;
+
+export const FREE_PROVIDER_ID = 'ollama-free' as const;
+export const PAID_PROVIDER_ID = 'ollama-paid' as const;
 
 const PROBE_CONCURRENCY_MAX = 16;
 const FREE_PROBE_CONCURRENCY_DEFAULT = 1;
@@ -130,13 +137,6 @@ function keyFor(env: Env, ref: Provider['secret_ref']) {
 function hasKey(env: Env, provider: Provider) {
     return keyFor(env, provider.secret_ref).trim().length > 0;
 }
-function excluded(env: Env, model: string) {
-    return (env.EXCLUDED_MODELS ?? '')
-        .split(',')
-        .map((x) => x.trim())
-        .filter(Boolean)
-        .includes(model);
-}
 function isFailure(c: Classification) {
     return !['SUCCESS', 'HIGH_LATENCY', 'SUBSCRIPTION_REQUIRED'].includes(c);
 }
@@ -145,8 +145,8 @@ export function nextCheckTier(
     model: Model,
     result: ProbeResult,
 ): 'FREE' | 'PAID' | 'UNKNOWN' {
-    if (provider.id === 'ollama-paid') return 'PAID';
-    if (provider.id === 'ollama-free') {
+    if (provider.id === PAID_PROVIDER_ID) return 'PAID';
+    if (provider.id === FREE_PROVIDER_ID) {
         if (result.classification === 'SUBSCRIPTION_REQUIRED') return 'PAID';
         if (result.classification === 'SUCCESS' || result.classification === 'HIGH_LATENCY')
             return 'FREE';
@@ -217,6 +217,12 @@ async function syncCatalog(
         keyFor(env, provider.secret_ref),
         maxResponseTokens(env.OLLAMA_MAX_TOKENS),
     );
+    const excludedSet = new Set(
+        (env.EXCLUDED_MODELS ?? '')
+            .split(',')
+            .map((x) => x.trim())
+            .filter(Boolean),
+    );
     try {
         const catalog = await client.tags(signal);
         const timestamp = now();
@@ -224,7 +230,7 @@ async function syncCatalog(
         const existingModels = await env.DB.prepare(
             'SELECT id,remote_name,last_show_at,digest,active FROM models WHERE provider_id=?',
         )
-            .bind('ollama-free')
+            .bind(FREE_PROVIDER_ID)
             .all<{
                 id: string;
                 remote_name: string;
@@ -255,7 +261,7 @@ async function syncCatalog(
                         provider.id,
                         remote.name,
                         1,
-                        excluded(env, remote.name) ? 1 : 0,
+                        excludedSet.has(remote.name) ? 1 : 0,
                         remoteDigest,
                         timestamp,
                         timestamp,
@@ -276,8 +282,8 @@ async function syncCatalog(
                     )
                         .bind(JSON.stringify(details), timestamp, modelId)
                         .run();
-                } catch {
-                    /* show metadata is diagnostic only; catalog remains valid */
+                } catch (error) {
+                    console.warn(`catalog: /show metadata fetch failed for ${remote.name}`, error);
                 }
             }
         }
@@ -416,16 +422,9 @@ export async function materializeStatus(
             timestamp,
         )
         .run();
-    if (provider.id === 'ollama-free') {
-        const tier =
-            result.classification === 'SUBSCRIPTION_REQUIRED'
-                ? 'PAID'
-                : ['SUCCESS', 'HIGH_LATENCY'].includes(result.classification)
-                  ? 'FREE'
-                  : null;
-        // Only persist tier when it actually changes; a stable FREE/PAID model would otherwise
-        // rewrite the same row every probe (one write per model per cycle for no effect).
-        if (tier && model.tier !== tier)
+    if (provider.id === FREE_PROVIDER_ID) {
+        const tier = entitlementFromFreeProbe(result.classification);
+        if (tier !== 'UNKNOWN' && model.tier !== tier)
             await env.DB.prepare('UPDATE models SET tier=?,updated_at=? WHERE id=?')
                 .bind(tier, timestamp, model.id)
                 .run();
@@ -480,8 +479,8 @@ export async function materializeStatus(
                     retry_at: result.retryAfterSeconds ?? null,
                 }),
             });
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
     }
     if (
@@ -498,8 +497,8 @@ export async function materializeStatus(
                 subjectId: `${provider.id}:${model.id}`,
                 detailJson: JSON.stringify({ credential_account_id: provider.id }),
             });
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
     }
 }
@@ -653,8 +652,8 @@ async function probeModel(
             warmupAgeMs: null,
             experimentConfigVersion: null,
         });
-    } catch {
-        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    } catch (error) {
+        console.error('ledger: recordProbeAttempt failed', error);
     }
 
     // A transient failure is left to reschedule on its own cadence (~5 min) instead of
@@ -665,7 +664,7 @@ async function probeModel(
         await baseline(env, provider.id, model.id),
         signal,
     );
-    if (provider.id === 'ollama-free' && result.classification === 'MODEL_NOT_FOUND')
+    if (provider.id === FREE_PROVIDER_ID && result.classification === 'MODEL_NOT_FOUND')
         await env.DB.prepare(
             "UPDATE models SET excluded=1,exclusion_reason='unavailable after catalog' WHERE id=?",
         )
@@ -684,8 +683,8 @@ async function probeModel(
             nodeId: 'monitor-worker',
             fencingToken: runId,
         });
-    } catch {
-        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    } catch (error) {
+        console.error('ledger: recordProbeAttempt failed', error);
     }
 
     try {
@@ -736,8 +735,8 @@ async function probeModel(
                 }),
             });
         }
-    } catch {
-        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    } catch (error) {
+        console.error('ledger: recordProbeAttempt failed', error);
     }
 
     await storeProbe(env, provider, model, result, executionId, scheduledAtMs);
@@ -811,8 +810,8 @@ async function completeExecution(
     // Wrapped in try/catch for backward compatibility with mock DBs in tests.
     try {
         await updateExecutionState(env.DB, execution.id, 'COMPLETED', null, null);
-    } catch {
-        // Non-fatal: mock DBs in tests may not have the full ledger schema
+    } catch (error) {
+        console.error('ledger: recordProbeAttempt failed', error);
     }
 }
 
@@ -825,9 +824,9 @@ async function failExecution(
 ): Promise<void> {
     const state = signal?.aborted ? 'ABANDONED' : 'FAILED';
     const terminalReasonCode: ReasonCode = reasonCode ?? (
-        error instanceof Error && error.message === 'run_hard_stop'
+        error instanceof RunHardStopError
             ? 'run_hard_stop'
-            : error instanceof Error && error.message === 'monitor_lock_lost'
+            : error instanceof MonitorLockLostError
               ? 'lease_expired'
               : 'unattributed'
     );
@@ -993,9 +992,9 @@ async function resolveProviders(
                 .run(),
         ),
     );
-    const paid = activeProviders.find((provider) => provider.id === 'ollama-paid');
+    const paid = activeProviders.find((provider) => provider.id === PAID_PROVIDER_ID);
     return {
-        freeProvider: activeProviders.find((provider) => provider.id === 'ollama-free'),
+        freeProvider: activeProviders.find((provider) => provider.id === FREE_PROVIDER_ID),
         paidProvider: paid && hasKey(env, paid) ? paid : undefined,
     };
 }
@@ -1102,8 +1101,8 @@ async function scheduleDueExecutions(
                 'SUPPRESSED',
                 'selection_limit' as ReasonCode,
             );
-        } catch {
-            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        } catch (error) {
+            console.error('ledger: updateExpectationState failed', error);
         }
         try {
             const expectation: ModelCheckExpectation = {
@@ -1124,8 +1123,8 @@ async function scheduleDueExecutions(
             };
             const action = await proposeMitigation(env.DB, expectation, 'selection_limit');
             await executeMitigation(env.DB, action, expectation);
-        } catch {
-            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        } catch (error) {
+            console.error('ledger: updateExpectationState failed', error);
         }
     }
 
@@ -1134,8 +1133,8 @@ async function scheduleDueExecutions(
     for (const row of admitted) {
         try {
             await updateExpectationState(env.DB, row.expectation_id as string, 'SCHEDULED', null);
-        } catch {
-            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        } catch (error) {
+            console.error('ledger: updateExpectationState failed', error);
         }
     }
 
@@ -1241,8 +1240,8 @@ async function drainProbeQueues(
             )
                 .bind(deferredAt, runId)
                 .run();
-        } catch {
-            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        } catch (error) {
+            console.error('ledger: updateExpectationState failed', error);
         }
     };
     const waitForWorker = async () => {
@@ -1251,7 +1250,7 @@ async function drainProbeQueues(
     };
     while (freeQueue.length || paidQueue.length || active.size) {
         if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
-            throw new Error('run_hard_stop');
+            throw new RunHardStopError();
         if (Date.now() >= deadlineMs) {
             budgetExceeded = true;
             break;
@@ -1265,7 +1264,7 @@ async function drainProbeQueues(
         }
         // Renew before launching work, not while merely waiting for active probes. A lost
         // lease still abandons every non-terminal execution in the catch path below.
-        if (!(await renewLock(env, 'monitor', owner))) throw new Error('monitor_lock_lost');
+        if (!(await renewLock(env, 'monitor', owner))) throw new MonitorLockLostError();
         while (freeQueue.length && activeFree < freeConcurrency && Date.now() < deadlineMs) {
             const execution = freeQueue.shift();
             if (!execution) break;
@@ -1310,7 +1309,7 @@ async function drainProbeQueues(
         // probe. Do not close that run as COMPLETED/PARTIAL: route it through the catch
         // below so every non-terminal execution and the run itself become ABANDONED.
         if (runController.signal.aborted || Date.now() >= startedMs + RUN_HARD_STOP_MS)
-            throw new Error('run_hard_stop');
+            throw new RunHardStopError();
         await deferPending();
     }
     return { budgetExceeded, rejectedExecutions };
@@ -1354,15 +1353,16 @@ async function abandonRun(
 ): Promise<void> {
     const hardStopHit =
         runController.signal.aborted ||
-        (error instanceof Error && error.message === 'run_hard_stop');
+        error instanceof RunHardStopError;
+    const catalogUnavailable = !hardStopHit && error instanceof GlobalCatalogUnavailableError;
     const reasonCode: ReasonCode = hardStopHit
         ? 'run_hard_stop'
-        : error instanceof Error && error.message === 'global_catalog_unavailable'
+        : catalogUnavailable
           ? 'catalog_unavailable'
           : 'unattributed';
     const detail = hardStopHit
         ? 'hard_stop'
-        : error instanceof Error && error.message === 'global_catalog_unavailable'
+        : catalogUnavailable
           ? 'catalog_unavailable'
           : 'monitor_failed';
     if (runCreated) {
@@ -1427,8 +1427,8 @@ export async function runMonitor(
                 subjectId: tickKey,
                 detailJson: JSON.stringify({ tick_key: tickKey, owner: 'monitor' }),
             });
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
         await updateSchedulerTick(env.DB, tickKey, {
             state: 'COMPLETED',
@@ -1477,11 +1477,11 @@ export async function runMonitor(
                 runId,
                 detailJson: JSON.stringify({ run_id: runId, trigger, scheduled_at: scheduledAt }),
             });
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
         const { freeProvider, paidProvider } = await resolveProviders(env);
-        if (!freeProvider) throw new Error('global_catalog_unavailable');
+        if (!freeProvider) throw new GlobalCatalogUnavailableError();
         await reconcilePaidAvailability(env.DB, Boolean(paidProvider));
         // A transient catalog fetch failure must not abort the whole cycle: already-known due
         // models still get probed on their normal cadence, only discovery of new models is
@@ -1544,8 +1544,8 @@ export async function runMonitor(
                 runId,
                 detailJson: JSON.stringify({ run_id: runId, outcome, reason_code: null }),
             });
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
         return {
             kind: 'COMPLETED',
@@ -1572,8 +1572,8 @@ export async function runMonitor(
                 runId,
                 detailJson: JSON.stringify({ run_id: runId, reason_code: 'run_hard_stop', timeout_stage: null }),
             });
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
         await updateSchedulerTick(env.DB, tickKey, {
             state: 'COMPLETED',
@@ -1588,13 +1588,9 @@ export async function runMonitor(
         try {
             await releaseLock(env, 'monitor', owner);
         } catch (releaseError) {
-            // A throw inside finally replaces the function's return value and propagates to the
-            // caller as an unhandled rejection. The lease expires on its own, so a failed release
-            // only delays the next run by up to LOCK_LEASE_MS — never worth crashing over.
             console.warn(`monitor lock release failed: ${releaseError}`);
-        } finally {
-            ctx.waitUntil(cleanup(env).catch((error) => console.warn(`cleanup failed: ${error}`)));
         }
+        ctx.waitUntil(cleanup(env).catch((error) => console.warn(`cleanup failed: ${error}`)));
     }
 }
 
@@ -1629,15 +1625,23 @@ export async function cleanup(env: Env, timestampMs: number = Date.now()): Promi
             )
                 .bind(hourStart, new Date(new Date(hourStart).getTime() + 60 * 60_000).toISOString())
                 .all<{ model_id: string; purpose: string }>();
-            for (const { model_id, purpose } of pairs.results) {
-                try {
-                    await upsertHourlyExecutionRollup(env.DB, model_id, hourStart, purpose);
-                } catch {
-                    // Non-fatal: a single rollup failure shouldn't block cleanup
-                }
+            // Batch rollup computations in groups of 5 to run concurrently without overwhelming
+            // the DB pool. Each group runs in parallel; failures in one group don't block others.
+            const BATCH_SIZE = 5;
+            for (let i = 0; i < pairs.results.length; i += BATCH_SIZE) {
+                const batch = pairs.results.slice(i, i + BATCH_SIZE);
+                await Promise.all(
+                    batch.map(({ model_id, purpose }) =>
+                        upsertHourlyExecutionRollup(env.DB, model_id, hourStart, purpose).catch(
+                            () => {
+                                /* Non-fatal: a single rollup failure shouldn't block cleanup */
+                            },
+                        ),
+                    ),
+                );
             }
-        } catch {
-            // Non-fatal: mock DBs in tests may not have the full ledger schema
+        } catch (error) {
+            console.error('ledger: updateExpectationState failed', error);
         }
 
         try {
@@ -1665,8 +1669,8 @@ export async function cleanup(env: Env, timestampMs: number = Date.now()): Promi
                     // Non-fatal
                 }
             }
-        } catch {
-            // Non-fatal
+        } catch (error) {
+            console.error('ledger: credential.cooldown_started event write failed', error);
         }
 
         lastRolledHour = hour;

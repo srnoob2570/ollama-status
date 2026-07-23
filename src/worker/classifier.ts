@@ -480,13 +480,17 @@ interface ResultOverrides {
     retryAt?: string | null;
 }
 
+const NON_ERROR_CLASSIFICATIONS = new Set<Classification>(['SUCCESS', 'HIGH_LATENCY', 'SUBSCRIPTION_REQUIRED']);
+
 async function result(overrides: ResultOverrides): Promise<ClassificationResult> {
     const publicStatus = publicStatusFor(overrides.classification);
-    const fp = await errorFingerprint(
-        null, // No error object for HTTP-based classifications
-        overrides.timeoutStage ?? null,
-        overrides.httpStatus,
-    );
+    const fp = NON_ERROR_CLASSIFICATIONS.has(overrides.classification)
+        ? null
+        : await errorFingerprint(
+            null,
+            overrides.timeoutStage ?? null,
+            overrides.httpStatus,
+        );
 
     return {
         classification: overrides.classification,

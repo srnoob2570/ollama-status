@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { D1DatabaseLike, D1StatementLike } from '../worker/types.ts';
+import { normalizeBindValue } from './d1-bind-normalize.ts';
 
 /**
  * D1DatabaseLike adapter backed by `node:sqlite`.
@@ -9,11 +10,6 @@ import type { D1DatabaseLike, D1StatementLike } from '../worker/types.ts';
  * transaction. Parameter normalization handles `undefined` → `null` and
  * `boolean` → `0`/`1` coercion for compatibility with D1 semantics.
  */
-function normalize(value: unknown): unknown {
-    if (value === undefined) return null;
-    if (typeof value === 'boolean') return value ? 1 : 0;
-    return value;
-}
 
 class SqliteStatement implements D1StatementLike {
     private readonly db: DatabaseSync;
@@ -27,7 +23,7 @@ class SqliteStatement implements D1StatementLike {
     }
 
     bind(...values: unknown[]): D1StatementLike {
-        return new SqliteStatement(this.db, this.sql, values.map(normalize));
+        return new SqliteStatement(this.db, this.sql, values.map(normalizeBindValue));
     }
 
     async run(): Promise<{ meta: { changes: number } }> {

@@ -1,10 +1,6 @@
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import type { D1DatabaseLike, D1StatementLike } from '../worker/types.ts';
-
-function normalize(value: unknown): unknown {
-    if (value === undefined) return null;
-    return value;
-}
+import { normalizeBindValue } from './d1-bind-normalize.ts';
 
 /**
  * Translate D1-style positional parameters (`?`) to PostgreSQL positional
@@ -13,6 +9,11 @@ function normalize(value: unknown): unknown {
  * Respects single- and double-quoted literals so that SQL like
  * `state='RUNNING'` passes through unchanged. Parameter tokens inside quoted
  * strings are left as-is.
+ *
+ * WARNING: PostgreSQL JSONB operators that use `?` (such as `?|`, `?&`, and
+ * `??`) are NOT supported by this translator — every `?` is mapped to a `$N`
+ * positional parameter. Queries using these operators must use PostgreSQL's
+ * native syntax directly (i.e. skip `postgresQuery` for that statement).
  */
 export function postgresQuery(sql: string): string {
     let parameter = 0;
@@ -57,7 +58,7 @@ class PostgresStatement implements D1StatementLike {
     }
 
     bind(...values: unknown[]): D1StatementLike {
-        return new PostgresStatement(this.pool, this.sql, values.map(normalize));
+        return new PostgresStatement(this.pool, this.sql, values.map(normalizeBindValue));
     }
 
     async execute(client: Pool | PoolClient): Promise<{ rows: QueryResultRow[]; changes: number }> {
