@@ -572,8 +572,14 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
     const configuration = rangeConfiguration(requestedRange, timestamp);
     const [providers, modelResult, statuses, checks, executions, monitor] = await Promise.all([
         env.DB.prepare(
-            'SELECT id,name,catalog_status,catalog_checked_at FROM providers WHERE active=1 ORDER BY name',
-        ).all(),
+            'SELECT id,name,catalog_status,catalog_checked_at,key_configured FROM providers WHERE active=1 ORDER BY name',
+        ).all<{
+            id: string;
+            name: string;
+            catalog_status: string;
+            catalog_checked_at: string | null;
+            key_configured: number;
+        }>(),
         env.DB.prepare(
             "SELECT id,remote_name,tier,next_check_at FROM models WHERE provider_id='ollama-free' AND active=1 AND excluded=0 ORDER BY tier,remote_name",
         ).all<{ id: string; remote_name: string; tier: string; next_check_at: string | null }>(),
@@ -639,6 +645,8 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
             };
         }),
     );
+    const paidProviderRow = providers.results.find((provider) => provider.id === 'ollama-paid');
+    const paidKeyConfigured = paidProviderRow ? paidProviderRow.key_configured === 1 : false;
     return json({
         lastUpdatedAt: monitor.lastSuccessfulFinishedAt,
         checkIntervals: {
@@ -653,6 +661,7 @@ async function publicStatus(env: ApiEnv, requestedRange: string | null): Promise
         stuckRun: monitor.stuckRun,
         stale: monitor.stale,
         infeasible: monitor.infeasible,
+        paidKeyConfigured,
         providers: providers.results,
         models,
     });

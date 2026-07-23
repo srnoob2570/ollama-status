@@ -984,6 +984,15 @@ async function resolveProviders(
 ): Promise<{ freeProvider: Provider | undefined; paidProvider: Provider | undefined }> {
     await ensureProviders(env);
     const activeProviders = await providers(env);
+    // The public status API runs without access to the secrets themselves (see MonitorEnv vs
+    // ApiEnv), so persist each provider's key presence here where the secret is available.
+    await Promise.all(
+        activeProviders.map((provider) =>
+            env.DB.prepare('UPDATE providers SET key_configured=? WHERE id=?')
+                .bind(hasKey(env, provider) ? 1 : 0, provider.id)
+                .run(),
+        ),
+    );
     const paid = activeProviders.find((provider) => provider.id === 'ollama-paid');
     return {
         freeProvider: activeProviders.find((provider) => provider.id === 'ollama-free'),

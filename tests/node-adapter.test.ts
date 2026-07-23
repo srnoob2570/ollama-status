@@ -50,8 +50,54 @@ describe('node:sqlite D1 adapter parity', () => {
         }
         const res = await api(new Request('http://localhost/api/v1/status'), env, ctx, '/api/v1/status');
         expect(res.status).toBe(200);
-        const body = (await res.json()) as { models: unknown[] };
+        const body = (await res.json()) as { models: unknown[]; paidKeyConfigured: boolean };
         expect(body.models).toHaveLength(1);
+        expect(body.paidKeyConfigured).toBe(true);
+    });
+
+    it('reports paidKeyConfigured false when OLLAMA_API_KEY_PAID is unset', async () => {
+        const db = new SqliteD1Adapter(migratedDb());
+        // Module-level provider seeding (providersSeeded flag) has already run in the preceding
+        // parity test, so this fresh database needs providers inserted by hand — same pattern as
+        // the manual-cycle and recovery tests below.
+        await db
+            .prepare(
+                "INSERT INTO providers (id,name,kind,base_url,secret_ref,created_at) VALUES (?,?,'ollama',?,?,?)",
+            )
+            .bind('ollama-free', 'Free', 'https://example.test/api', 'OLLAMA_API_KEY_FREE', new Date().toISOString())
+            .run();
+        await db
+            .prepare(
+                "INSERT INTO providers (id,name,kind,base_url,secret_ref,created_at) VALUES (?,?,'ollama',?,?,?)",
+            )
+            .bind('ollama-paid', 'Paid', 'https://example.test/api', 'OLLAMA_API_KEY_PAID', new Date().toISOString())
+            .run();
+        const env = {
+            DB: db,
+            OLLAMA_BASE_URL: 'https://example.test/api',
+            OLLAMA_API_KEY_FREE: 'k',
+        } as unknown as Env;
+        (globalThis as unknown as { caches: CacheStorage }).caches = {
+            default: new MemoryCache(),
+        } as unknown as CacheStorage;
+        const ctx = { waitUntil(p: Promise<unknown>) { void p; } } as unknown as ExecutionContext;
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = (async (input: Request | URL | string) => {
+            const url = String(input);
+            if (url.endsWith('/tags'))
+                return new Response(JSON.stringify({ models: [{ name: 'm', digest: 'd' }] }));
+            if (url.endsWith('/show')) return new Response('{}');
+            return new Response('{"model":"m","message":{"content":"OK"},"done":true}\n');
+        }) as typeof fetch;
+        try {
+            await runMonitor(env, ctx, Date.now());
+        } finally {
+            globalThis.fetch = originalFetch;
+        }
+        const res = await api(new Request('http://localhost/api/v1/status'), env, ctx, '/api/v1/status');
+        expect(res.status).toBe(200);
+        const body = (await res.json()) as { paidKeyConfigured: boolean };
+        expect(body.paidKeyConfigured).toBe(false);
     });
 
     it('runs a manual cycle through the shared API without probing models before their cadence', async () => {

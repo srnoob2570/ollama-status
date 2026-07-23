@@ -48,6 +48,7 @@ type Status = {
     range: HistoryRange;
     stale: boolean;
     infeasible: boolean;
+    paidKeyConfigured: boolean;
     monitor: { started_at?: string } | null;
     monitorProgress: MonitorRun | null;
     monitorActive: boolean;
@@ -231,6 +232,12 @@ export function App() {
                     catalog.
                 </section>
             )}
+            {!status.paidKeyConfigured && (
+                <section className="notice info">
+                    PAID MODELS DISABLED — no paid Ollama API key is configured. Paid-tier checks
+                    are skipped to control cost; only free-tier models are actively monitored.
+                </section>
+            )}
             <section className="summary" aria-label="Catalog summary">
                 {Object.entries(summary)
                     .filter(([, count]) => count > 0)
@@ -250,7 +257,7 @@ export function App() {
                 range={status.range}
             />
             <ModelCategory
-                title="Paid models"
+                title={status.paidKeyConfigured ? 'Paid models' : 'Paid models (not monitored)'}
                 models={status.models.filter((model) => model.tier === 'PAID')}
                 range={status.range}
             />
