@@ -9,13 +9,21 @@ export type LiveProgressListener = (payload: string) => void;
 export interface LiveProgressHandle {
     /** Register a listener for raw NOTIFY payloads. Returns an unsubscribe function. */
     subscribe(listener: LiveProgressListener): () => void;
+    /** Permanently stop the listener and close the PostgreSQL connection. */
     stop(): Promise<void>;
 }
 
-// A dedicated Client (not the shared Pool) because LISTEN ties a subscription to one specific
-// connection for its whole lifetime — a pooled connection would get recycled out from under it.
-// Reconnects on error/close so a transient DB blip doesn't permanently kill live progress; the web
-// process stays up either way, it just falls back to stale data until the next successful connect.
+/**
+ * Start a dedicated PostgreSQL LISTEN connection for live monitor progress.
+ *
+ * A dedicated Client (not the shared Pool) is used because LISTEN ties a
+ * subscription to one specific connection for its whole lifetime — a pooled
+ * connection would get recycled out from under it.
+ *
+ * Reconnects on error/close so a transient DB blip doesn't permanently kill
+ * live progress; the web process stays up either way, it just falls back to
+ * stale data until the next successful connect.
+ */
 export function startLiveProgress(connectionString: string): LiveProgressHandle {
     const subscribers = new Set<LiveProgressListener>();
     let stopped = false;
