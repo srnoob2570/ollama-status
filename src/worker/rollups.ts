@@ -40,71 +40,67 @@ export async function computeHourlyRollup(
     const hourEnd = new Date(new Date(hourStart).getTime() + 60 * 60_000).toISOString();
 
     // ── Count expectations by state ──────────────────────────────────────────
-    const counts = await db
-        .prepare(
-            `SELECT
-                COUNT(*)                                                         AS total,
-                COALESCE(SUM(CASE WHEN state = 'SATISFIED'  THEN 1 ELSE 0 END), 0) AS satisfied,
-                COALESCE(SUM(CASE WHEN state = 'SUPPRESSED' THEN 1 ELSE 0 END), 0) AS suppressed,
-                COALESCE(SUM(CASE WHEN state = 'MISSED'     THEN 1 ELSE 0 END), 0) AS missed,
-                COALESCE(SUM(CASE WHEN state = 'CANCELLED'  THEN 1 ELSE 0 END), 0) AS cancelled
-             FROM model_check_expectations
-             WHERE model_id = ?
-               AND purpose = ?
-               AND due_at >= ?
-               AND due_at < ?`,
-        )
-        .bind(modelId, purpose, hourStart, hourEnd)
-        .first<{
-            total: number;
-            satisfied: number;
-            suppressed: number;
-            missed: number;
-            cancelled: number;
-        }>();
+    const [counts, dominantRow, tierRow] = await Promise.all([
+        db
+            .prepare(
+                `SELECT
+                    COUNT(*)                                                         AS total,
+                    COALESCE(SUM(CASE WHEN state = 'SATISFIED'  THEN 1 ELSE 0 END), 0) AS satisfied,
+                    COALESCE(SUM(CASE WHEN state = 'SUPPRESSED' THEN 1 ELSE 0 END), 0) AS suppressed,
+                    COALESCE(SUM(CASE WHEN state = 'MISSED'     THEN 1 ELSE 0 END), 0) AS missed,
+                    COALESCE(SUM(CASE WHEN state = 'CANCELLED'  THEN 1 ELSE 0 END), 0) AS cancelled
+                 FROM model_check_expectations
+                 WHERE model_id = ?
+                   AND purpose = ?
+                   AND due_at >= ?
+                   AND due_at < ?`,
+            )
+            .bind(modelId, purpose, hourStart, hourEnd)
+            .first<{
+                total: number;
+                satisfied: number;
+                suppressed: number;
+                missed: number;
+                cancelled: number;
+            }>(),
+        db
+            .prepare(
+                `SELECT reason_code, COUNT(*) AS cnt
+                 FROM model_check_expectations
+                 WHERE model_id = ?
+                   AND purpose = ?
+                   AND due_at >= ?
+                   AND due_at < ?
+                   AND state IN ('SUPPRESSED', 'MISSED', 'CANCELLED')
+                   AND reason_code IS NOT NULL
+                 GROUP BY reason_code
+                 ORDER BY cnt DESC
+                 LIMIT 1`,
+            )
+            .bind(modelId, purpose, hourStart, hourEnd)
+            .first<{ reason_code: string; cnt: number }>(),
+        db
+            .prepare(
+                `SELECT tier, COUNT(*) AS cnt
+                 FROM model_check_expectations
+                 WHERE model_id = ?
+                   AND purpose = ?
+                   AND due_at >= ?
+                   AND due_at < ?
+                 GROUP BY tier
+                 ORDER BY cnt DESC
+                 LIMIT 1`,
+            )
+            .bind(modelId, purpose, hourStart, hourEnd)
+            .first<{ tier: string; cnt: number }>(),
+    ]);
 
     const total = counts?.total ?? 0;
     const satisfied = counts?.satisfied ?? 0;
     const suppressed = counts?.suppressed ?? 0;
     const missed = counts?.missed ?? 0;
     const cancelled = counts?.cancelled ?? 0;
-
-    // ── Dominant reason_code among non-satisfied ───────────────────────────
-    const dominantRow = await db
-        .prepare(
-            `SELECT reason_code, COUNT(*) AS cnt
-             FROM model_check_expectations
-             WHERE model_id = ?
-               AND purpose = ?
-               AND due_at >= ?
-               AND due_at < ?
-               AND state IN ('SUPPRESSED', 'MISSED', 'CANCELLED')
-               AND reason_code IS NOT NULL
-             GROUP BY reason_code
-             ORDER BY cnt DESC
-             LIMIT 1`,
-        )
-        .bind(modelId, purpose, hourStart, hourEnd)
-        .first<{ reason_code: string; cnt: number }>();
-
     const dominantReason = dominantRow?.reason_code ?? null;
-
-    // ── Tier (most common among expectations in this hour) ─────────────────
-    const tierRow = await db
-        .prepare(
-            `SELECT tier, COUNT(*) AS cnt
-             FROM model_check_expectations
-             WHERE model_id = ?
-               AND purpose = ?
-               AND due_at >= ?
-               AND due_at < ?
-             GROUP BY tier
-             ORDER BY cnt DESC
-             LIMIT 1`,
-        )
-        .bind(modelId, purpose, hourStart, hourEnd)
-        .first<{ tier: string; cnt: number }>();
-
     const tier = tierRow?.tier ?? 'FREE';
 
     // ── Ratios ────────────────────────────────────────────────────────────
