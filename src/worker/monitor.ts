@@ -927,6 +927,18 @@ async function abandonOpenRuns(env: Env, at: string): Promise<void> {
             `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,detail='interrupted'
              WHERE state IN ('SCHEDULED','RUNNING') AND run_id IN (SELECT id FROM monitor_runs WHERE finished_at IS NULL)`,
         ).bind(at),
+        // Mark the corresponding expectations as MISSED so no slot is unresolved (AC#11).
+        // Without this, the expectation stays SCHEDULED forever and the next run's
+        // scheduleDueExecutions re-selects it, trying to insert a second execution row for the
+        // same expectation_id and violating uq_model_check_executions_expectation_id — wedging
+        // every future run on that model.
+        env.DB.prepare(
+            `UPDATE model_check_expectations SET state='MISSED', reason_code='run_abandoned', resolved_at=?
+             WHERE id IN (
+                 SELECT expectation_id FROM model_check_executions
+                 WHERE state='ABANDONED' AND completed_at=? AND expectation_id IS NOT NULL
+             ) AND state NOT IN ('SATISFIED','MISSED','CANCELLED')`,
+        ).bind(at, at),
         env.DB.prepare(
             "UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase='ABANDONED',detail='interrupted',current_model=NULL WHERE finished_at IS NULL",
         ).bind(at),
@@ -1004,10 +1016,27 @@ async function scheduleDueExecutions(
         .bind(deadline)
         .all<Record<string, unknown>>();
 
-    const expectations = due.results;
+    // A backlog (e.g. the runner was down longer than one cadence interval) can leave a model
+    // with more than one due-and-unresolved expectation at once. model_check_executions has a
+    // UNIQUE(run_id, model_id) constraint — only one execution per model per run is possible —
+    // so admit at most the oldest (most overdue) expectation per model here; any later slot for
+    // the same model falls through to the overflow/SUPPRESSED handling below instead of hitting
+    // that constraint mid-batch and failing the whole run.
+    const seenModelIds = new Set<string>();
+    const deduped: typeof due.results = [];
+    const duplicateModelSlots: typeof due.results = [];
+    for (const row of due.results) {
+        const modelId = row.model_id as string;
+        if (seenModelIds.has(modelId)) duplicateModelSlots.push(row);
+        else {
+            seenModelIds.add(modelId);
+            deduped.push(row);
+        }
+    }
+
     const MAX_EXECUTIONS_PER_RUN = 200;
-    const admitted = expectations.slice(0, MAX_EXECUTIONS_PER_RUN);
-    const overflow = expectations.slice(MAX_EXECUTIONS_PER_RUN);
+    const admitted = deduped.slice(0, MAX_EXECUTIONS_PER_RUN);
+    const overflow = [...deduped.slice(MAX_EXECUTIONS_PER_RUN), ...duplicateModelSlots];
     const executions: ScheduledExecution[] = [];
     const batch: { stmt: ReturnType<typeof env.DB.prepare>; params: unknown[] }[] = [];
 
@@ -1107,7 +1136,7 @@ async function scheduleDueExecutions(
         .bind(catalogModelCount ?? 0, executions.length, runId)
         .run();
 
-    return { due: { results: expectations }, executions };
+    return { due, executions };
 }
 
 // Drains the independent Free/Paid probe pools until both queues empty or the soft deadline is
@@ -1327,16 +1356,27 @@ async function abandonRun(
         : error instanceof Error && error.message === 'global_catalog_unavailable'
           ? 'catalog_unavailable'
           : 'monitor_failed';
-    if (runCreated)
+    if (runCreated) {
+        const abandonedAt = now();
         await env.DB.batch([
             env.DB.prepare(
                 `UPDATE model_check_executions SET state='ABANDONED',completed_at=?,terminal_reason_code=?,detail=NULL
                  WHERE run_id=? AND state IN ('SCHEDULED','RUNNING')`,
-            ).bind(now(), reasonCode, runId),
+            ).bind(abandonedAt, reasonCode, runId),
+            // Mark the corresponding expectations as MISSED so no slot is unresolved (AC#11) —
+            // see abandonOpenRuns for why leaving them SCHEDULED wedges the next run.
+            env.DB.prepare(
+                `UPDATE model_check_expectations SET state='MISSED', reason_code=?, resolved_at=?
+                 WHERE id IN (
+                     SELECT expectation_id FROM model_check_executions
+                     WHERE run_id=? AND state='ABANDONED' AND completed_at=? AND expectation_id IS NOT NULL
+                 ) AND state NOT IN ('SATISFIED','MISSED','CANCELLED')`,
+            ).bind(reasonCode, abandonedAt, runId, abandonedAt),
             env.DB.prepare(
                 `UPDATE monitor_runs SET finished_at=?,outcome='ERROR',phase=${hardStopHit ? "'ABANDONED'" : "'FAILED'"},detail=?,current_model=NULL WHERE id=?`,
             ).bind(now(), detail, runId),
         ]);
+    }
 }
 
 export async function runMonitor(

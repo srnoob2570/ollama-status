@@ -605,6 +605,14 @@ describe('isSubscription403', () => {
     it('returns false for a non-subscription 403 body', () => {
         expect(isSubscription403('Access denied. Contact your administrator.')).toBe(false);
     });
+
+    it('matches the real ollama.com entitlement error format', () => {
+        expect(
+            isSubscription403(
+                '{"error":"this model requires a subscription, upgrade for access: https://ollama.com/upgrade (ref: c3b59376-0bb5-4e31-9f72-4dbeabf1ee98)"}',
+            ),
+        ).toBe(true);
+    });
 });
 
 // ── classifySubscription403 ───────────────────────────────────────────────────
@@ -636,6 +644,16 @@ describe('classifySubscription403', () => {
         expect(r.classification).toBe('RATE_LIMITED');
         expect(r.reasonCode).toBeNull();
     });
+
+    it('returns SUBSCRIPTION_REQUIRED for the real ollama.com entitlement error format', () => {
+        const r = classifySubscription403(
+            403,
+            '{"error":"this model requires a subscription, upgrade for access: https://ollama.com/upgrade (ref: c3b59376-0bb5-4e31-9f72-4dbeabf1ee98)"}',
+        );
+        expect(r.classification).toBe('SUBSCRIPTION_REQUIRED');
+        expect(r.reasonCode).toBe('subscription_required');
+        expect(r.evidenceSource).toBe('CLASSIFIER_RULE');
+    });
 });
 
 // ── exported constants ─────────────────────────────────────────────────────────
@@ -648,6 +666,7 @@ describe('exported constants', () => {
     it('SUBSCRIPTION_MARKERS includes the canonical markers', () => {
         expect(SUBSCRIPTION_MARKERS).toContain('subscription required');
         expect(SUBSCRIPTION_MARKERS).toContain('requires subscription');
+        expect(SUBSCRIPTION_MARKERS).toContain('requires a subscription');
         expect(SUBSCRIPTION_MARKERS).toContain('model entitlement');
         expect(SUBSCRIPTION_MARKERS).toContain('payment required');
     });

@@ -47,6 +47,7 @@ export const CLASSIFIER_RULE_VERSION = 1;
 export const SUBSCRIPTION_MARKERS = [
     'subscription required',
     'requires subscription',
+    'requires a subscription',
     'model entitlement',
     'plan required',
     'upgrade your plan',

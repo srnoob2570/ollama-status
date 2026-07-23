@@ -302,29 +302,24 @@ async function firstChatToken(
                         ? 'HIGH_LATENCY'
                         : 'SUCCESS';
 
-                    const classificationResult = await classifyProbe({
-                        httpStatus: response.status,
-                        error: null,
-                        timeoutStage: null,
-                        responseBodySnippet: null,
-                        retryAfterHeader: response.headers.get('retry-after') ?? undefined,
-                    });
-
+                    // Do NOT run this through classifyProbe: that function classifies error
+                    // conditions from an httpStatus/error pair, and a 2xx/null-error input matches
+                    // none of its cases — it falls through to the PROTOCOL_ERROR default, which
+                    // silently downgraded every successful probe's publicStatus to CONFIGURATION
+                    // and set contributesToStatus:false, which in turn made materializeStatus
+                    // skip updating provider_model_status on success (monitor.ts's `if
+                    // (result.contributesToStatus === false) return;`) — a model that recovered
+                    // would never show as OPERATIONAL again.
                     return {
                         classification,
-                        publicStatus: classificationResult.publicStatus,
+                        publicStatus: publicStatusFor(classification),
                         httpStatus: response.status,
                         rttMs,
                         headersAt,
                         firstByteAt: milestones?.firstByteAt ?? null,
                         firstTokenAt: milestones?.firstTokenAt ?? null,
                         ttftMs,
-                        timeoutStage: classificationResult.timeoutStage ?? undefined,
-                        failureDomain: classificationResult.failureDomain,
-                        reasonCode: classificationResult.reasonCode,
-                        evidenceSource: classificationResult.evidenceSource,
-                        retryability: classificationResult.retryability,
-                        contributesToStatus: classificationResult.contributesToStatus,
+                        contributesToStatus: true,
                     };
                 }
             }

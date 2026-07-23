@@ -36,6 +36,16 @@ describe('probe timeline milestones', () => {
         const result = await provider.probe('cloud');
 
         expect(result.classification).toBe('SUCCESS');
+        // A successful probe must report OPERATIONAL and contribute to status. These regressed
+        // silently when the success path ran its result through classifyProbe(200, null): that
+        // function classifies error conditions and has no case for a clean 2xx/null-error input,
+        // so it fell through to its PROTOCOL_ERROR default — downgrading every successful check
+        // to publicStatus CONFIGURATION and contributesToStatus:false, which in turn made
+        // materializeStatus skip updating provider_model_status on success (see monitor.ts's
+        // `if (result.contributesToStatus === false) return;`), so a recovered model would never
+        // show as OPERATIONAL again.
+        expect(result.publicStatus).toBe('OPERATIONAL');
+        expect(result.contributesToStatus).toBe(true);
         expect(result.headersAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
         expect(result.firstByteAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
         expect(result.firstTokenAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
