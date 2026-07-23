@@ -9,6 +9,14 @@ export type ManualMonitorJob = {
     expires_at: string;
 };
 
+/**
+ * Enqueue a manual monitor job, deduplicating concurrent requests.
+ *
+ * Expires any stale queued/running jobs first, then inserts a new job.
+ * When another active job already exists, returns its id with `deduplicated: true`.
+ * The partial unique index on monitor_jobs is the authoritative deduplication
+ * mechanism under concurrent requests.
+ */
 export async function enqueueManualMonitorJob(env: ApiEnv): Promise<{ jobId: string; deduplicated: boolean }> {
     const timestamp = now();
     await expireManualMonitorJobs(env, timestamp);
@@ -41,6 +49,10 @@ async function activeManualMonitorJob(env: ApiEnv): Promise<ManualMonitorJob | n
     ).first<ManualMonitorJob>();
 }
 
+/**
+ * Transition every QUEUED or RUNNING manual monitor job past its expiry
+ * timestamp to EXPIRED. Idempotent, safe to call on every tick.
+ */
 export async function expireManualMonitorJobs(env: ApiEnv, timestamp = now()): Promise<void> {
     await env.DB.prepare(
         `UPDATE monitor_jobs SET state='EXPIRED',updated_at=?
@@ -70,6 +82,13 @@ async function claimManualMonitorJob(env: MonitorEnv): Promise<ManualMonitorJob 
     return claimed.meta.changes === 1 ? { ...candidate, state: 'RUNNING' } : null;
 }
 
+/**
+ * Claim and execute one manual monitor job, if queued.
+ *
+ * Returns the job that was executed, or null when the queue is empty.
+ * Lock-contended runs are re-queued for the next poll cycle;
+ * failed and completed runs settle to their terminal state immediately.
+ */
 export async function drainManualMonitorJobs(
     env: MonitorEnv,
     ctx: ExecutionContext,

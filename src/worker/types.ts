@@ -406,5 +406,7 @@ export interface ProbeResult {
     contributesToStatus?: boolean;
 }
 
+/** Current UTC timestamp as ISO 8601 string. */
 export const now = () => new Date().toISOString();
+/** Generate a prefixed random id, e.g. `run_<uuid>`. */
 export const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
