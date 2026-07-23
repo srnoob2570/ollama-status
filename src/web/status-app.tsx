@@ -1,8 +1,10 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { cadenceLegend } from './cadence';
 import { nextUpdateLabel } from './next-update';
 import { parseMonitorRunEvent } from './live-progress';
+
+const FREE_PROVIDER_ID = 'ollama-free' as const;
 
 type HistoryRange = '1h' | '24h' | '7d' | '30d';
 type HistorySegment = {
@@ -287,7 +289,7 @@ function LastDataUpdate({ value }: { value: string | null }) {
 
 function StatusSignals({ status }: { status: Status }) {
     const catalog =
-        status.providers.find((provider) => provider.id === 'ollama-free')?.catalog_status ??
+        status.providers.find((provider) => provider.id === FREE_PROVIDER_ID)?.catalog_status ??
         'UNKNOWN';
     const run = status.monitorProgress;
     const running = status.monitorActive;
@@ -414,7 +416,7 @@ function ModelCategory({
     );
 }
 
-function ModelRow({
+const ModelRow = memo(function ModelRow({
     model,
     range,
     showHistory = true,
@@ -442,7 +444,7 @@ function ModelRow({
             {showHistory && <History model={model} range={range} />}
         </article>
     );
-}
+});
 
 type BucketSegmentView = {
     status: string;
