@@ -10,10 +10,14 @@ export type MonitorRunEvent = {
     current_model: string | null;
 };
 
-// Parses a `monitor_progress` NOTIFY payload (see migrations/postgres/0010_monitor_progress_notify.sql)
-// delivered over the /api/v1/monitor/stream SSE endpoint. Defensive about shape since the payload
-// crosses a JSON-over-the-wire boundary: a malformed or truncated event is dropped (returns null)
-// rather than corrupting the dashboard's monitor state.
+/**
+ * Parse a `monitor_progress` NOTIFY payload delivered over the
+ * /api/v1/monitor/stream SSE endpoint.
+ *
+ * Defensive about shape since the payload crosses a JSON-over-the-wire
+ * boundary: a malformed or truncated event is dropped (returns null)
+ * rather than corrupting the dashboard's monitor state.
+ */
 export function parseMonitorRunEvent(raw: string): MonitorRunEvent | null {
     let parsed: unknown;
     try {

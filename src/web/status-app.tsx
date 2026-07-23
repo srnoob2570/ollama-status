@@ -109,6 +109,10 @@ const availabilityReasons: Record<string, string> = {
     UNKNOWN: 'The monitor has not received a diagnostic result for this model yet.',
 };
 
+/**
+ * Map a status + classification pair to a human-readable reason string.
+ * Returns null when the model is OPERATIONAL (no reason needed).
+ */
 function availabilityReason(status: string, classification: string): string | null {
     if (status === 'OPERATIONAL') return null;
     return (
@@ -117,6 +121,13 @@ function availabilityReason(status: string, classification: string): string | nu
     );
 }
 
+/**
+ * Main dashboard application component.
+ *
+ * Fetches the public /api/v1/status endpoint every 30s, subscribes to
+ * live monitor progress via SSE, and renders the model catalog grouped
+ * by tier with configurable history ranges (1h, 24h, 7d, 30d).
+ */
 export function App() {
     const [range, setRange] = useState<HistoryRange>('1h');
     const [status, setStatus] = useState<Status | null>(null);
@@ -471,6 +482,12 @@ type BucketDescription = {
     executionState: HistoryBucket['executionState'];
 };
 
+/**
+ * Convert a raw HistoryBucket from the API into a fully described
+ * BucketDescription for rendering. Handles execution-mode buckets (1h
+ * range) differently: they show scheduling/completion info instead of
+ * check counts, and distinguish deferred/abandoned states from pending.
+ */
 function describeBucket(bucket: HistoryBucket, range: HistoryRange): BucketDescription {
     const time = bucketLabel(bucket.startAt, range);
     const isExecution = range === '1h' && bucket.executionState !== undefined;
@@ -709,6 +726,11 @@ function HistoryTooltip({ rect, data }: { rect: DOMRect; data: BucketDescription
     );
 }
 
+/**
+ * Format a bucket's ISO timestamp for display, adapting granularity
+ * to the selected history range (full date+time for 1h, date+hour for 24h,
+ * date only for 7d/30d).
+ */
 function bucketLabel(value: string, range: HistoryRange): string {
     const date = new Date(value);
     if (range === '1h')
